@@ -60,7 +60,7 @@ except ImportError:
 
 N_HARMONICS = 39          # harmonics 2nd through 40th
 V_NOMINAL = 230.0         # nominal phase voltage (L-N) in V
-FORMAT_VERSION = "0.1"
+FORMAT_VERSION = "0.2"
 GENERATOR_VERSION = "0.1.0"
 
 
@@ -529,7 +529,7 @@ class WashingMachineGenerator(ApplianceGenerator):
         "heat_P_W":             [1800, 2300],
         "motor_P_W":            [100, 250],
         "spin_max_P_W":         [300, 600],
-        "cycle_probability":    0.5,        # chance there's a wash this day
+        "cycle_probability":    0.85,        # chance there's a wash this day
     }
     HARMONICS_HEAT = {3: 0.01}
     HARMONICS_MOTOR = {3: 0.05, 5: 0.02, 7: 0.01}
@@ -638,7 +638,7 @@ class EVGenerator(ApplianceGenerator):
         "battery_capacity_kWh": [40.0, 100.0],
         "start_SoC":            [0.10, 0.60],
         "charger_quality":      "mid",       # budget | mid | premium
-        "session_probability":  0.7,
+        "session_probability":  0.9,
     }
     MODE_POWER = {
         "slow_AC": 3700.0,
