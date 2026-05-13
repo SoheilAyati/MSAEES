@@ -1,18 +1,16 @@
 # NILM Project — Appliance Generator Specification
 
-**Version:** 0.1 (draft)    
+**Version:** 0.2    
 **Milestone:** 1    
-**Companion to:** `data_format_v0.1.md`    
+**Companion to:** `data_format.md`    
 **Owners:** Soheil Ayati, Marc Steffgen   
-**Last updated:** 2026-05-11
+**Last updated:** 2026-05-13
 
 ---
 
 ## 1. Purpose
 
 Defines the physical, electrical, and behavioural model for each of the 8 appliances in the NILM project. Each appliance generator produces a clean, deterministic signature given a seed; measurement noise is added later in the preprocessing pipeline.
-
-Together with the data format spec, this document is sufficient for a partner working in parallel to produce signatures consistent with yours.
 
 ---
 
@@ -49,7 +47,7 @@ class ApplianceGenerator:
 ### 2.2 Conventions
 
 - All P in watts, Q in var, time in UTC microseconds.
-- Sign convention follows `data_format_v0.1.md` §6 (P>0 = consumption, P<0 = generation; Q>0 = inductive).
+- Sign convention follows `data_format.md` §6 (P>0 = consumption, P<0 = generation; Q>0 = inductive).
 - Harmonics are *current* harmonics; voltage harmonics emerge from the grid model, not from appliances directly. (For NILM purposes, current harmonics are what matters.)
 - Harmonic phase is referred to V_L1 fundamental zero crossing — appliance generators receive a reference phase at construction so single-phase appliances on L2/L3 shift accordingly.
 
@@ -66,7 +64,7 @@ A shared helper produces a probability-of-activation curve `p(t)` from a small s
 
 Each appliance generator declares which profile drives its top-level state machine.
 
-### 2.4 Parameter randomization for generalization (angle 5)
+### 2.4 Parameter randomization for generalization
 
 Each generator accepts `params` with ranges, not fixed values. The seed picks a sample inside the ranges. Two scenarios generated with different seeds therefore see different appliance "instances" of the same category — different fridge compressor sizes, different EV charging rates, etc. This is what enables generalization testing in M2 (train on some sampled instances, test on held-out ones).
 
@@ -275,7 +273,7 @@ Top-level driver: `random_burst`, but realistically clustered to mid-day (10:00�
 
 **Implementation notes**
 - This is the most state-heavy generator. Implement after one Type-IV (PCs) and one continuous Type-III (resistive) are working — you'll have battle-tested the framework by then.
-- The phase transitions are valuable benchmark events (angle 1) — every phase change is an event with a known timestamp and known before/after signature.
+- The phase transitions are valuable benchmark events — every phase change is an event with a known timestamp and known before/after signature.
 
 ---
 
@@ -425,7 +423,7 @@ Voltage is *not* affected by load in this synthetic model — we assume an infin
 3. **Hair dryer** (Type II, multi-state) — validates richer state machines and time-of-day driver.
 4. **PCs** (Type IV with overlay) — validates multi-instance and per-phase assignment.
 5. **Washing machine** (complex FSM) — validates long-sequence state machines and within-phase fast oscillations.
-6. **PV** (bidirectional, solar-driven) — validates sign convention and inverter harmonic phase model. Critical for angle 3.
+6. **PV** (bidirectional, solar-driven) — validates sign convention and inverter harmonic phase model.
 7. **EV** (multiple modes including smart) — validates mode-switching and PV-correlated control signal.
 8. **Synchronous machine** (four-quadrant) — validates full (P, Q) plane coverage.
 

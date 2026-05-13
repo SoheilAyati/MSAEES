@@ -73,7 +73,7 @@ A single scenario HDF5 file containing three top-level groups:
 
 Plus the top-level `/timestamp` dataset shared across all channels.
 
-The output file structure intentionally matches the layout in `data_format_v0.1.md` §10.2, with the exception that `/preprocessed` is empty at this stage (populated by the preprocessing step).
+The output file structure intentionally matches the layout in `data_format.md` §10.2, with the exception that `/preprocessed` is empty at this stage (populated by the preprocessing step).
 
 ---
 
@@ -192,7 +192,7 @@ Division is guarded — where the denominator is below threshold (P below 1 W, c
 
 ## 5. Sign and phase conventions
 
-Inherited from `data_format_v0.1.md` §6:
+Inherited from `data_format.md` §6:
 
 - **Active power P:** positive = consumption from grid; negative = generation (PV active hours, synchronous machine in generator mode).
 - **Reactive power Q:** positive = inductive (lagging); negative = capacitive (leading). The synchronous machine can produce all four quadrants.
@@ -225,7 +225,7 @@ The full tier strategy is documented separately and orchestrated by a per-tier g
 
 ## 7. File format
 
-Output structure follows `data_format_v0.1.md` §10.2:
+Output structure follows `data_format.md` §10.2:
 
 ```
 scenario_*.h5
@@ -303,20 +303,6 @@ Other sanity checks that should be examined in the summary output:
 - **`Per-phase RMS I` should be vaguely similar** across L1/L2/L3 if appliances are distributed across phases. One phase being 10× larger than the others indicates all single-phase appliances ended up on one phase (unbalanced).
 - **`THD_I` should sit in 2–8% range** during periods of normal load. Below 1% suggests harmonics aren't being aggregated correctly; above 15% suggests something is generating excessive distortion.
 - **`Neutral I mean` should track imbalance.** Zero indicates perfectly balanced load (rare in residential); 50+ A would indicate severe imbalance worth flagging.
-
----
-
-## 10. Open issues / deferred decisions
-
-1. **Grid impedance model.** Voltage harmonics are currently synthesized with fixed fractions; a proper model would compute V_h = Z_grid(f) × I_h. The latter would couple voltage harmonics to instantaneous load harmonics, which is more realistic but adds a tunable parameter (`Z_grid`) we'd have to defend. Current fixed-fraction model is adequate for this milestone.
-
-2. **3-phase appliance asymmetry.** PV and synchronous machine currently distribute power exactly equally across phases. Real 3-phase appliances have small (~1%) imbalances. Could be added by perturbing each phase's contribution slightly; deferred to a later version unless M2 evaluation reveals the assumption matters.
-
-3. **Neutral current harmonic content.** The approximation in §4.7 captures the fundamental neutral current correctly but loses zero-sequence triplen harmonics that would otherwise sum in the neutral. Defensible omission for this project's NILM purpose; flag if M2 wants to use I_N harmonics as a feature.
-
-4. **Multi-instance appliances.** Currently the aggregator handles whatever instances are in the input list, with names like `pc_1`. If two PCs are present they're treated as fully independent appliances; ground truth columns will reflect both. This works but the per-appliance metadata schema doesn't yet enforce uniqueness or document the convention.
-
-5. **Output file size for full dataset.** ~170 MB per scenario; 22 scenarios = ~3.7 GB compressed. Fits on a laptop but a USB stick is needed for sharing. Worth flagging when planning the dataset distribution.
 
 ---
 

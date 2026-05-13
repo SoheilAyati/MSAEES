@@ -1,9 +1,9 @@
 # NILM Project — Data Format Specification
 
-**Version:** 0.1 (draft)    
+**Version:** 0.3    
 **Milestone:** 1    
 **Owners:** Soheil Ayati, Marc Steffgen   
-**Last updated:** 2026-05-11
+**Last updated:** 2026-05-13
 
 ---
 
@@ -124,7 +124,7 @@ This is the load-bearing constraint behind the sampling-rate decision in section
 
 **Why 5 Hz (not 1 Hz):**
 - *Alignment.* All measured channels at one rate means one timestamp column applies to everything. No resampling needed for ML feature construction.
-- *Switching transients.* Inrush currents on motor start-up contain disproportionate harmonic energy that decays within ~500 ms. 1 Hz risks missing it; 5 Hz gives ~5 samples across the transient.
+- *Switching transients.* Inrush currents on motor start-up contain disproportionate harmonic energy that decays within ~500 ms. 1 Hz risks missing it; 5 Hz gives ~2-3 samples across the transient.
 - *Multi-state transitions.* Washing-machine and EV-mode transitions complete in 2–5 s; harmonic signatures change between phases. 1 Hz can smear two phases together.
 - *Adversarial scenarios.* Distinguishing near-simultaneous events needs joint feature vectors at one common rate.
 - *Storage is acceptable.* See appendix A.
@@ -213,14 +213,11 @@ Each scenario has an anchor datetime in ISO 8601 UTC stored in metadata. Anchor 
 
 | Purpose | Count | Notes |
 |---|---|---|
-| Training scenarios (mixed easy/normal, varied parameters) | 10 days | ML training in M2 |
-| Benchmark — easy tier | 3 days | Sparse, non-overlapping events |
-| Benchmark — normal tier | 3 days | Realistic concurrent events |
-| Benchmark — hard tier | 3 days | Concurrent events, similar-power appliances |
-| Benchmark — adversarial tier | 3 days | EV mirroring hair dryer + PCs; PV cancelling fridge |
-| **Total** | **22 days** | ~5 GB compressed |
-
-**Why this much:** training set large enough for M2 ML; three independent days per benchmark tier means meaningful test statistics rather than single-shot evaluation; adversarial tier kept small but deliberate.
+| Training scenarios (mixed easy/normal, varied parameters) | 1 day | ML training in M2 |
+| Easy tier | 1 day | Sparse, non-overlapping events |
+| Normal tier | 1 day | Realistic concurrent events |
+| Hard tier | 1 day | Concurrent events, similar-power appliances |
+| Adversarial tier | 1 day | EV mirroring hair dryer + PCs; PV cancelling fridge |
 
 ---
 
@@ -233,6 +230,10 @@ Use https://myhdf5.hdfgroup.org/ to see and visualize .h5 files.
 | HDF5 | Hierarchical (measurements + ground truth + metadata in one file); efficient mixed types; built-in compression; self-describing | Slightly heavier dependency than CSV/Parquet | **Chosen** |
 | Parquet | Excellent columnar storage; great pandas/Polars integration | No native hierarchical structure; would split metadata into separate file | Rejected |
 | CSV | Universally readable | No types, no compression, slow, no nested structures | Rejected |
+
+
+Useful links:
+https://towardsdatascience.com/which-data-format-to-use-for-your-big-data-project-837a48d3661d/
 
 ### 10.2 Internal structure
 
@@ -299,25 +300,6 @@ The name alone identifies the file uniquely without opening it.
 
 ---
 
-## 13. Versioning
-
-- `format_version` (this document): bumped on any breaking change to file structure or channel names. Currently `0.1`.
-- `generator_version`: bumped per appliance generator release using semantic versioning.
-
-Files always carry both, so any reader can determine compatibility.
-
----
-
-## 14. Open questions / deferred decisions
-
-These are noted here so they don't get lost, but they are owned by other documents:
-
-- **Noise injection** (Gaussian per channel + occasional spikes, calibrated to class-0.2 accuracy) — specified in preprocessing pipeline doc, not here.
-- **Simulated Modbus dropout** (occasional missing samples in raw view, filled in preprocessed view) — preprocessing doc.
-- **Phase-imbalance handling** for 3-phase appliances — appliance generator doc.
-
----
-
 ## Appendix A: Storage budget
 
 At 5 Hz over 24 h = 432 000 samples per channel.
@@ -331,5 +313,4 @@ At 5 Hz over 24 h = 432 000 samples per channel.
 | Harmonics (468) | 468 | 808 MB |
 | Ground truth (~10 appliance × 2) | ~20 | 34.6 MB |
 | **Total raw** | ~520 | **~900 MB / day** |
-| **After LZF compression (~25% ratio)** | | **~225 MB / day** |
-| **22-day dataset, compressed** | | **~5 GB** |
+| **After LZF compression (~25% ratio)** | | **~225–450 MB/day depending on noise level and harmonic variability.** |
