@@ -2,7 +2,7 @@
 
 Non-Intrusive Load Monitoring (NILM) recovers per-appliance power consumption from a single aggregate measurement at the Point of Common Coupling. This project develops a complete NILM pipeline targeting two challenges that distinguish good systems from passing demonstrations: **PV-aware disaggregation** (handling bidirectional power flow when behind-the-meter generation creates a *signal-eclipse* effect) and **multi-feature fusion** (combining steady-state, harmonic, and transient features rather than choosing one).
 
-Course: *Modeling, Simulation and Automation of Electrical Energy Systems*, TH Köln.
+Course: *Modeling, Simulation and Automation of Electrical Energy Systems*, TH Köln.     
 Team: Soheil Ayati (11153003), Marc Steffgen (11149043).
 
 ## What's built
