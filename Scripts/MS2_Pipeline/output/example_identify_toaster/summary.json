@@ -1,0 +1,8 @@
+{
+  "input": "Toaster",
+  "task": "identify",
+  "most_likely_appliance": "resistive",
+  "active_seconds_per_appliance": {
+    "resistive": 60.0
+  }
+}

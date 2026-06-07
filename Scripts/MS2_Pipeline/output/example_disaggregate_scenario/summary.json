@@ -1,0 +1,27 @@
+{
+  "input": "scenario_normal",
+  "task": "disaggregate",
+  "energy_kWh_per_appliance": {
+    "baseload": 0.554608119925303,
+    "ev": 6.451593833936299,
+    "fridge": 3.1069969326791353,
+    "hair_dryer": 0.006621227915276234,
+    "pc": 0.6818496375446063,
+    "pv": -5.32176682414629,
+    "resistive": 0.05116609695854468,
+    "synchronous": 1.6155495916093,
+    "washing_machine": 3.69808028764821
+  },
+  "per_appliance_mae_W": {
+    "baseload": 3.8821353432885304,
+    "ev": 38.89712417387728,
+    "fridge": 103.72070420451237,
+    "hair_dryer": 5.939089165634398,
+    "pc": 3.8645723623654082,
+    "pv": 172.92737571724194,
+    "resistive": 38.83911230903492,
+    "synchronous": 65.62100783452102,
+    "washing_machine": 134.1999182127018
+  },
+  "overall_mae_W": 63.09900436924196
+}

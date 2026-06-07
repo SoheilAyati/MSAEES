@@ -1,0 +1,40 @@
+{
+  "task": "disaggregate",
+  "model": "lgbm",
+  "features": [
+    "Ptot_mean",
+    "Ptot_std",
+    "Ptot_min",
+    "Ptot_max",
+    "Qtot_mean",
+    "PL1_mean",
+    "PL2_mean",
+    "PL3_mean",
+    "PF_mean",
+    "THDI_mean",
+    "hour"
+  ],
+  "appliances": [
+    "baseload",
+    "ev",
+    "fridge",
+    "hair_dryer",
+    "pc",
+    "pv",
+    "resistive",
+    "synchronous",
+    "washing_machine"
+  ],
+  "overall_mae_W": 26.19556021081693,
+  "per_appliance_mae_W": {
+    "baseload": 3.5845735455632224,
+    "ev": 16.212220343911525,
+    "fridge": 14.326920346326435,
+    "hair_dryer": 1.290818339993644,
+    "pc": 4.0949092922544565,
+    "pv": 83.4302470870238,
+    "resistive": 4.126605280460107,
+    "synchronous": 96.05431201682843,
+    "washing_machine": 12.639435644990728
+  }
+}
