@@ -41,7 +41,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.multioutput import MultiOutputRegressor
+from sklearn.multioutput import MultiOutputRegressor, MultiOutputClassifier
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
 from sklearn.metrics import confusion_matrix, f1_score, accuracy_score, mean_absolute_error
 
@@ -158,6 +158,49 @@ def _lgbm_reg():
     return LGBMRegressor(n_estimators=300, learning_rate=0.05, random_state=0, verbose=-1)
 
 
+def _base_clf(kind):
+    if kind == "lgbm":
+        from lightgbm import LGBMClassifier
+        return LGBMClassifier(n_estimators=300, learning_rate=0.05, random_state=0, verbose=-1)
+    return RandomForestClassifier(n_estimators=200, random_state=0, n_jobs=-1,
+                                  class_weight="balanced")
+
+
+def train_presence(files, args, out):
+    """Multi-label: for each aggregate window predict which appliances are ON."""
+    Xs, Ys, gs, k = [], [], [], 0
+    for f in files:                                   # stream one scenario at a time
+        s = nl.load_signal(f)
+        if s.gt_P is None:
+            del s; continue
+        X, Y, names = nl.aggregate_presence(s, args.window, on_W=15.0)
+        Xs.append(X); Ys.append(Y); gs.append(np.full(len(X), k)); k += 1
+        del s
+    if not Xs:
+        sys.exit("presence needs scenario .h5 files with /ground_truth")
+    X, Y, g = np.vstack(Xs), np.vstack(Ys), np.concatenate(gs)
+    print(f"presence: {X.shape[0]} windows from {k} scenarios, {Y.shape[1]} appliances")
+    if k >= 2:
+        tr, te = next(GroupShuffleSplit(1, test_size=0.3, random_state=0).split(X, Y, g))
+    else:
+        tr, te = train_test_split(np.arange(len(X)), test_size=0.3, random_state=0)
+    # presence uses RandomForest: robust to always-on appliances (single-class
+    # columns like baseload) that would break a per-output LightGBM.
+    model = MultiOutputClassifier(_base_clf("rf")).fit(X[tr], Y[tr])
+    Pp = np.asarray(model.predict(X[te]))
+    per = {names[i]: float(f1_score(Y[te][:, i], Pp[:, i], zero_division=0)) for i in range(len(names))}
+    metrics = {"task": "presence", "model": "rf", "features": nl.AGG_FEATURES,
+               "appliances": names, "on_W": 15.0,
+               "macro_f1": float(np.mean(list(per.values()))), "per_appliance_f1": per}
+    print(f"  held-out presence macro-F1 = {metrics['macro_f1']:.3f}")
+    print("  per-appliance F1: " + ", ".join(f"{a}={v:.2f}" for a, v in per.items()))
+    joblib.dump({"task": "presence", "model": model, "features": nl.AGG_FEATURES,
+                 "appliances": names, "window_s": args.window, "on_W": 15.0},
+                os.path.join(out, "model_presence.joblib"))
+    json.dump(metrics, open(os.path.join(out, "train_presence_metrics.json"), "w"), indent=2)
+    print(f"  saved -> {out}/model_presence.joblib")
+
+
 def _confusion(yt, yp, labels, path, title):
     C = confusion_matrix(yt, yp, labels=labels).astype(float)
     Cn = C / C.sum(1, keepdims=True).clip(min=1)
@@ -177,8 +220,9 @@ def _confusion(yt, yp, labels, path, title):
 def main():
     ap = argparse.ArgumentParser(description="MS2 training pipeline")
     ap.add_argument("--data", nargs="+", required=True, help="files, globs, or dirs")
-    ap.add_argument("--task", choices=["identify", "disaggregate"], default="identify")
-    ap.add_argument("--model", choices=["rf", "lgbm"], default="rf")
+    ap.add_argument("--task", choices=["identify", "disaggregate", "presence"], default="identify")
+    ap.add_argument("--model", choices=["rf", "lgbm", "mlp"], default="rf",
+                    help="mlp = neural network on the raw waveform (disaggregate/presence)")
     ap.add_argument("--features", choices=["auto", "common", "full"], default="auto",
                     help="identify only; 'common' = real-PAC4200 compatible")
     ap.add_argument("--out", default=os.path.join(HERE, "output"))
@@ -191,7 +235,14 @@ def main():
     if not files:
         sys.exit("no input files found")
     print(f"task={args.task}  inputs={len(files)} file(s)  out={args.out}")
-    (train_identify if args.task == "identify" else train_disaggregate)(files, args, args.out)
+    if args.model == "mlp":
+        if args.task not in ("disaggregate", "presence"):
+            sys.exit("--model mlp supports --task disaggregate or presence")
+        import deep_models
+        deep_models.train(files, args, args.out)
+    else:
+        {"identify": train_identify, "disaggregate": train_disaggregate,
+         "presence": train_presence}[args.task](files, args, args.out)
 
 
 if __name__ == "__main__":

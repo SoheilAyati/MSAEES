@@ -1,0 +1,27 @@
+{
+  "input": "scenario_seed101",
+  "task": "presence",
+  "fraction_on": {
+    "baseload": 1.0,
+    "ev": 0.0,
+    "fridge": 0.2869212962962963,
+    "hair_dryer": 0.006597222222222222,
+    "pc": 0.5606481481481481,
+    "pv": 0.6659722222222222,
+    "resistive": 0.04155092592592593,
+    "synchronous": 0.3260416666666667,
+    "washing_machine": 0.0
+  },
+  "per_appliance_f1": {
+    "baseload": 1.0,
+    "ev": 0.0,
+    "fridge": 0.99959661153691,
+    "hair_dryer": 0.991304347826087,
+    "pc": 0.9986577181208054,
+    "pv": 1.0,
+    "resistive": 0.9958391123439667,
+    "synchronous": 0.9998225377107365,
+    "washing_machine": 0.0
+  },
+  "macro_f1": 0.7761355919487228
+}

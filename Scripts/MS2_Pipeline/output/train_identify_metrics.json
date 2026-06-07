@@ -10,10 +10,15 @@
     "THD_I_mean",
     "P_std",
     "P_min",
-    "P_max"
+    "P_max",
+    "h3",
+    "h5",
+    "h7",
+    "h_centroid",
+    "h_energy"
   ],
-  "split": "grouped: tested on held-out instances",
-  "n_windows": 55783,
+  "split": "stratified rows (one instance per class)",
+  "n_windows": 56857,
   "classes": [
     "baseload",
     "ev",
@@ -25,6 +30,6 @@
     "synchronous",
     "washing_machine"
   ],
-  "holdout_macro_f1": 0.9515790292219131,
-  "holdout_accuracy": 0.9878061940217978
+  "holdout_macro_f1": 0.9947041846812787,
+  "holdout_accuracy": 0.9998593035525853
 }

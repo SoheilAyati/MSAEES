@@ -4,16 +4,32 @@ Two clean pipelines for Milestone 2. Both take a `.csv` (real PAC4200 run) or
 `.h5` (synthetic) file and just work — no other setup.
 
 ```
+app.py     Streamlit UI for all of the below (recommended)
 infer.py   signal file + trained model  ->  results (csv + json + plot)
 train.py   labelled files               ->  trained model (+ metrics)
 ```
 
 Everything needed is in this folder; nothing imports the old `Scripts/MS2`.
 
+## UI (recommended)
+
+A point-and-click panel for generate / train / infer, with the result graphs
+shown inline and each inference saved to its own timestamped folder:
+
+```bash
+pip install streamlit          # or: uv pip install streamlit
+streamlit run app.py
+```
+
+Opens in the browser with three tabs: **Infer**, **Train**, **Generate corpus**.
+Everything below is the command-line equivalent the UI runs for you.
+
 ## Files
 
 | File | Role |
 |---|---|
+| `app.py` | **Streamlit UI** for everything below (`streamlit run app.py`) |
+| `generate_corpus.py` | make a multi-seed synthetic corpus (calls the MS1 generator + aggregator) |
 | `nilm_pipeline.py` | shared library: `load_signal()` (auto-detects csv/h5), feature extraction. Both scripts import it. |
 | `train.py` | TRAINING pipeline — learn a model from labelled data |
 | `infer.py` | INFERENCE pipeline — run a trained model on one signal file |
@@ -31,9 +47,13 @@ python train.py --data <folder-of-single-appliance-h5> --task identify --feature
 # power disaggregation (needs scenario .h5 with /ground_truth):
 python train.py --data <folder-of-scenario-h5> --task disaggregate --model lgbm
 
-# ---- INFER ----
+# appliance presence — which appliances are ON per window (multi-label; needs scenarios):
+python train.py --data <folder-of-scenario-h5> --task presence --model lgbm
+
+# ---- INFER ---- (the model file knows its own task)
 python infer.py --input <signal.csv|.h5> --model output/model_identify.joblib
 python infer.py --input <scenario.h5>    --model output/model_disaggregate.joblib
+python infer.py --input <scenario.h5>    --model output/model_presence.joblib
 ```
 
 ## Pipeline 1 — `infer.py` (signal in → result out)

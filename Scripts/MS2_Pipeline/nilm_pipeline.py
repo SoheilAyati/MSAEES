@@ -74,7 +74,7 @@ def load_signal(path: str) -> Signal:
 
 
 def _clean(a):
-    a = np.asarray(a, dtype=np.float64)
+    a = np.array(a, dtype=np.float64)   # np.array() copies -> writable (asarray may be read-only)
     a[~np.isfinite(a)] = np.nan
     return a
 
@@ -212,3 +212,45 @@ def aggregate_windows(sig: Signal, window_s=30.0):
             if base in CANON:
                 Y[:, CANON.index(base)] = np.nanmean(W(sig.gt_P[:, col]), 1)
     return X, Y, CANON
+
+
+def aggregate_presence(sig, window_s=30.0, on_W=15.0):
+    """Multi-hot 'appliance active' targets per aggregate window (|power| > on_W).
+
+    Reuses aggregate_windows; returns (X, Y_multihot, names). Y is None when the
+    file has no ground truth.
+    """
+    X, Yp, names = aggregate_windows(sig, window_s)
+    Y = None if Yp is None else (np.abs(Yp) > on_W).astype(int)
+    return X, Y, names
+
+
+def aggregate_sequences(sig, window_s=30.0, on_W=15.0):
+    """Flatten the raw P/Q/THD waveform of each (non-overlapping) window.
+
+    Returns (X_flat, Y_power, Y_presence, names):
+      X_flat     (N, 3*W)   raw [P, Q, THD_I] samples per window (the 'sequence')
+      Y_power    (N, n_app)  window-mean per-appliance power   (None if no GT)
+      Y_presence (N, n_app)  1 if |power| > on_W else 0        (None if no GT)
+
+    Used by the neural-network (MLP) path, which learns from the waveform shape
+    itself rather than the hand-crafted summary features.
+    """
+    sr = sig.sample_rate_hz
+    w = max(1, int(round(window_s * sr)))
+    n = (sig.n // w) * w
+
+    def Wn(a):
+        return np.asarray(a[:n], float).reshape(-1, w)
+
+    chans = [np.nan_to_num(Wn(sig.P)), np.nan_to_num(Wn(sig.Q)), np.nan_to_num(Wn(sig.THD_I))]
+    Xf = np.concatenate(chans, axis=1).astype(np.float32)        # (N, 3*W)
+    Ypow = Ypres = None
+    if sig.gt_P is not None:
+        Ypow = np.zeros((Xf.shape[0], len(CANON)))
+        for col, nm in enumerate(sig.gt_names):
+            base = nm.rsplit("_", 1)[0]
+            if base in CANON:
+                Ypow[:, CANON.index(base)] = np.nanmean(Wn(sig.gt_P[:, col]), 1)
+        Ypres = (np.abs(Ypow) > on_W).astype(int)
+    return Xf, Ypow, Ypres, CANON

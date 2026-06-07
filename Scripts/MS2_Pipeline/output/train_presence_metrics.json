@@ -1,0 +1,41 @@
+{
+  "task": "presence",
+  "model": "rf",
+  "features": [
+    "Ptot_mean",
+    "Ptot_std",
+    "Ptot_min",
+    "Ptot_max",
+    "Qtot_mean",
+    "PL1_mean",
+    "PL2_mean",
+    "PL3_mean",
+    "PF_mean",
+    "THDI_mean",
+    "hour"
+  ],
+  "appliances": [
+    "baseload",
+    "ev",
+    "fridge",
+    "hair_dryer",
+    "pc",
+    "pv",
+    "resistive",
+    "synchronous",
+    "washing_machine"
+  ],
+  "on_W": 15.0,
+  "macro_f1": 0.9251963960407841,
+  "per_appliance_f1": {
+    "baseload": 0.9999131869085858,
+    "ev": 1.0,
+    "fridge": 0.9469759734879868,
+    "hair_dryer": 0.989010989010989,
+    "pc": 0.9824750192159877,
+    "pv": 0.9978367748279253,
+    "resistive": 0.9583333333333334,
+    "synchronous": 0.9994663820704376,
+    "washing_machine": 0.452755905511811
+  }
+}

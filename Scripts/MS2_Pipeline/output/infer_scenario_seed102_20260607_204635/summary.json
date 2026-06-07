@@ -1,0 +1,15 @@
+{
+  "input": "scenario_seed102",
+  "task": "identify",
+  "is_scenario": true,
+  "active_seconds_per_appliance": {
+    "synchronous": 24250.0,
+    "baseload": 19900.0,
+    "fridge": 14850.0,
+    "pv": 13065.0,
+    "ev": 9305.0,
+    "washing_machine": 3035.0,
+    "pc": 1300.0,
+    "resistive": 115.0
+  }
+}
