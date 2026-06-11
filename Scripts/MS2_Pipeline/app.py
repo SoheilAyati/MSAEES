@@ -23,6 +23,7 @@ import streamlit as st
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 PY = sys.executable
+AGG_SCRIPT = os.path.join(REPO, "Scripts", "Aggregator", "mix_measured_scenarios.py")
 
 
 # --------------------------------------------------------------------------
@@ -59,7 +60,8 @@ def show_images(folder):
 st.set_page_config(page_title="NILM MS2 Pipeline", layout="wide")
 st.title("NILM Pipeline")
 
-tab_infer, tab_train, tab_gen = st.tabs(["Infer", "Train", "Generate corpus"])
+tab_infer, tab_train, tab_gen, tab_agg = st.tabs(
+    ["Infer", "Train", "Generate corpus", "Aggregate (measured)"])
 
 # ---------------- INFER ----------------
 with tab_infer:
@@ -152,6 +154,50 @@ with tab_gen:
             scen = find([os.path.join(HERE, gout, "scenario_*.h5")])
             st.success("Corpus ready: %d scenario(s) in %s" % (len(scen), gout))
             st.write([os.path.basename(s) for s in scen])
+
+# ---------------- AGGREGATE (measured) ----------------
+with tab_agg:
+    st.subheader("Mix real PAC4200 recordings into ground-truth scenarios")
+    st.caption("Converts each single-appliance recording to per-appliance format, "
+               "loops it to a common length, then runs the aggregator to build "
+               "scenario .h5 files with /ground_truth. Use them under Train -> "
+               "disaggregate / presence.")
+    rec_dir = st.text_input(
+        "Recordings folder",
+        value=os.path.join(REPO, "Scripts", "PAC4200_reader", "recordings"))
+    agg_out = st.text_input(
+        "Output dir",
+        value=os.path.join(REPO, "Scripts", "Aggregator", "measured_scenarios"))
+    a1, a2, a3 = st.columns(3)
+    n_scen = a1.number_input("Scenarios", value=6, min_value=1, step=1, key="an")
+    adur = a2.number_input("Duration (s)", value=300.0, min_value=10.0, step=10.0, key="adur")
+    aseed = a3.number_input("Seed", value=0, min_value=0, step=1, key="aseed")
+    a4, a5, a6 = st.columns(3)
+    min_app = a4.number_input("Min appliances", value=2, min_value=2, step=1, key="amin")
+    max_app = a5.number_input("Max appliances", value=4, min_value=2, step=1, key="amax")
+    do_plot = a6.checkbox("Decomposition plots", value=True, key="aplot")
+
+    if st.button("Aggregate measured recordings", type="primary"):
+        if not os.path.isfile(AGG_SCRIPT):
+            st.error("Aggregator script not found: %s" % AGG_SCRIPT)
+        elif not os.path.isdir(rec_dir):
+            st.warning("Recordings folder not found: %s" % rec_dir)
+        else:
+            cmd = [PY, AGG_SCRIPT, "--recordings", rec_dir, "--out", agg_out,
+                   "--n-scenarios", str(int(n_scen)), "--duration", str(adur),
+                   "--min-app", str(int(min_app)), "--max-app", str(int(max_app)),
+                   "--seed", str(int(aseed))]
+            if do_plot:
+                cmd.append("--plot")
+            if run_cmd(cmd, "Aggregating measured recordings..."):
+                scen = find([os.path.join(agg_out, "measured_scenario_*.h5")])
+                st.success("Built %d scenario(s) in %s" % (len(scen), agg_out))
+                st.write([os.path.basename(s) for s in scen])
+                mf = os.path.join(agg_out, "manifest.json")
+                if os.path.exists(mf):
+                    st.subheader("Manifest")
+                    st.json(json.load(open(mf)))
+                show_images(agg_out)
 
 st.divider()
 st.caption("Outputs are written under MS2_Pipeline/output/. Each inference run "

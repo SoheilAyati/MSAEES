@@ -1,0 +1,27 @@
+{
+  "input": "measured_scenario_00",
+  "task": "presence",
+  "fraction_on": {
+    "baseload": 0.0,
+    "ev": 0.0,
+    "fridge": 0.0,
+    "hair_dryer": 0.0,
+    "pc": 0.0,
+    "pv": 0.0,
+    "resistive": 0.0,
+    "synchronous": 0.0,
+    "washing_machine": 0.0
+  },
+  "per_appliance_f1": {
+    "baseload": 0.0,
+    "ev": 0.0,
+    "fridge": 0.0,
+    "hair_dryer": 0.0,
+    "pc": 0.0,
+    "pv": 0.0,
+    "resistive": 0.0,
+    "synchronous": 0.0,
+    "washing_machine": 0.0
+  },
+  "macro_f1": 0.0
+}

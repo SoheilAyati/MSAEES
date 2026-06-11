@@ -27,8 +27,18 @@ try:
 except ImportError as e:                                    # pragma: no cover
     raise ImportError("h5py required: pip install h5py") from e
 
-CANON = ["baseload", "ev", "fridge", "hair_dryer", "pc", "pv", "resistive",
-         "synchronous", "washing_machine"]
+# Canonical appliance vocabulary: it both sizes the disaggregate/presence model
+# output and is the set of names a scenario's ground truth can map to. A target
+# column is filled only when the base of a ground-truth appliance name
+# ("<name>_<instance>") is in this list (see aggregate_windows / _presence).
+SYNTHETIC_APPLIANCES = ["baseload", "ev", "fridge", "hair_dryer", "pc", "pv",
+                        "resistive", "synchronous", "washing_machine"]
+# Real PAC4200 appliance families produced by mix_measured_scenarios.py. Appended
+# (never inserted) so the synthetic indices 0-8 stay stable for existing models.
+# Without these, measured scenarios map to NO class -> every target is zero -> the
+# model learns "always off" and inference returns all zeros.
+MEASURED_APPLIANCES = ["laptop", "stand_cooler", "table_fan", "table_pv"]
+CANON = SYNTHETIC_APPLIANCES + MEASURED_APPLIANCES
 
 FEATURES_COMMON = ["P_mean", "Q_mean", "S_mean", "PF_mean", "QP_ratio",
                    "THD_I_mean", "P_std", "P_min", "P_max"]
@@ -102,32 +112,68 @@ def _load_h5(path):
         ts = f["timestamp"][:]
         t_s = (ts - ts[0]) / 1e6
         m = f["measurements"]
-        if "P_total" in m:                                  # aggregate scenario
-            P = _clean(m["P_total"][:]); Q = _clean(m["Q_total"][:])
-            S = _clean(m["S_total"][:]); PF = _clean(m["PF_total"][:])
-            THD = _clean(m["THD_I_L1"][:])
-            Pph = np.column_stack([_clean(m[f"P_L{i}"][:]) for i in (1, 2, 3)])
-            harm = m["harmonics/I_mag_L1"][:] if "harmonics/I_mag_L1" in m else None
-            gtn = gtP = None
-            if "ground_truth" in f:
-                gtn = [_attr(x) for x in f["ground_truth"]["appliance_names"][:]]
-                gtP = f["ground_truth"]["P_contribution"][:].astype(np.float64)
-            return Signal(source="h5_scenario", name=_stem(path), sample_rate_hz=sr,
-                          t=t_s, P=P, Q=Q, S=S, PF=PF, THD_I=THD, P_phase=Pph,
-                          harm_I=harm, gt_names=gtn, gt_P=gtP)
-        else:                                               # single appliance
-            P = _clean(m["P"][:]); Q = _clean(m["Q"][:])
+
+        def chan(*names):
+            """First present channel among `names`, cleaned; None if none exist."""
+            for nm in names:
+                if nm in m:
+                    return _clean(m[nm][:])
+            return None
+
+        def phase_power():                                  # (T,3) or None
+            if all(f"P_L{i}" in m for i in (1, 2, 3)):
+                return np.column_stack([_clean(m[f"P_L{i}"][:]) for i in (1, 2, 3)])
+            return None
+
+        def harm_I():
+            for nm in ("harmonics/I_mag_L1", "harmonics_I_mag"):
+                if nm in m:
+                    return m[nm][:]
+            return None
+
+        # Power is 'P'/'Q' in synthetic single files and 'P_total'/'Q_total' in the
+        # scenario channel layout (synthetic scenarios AND the live PAC4200 recorder).
+        P = chan("P", "P_total")
+        Q = chan("Q", "Q_total")
+        S = chan("S_total")
+        if S is None:
             S = np.hypot(P, Q)
+        PF = chan("PF_total")
+        if PF is None:
             PF = np.divide(P, S, out=np.ones_like(P), where=S > 1e-6)
-            harm = m["harmonics_I_mag"][:] if "harmonics_I_mag" in m else None
-            name = "unknown"
+        # THD of CURRENT is optional. Synthetic scenarios store it as THD_I_L1; the
+        # real PAC4200 does not expose current-THD by default, so fall back to NaN
+        # (window_features then derives THD from the harmonic spectrum instead).
+        THD = chan("THD_I_L1")
+        if THD is None:
+            THD = np.full_like(P, np.nan)
+
+        # A file is a DISAGGREGATION SCENARIO only if it actually carries per-
+        # appliance ground truth. The PAC4200 recorder writes single appliances in
+        # this same channel layout (P_total, P_L1..3, ...) but with NO ground truth,
+        # so the presence of 'P_total' alone must NOT route here (that was the bug
+        # that raised KeyError: 'THD_I_L1' on real single-appliance recordings).
+        if "ground_truth" in f:
+            gtn = [_attr(x) for x in f["ground_truth"]["appliance_names"][:]]
+            gtP = f["ground_truth"]["P_contribution"][:].astype(np.float64)
+            return Signal(source="h5_scenario", name=_stem(path), sample_rate_hz=sr,
+                          t=t_s, P=P, Q=Q, S=S, PF=PF, THD_I=THD,
+                          P_phase=phase_power(), harm_I=harm_I(),
+                          gt_names=gtn, gt_P=gtP)
+
+        # Otherwise it is a LABELLED SINGLE APPLIANCE. The label lives in
+        # metadata.appliance_label (PAC4200 recorder) or the nested appliance_metadata
+        # JSON (synthetic single files); identify uses this as the class label.
+        name = meta.get("appliance_label") or ""
+        if not name:
             try:
-                name = json.loads(meta.get("appliance_metadata", "{}")).get("name", "unknown")
+                name = json.loads(meta.get("appliance_metadata", "{}")).get("name", "")
             except Exception:
-                pass
-            return Signal(source="h5_single", name=name, label=name, sample_rate_hz=sr,
-                          t=t_s, P=P, Q=Q, S=S, PF=PF, THD_I=np.full_like(P, np.nan),
-                          harm_I=harm)
+                name = ""
+        name = name or "unknown"
+        return Signal(source="h5_single", name=name, label=name, sample_rate_hz=sr,
+                      t=t_s, P=P, Q=Q, S=S, PF=PF, THD_I=THD,
+                      P_phase=phase_power(), harm_I=harm_I())
 
 
 def _stem(path):

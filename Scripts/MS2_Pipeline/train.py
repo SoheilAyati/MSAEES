@@ -82,6 +82,9 @@ def train_identify(files, args, out):
             continue
         all_harm = all_harm and s.has_harmonics
         wf = nl.window_features(s, args.window, args.stride, args.on_threshold)
+        if wf.empty or "active" not in wf.columns:        # recording shorter than one window
+            print(f"  skip (no full window): {os.path.basename(f)}")
+            del s; continue
         wf = wf[wf.active].copy()
         wf["label"] = s.label
         wf["group"] = os.path.basename(os.path.dirname(f)) or nl._stem(f)  # instance = seed/file

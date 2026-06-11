@@ -23,19 +23,27 @@
     "pv",
     "resistive",
     "synchronous",
-    "washing_machine"
+    "washing_machine",
+    "laptop",
+    "stand_cooler",
+    "table_fan",
+    "table_pv"
   ],
   "on_W": 15.0,
-  "macro_f1": 0.9251963960407841,
+  "macro_f1": 0.6428597911270736,
   "per_appliance_f1": {
-    "baseload": 0.9999131869085858,
+    "baseload": 1.0,
     "ev": 1.0,
-    "fridge": 0.9469759734879868,
-    "hair_dryer": 0.989010989010989,
-    "pc": 0.9824750192159877,
-    "pv": 0.9978367748279253,
-    "resistive": 0.9583333333333334,
-    "synchronous": 0.9994663820704376,
-    "washing_machine": 0.452755905511811
+    "fridge": 0.95265614581018,
+    "hair_dryer": 0.9836065573770492,
+    "pc": 0.9852242066041372,
+    "pv": 0.9969405594405595,
+    "resistive": 0.9909365558912386,
+    "synchronous": 0.9984461709211987,
+    "washing_machine": 0.44936708860759494,
+    "laptop": 0.0,
+    "stand_cooler": 0.0,
+    "table_fan": 0.0,
+    "table_pv": 0.0
   }
 }

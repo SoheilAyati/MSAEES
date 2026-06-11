@@ -1,0 +1,9 @@
+{
+  "input": "table_pv_2",
+  "task": "identify",
+  "is_scenario": false,
+  "active_seconds_per_appliance": {
+    "table_pv_2": 45.0
+  },
+  "most_likely_appliance": "table_pv_2"
+}
