@@ -1,0 +1,11 @@
+{
+  "input": "measured_scenario_07",
+  "task": "identify",
+  "is_scenario": true,
+  "active_seconds_per_appliance": {
+    "laptop_ravi": 3562.0,
+    "stand_cooler_mixed_withSwing": 20.0,
+    "stand_cooler_2_swing": 9.0,
+    "table_pv_2": 1.0
+  }
+}

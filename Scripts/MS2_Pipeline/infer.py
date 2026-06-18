@@ -33,9 +33,10 @@ sys.path.insert(0, HERE)
 import nilm_pipeline as nl
 
 
-def _appliance_colors():
+def _appliance_colors(names=None):
+    names = list(names) if names is not None else nl.CANON
     cmap = plt.get_cmap("tab10")
-    return {name: cmap(i % 10) for i, name in enumerate(nl.CANON)}
+    return {name: cmap(i % 10) for i, name in enumerate(names)}
 
 
 def run_identify(sig, bundle, args, out):
@@ -66,7 +67,14 @@ def run_identify(sig, bundle, args, out):
     json.dump(summary, open(os.path.join(out, "summary.json"), "w"), indent=2)
 
     # ---- build per-sample predicted class (primary + 2nd guess) ----
-    colors = _appliance_colors()
+    # Colour by the labels that actually occur (the model's own classes plus any
+    # ground-truth bases), so the prediction panel is coloured even when the model
+    # was trained on labels outside CANON - e.g. real recordings like 'laptop_ravi'
+    # or 'stand_cooler_1'. Previously this looped over CANON only, so a model whose
+    # classes were not in CANON produced an all-grey (uncoloured) prediction panel.
+    gt_bases = [nm.rsplit("_", 1)[0] for nm in sig.gt_names] if sig.gt_P is not None else []
+    label_universe = list(dict.fromkeys(list(classes) + gt_bases)) or list(nl.CANON)
+    colors = _appliance_colors(label_universe)
     hrs = sig.t / 3600.0
     sr = sig.sample_rate_hz
     step = max(1, int(round(args.stride * sr)))
@@ -84,7 +92,7 @@ def run_identify(sig, bundle, args, out):
     ax = axes[0, 0]
     ax.plot(hrs, sig.P, color="0.35", lw=0.7, zorder=3)
     used = []
-    for app in nl.CANON:
+    for app in label_universe:
         m = (prim == app)
         if m.any():
             ax.fill_between(hrs, 0, sig.P, where=m, color=colors[app], alpha=0.55,
@@ -95,7 +103,7 @@ def run_identify(sig, bundle, args, out):
                             hatch="///", linewidth=0, zorder=2)
     ax.axhline(0, color="0.7", lw=0.5)
     handles = [Patch(color=colors[a], label=a) for a in used]
-    if any((sec == a).any() for a in nl.CANON):
+    if any((sec == a).any() for a in label_universe):
         handles.append(Patch(facecolor="0.8", hatch="///", label="2nd guess"))
     if handles:
         ax.legend(handles=handles, fontsize=7, ncol=2, loc="upper left")

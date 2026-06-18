@@ -1,0 +1,35 @@
+{
+  "input": "measured_scenario_05",
+  "task": "disaggregate",
+  "energy_kWh_per_appliance": {
+    "baseload": 0.0,
+    "ev": 0.0,
+    "fridge": 0.0,
+    "hair_dryer": 0.0,
+    "pc": 0.0,
+    "pv": 0.0,
+    "resistive": 0.0,
+    "synchronous": 0.0,
+    "washing_machine": 0.0,
+    "laptop": 0.04894839016645318,
+    "stand_cooler": 0.024948101317840303,
+    "table_fan": 0.014173426772730344,
+    "table_pv": -0.00121329009771746
+  },
+  "per_appliance_mae_W": {
+    "baseload": 0.0,
+    "ev": 0.0,
+    "fridge": 0.0,
+    "hair_dryer": 0.0,
+    "pc": 0.0,
+    "pv": 0.0,
+    "resistive": 0.0,
+    "synchronous": 0.0,
+    "washing_machine": 0.0,
+    "laptop": 0.8156402846950394,
+    "stand_cooler": 0.7201960811714163,
+    "table_fan": 0.792757892708715,
+    "table_pv": 0.32407437599644656
+  },
+  "overall_mae_W": 0.20405143342858592
+}

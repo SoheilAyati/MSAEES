@@ -1,0 +1,37 @@
+{
+  "task": "disaggregate",
+  "model": "mlp",
+  "dl": true,
+  "appliances": [
+    "baseload",
+    "ev",
+    "fridge",
+    "hair_dryer",
+    "pc",
+    "pv",
+    "resistive",
+    "synchronous",
+    "washing_machine",
+    "laptop",
+    "stand_cooler",
+    "table_fan",
+    "table_pv"
+  ],
+  "window_s": 5.0,
+  "overall_mae_W": 0.9587454612778795,
+  "per_appliance_mae_W": {
+    "baseload": 0.04929344670950538,
+    "ev": 0.05376009532353944,
+    "fridge": 0.04702185797608561,
+    "hair_dryer": 0.05101224016398191,
+    "pc": 0.0660294727453341,
+    "pv": 0.04191166321953965,
+    "resistive": 0.04965031072290407,
+    "synchronous": 0.06046046439247827,
+    "washing_machine": 0.044830453253816814,
+    "laptop": 2.266937386835118,
+    "stand_cooler": 3.1823056296512897,
+    "table_fan": 4.37039520781479,
+    "table_pv": 2.1800827678040497
+  }
+}

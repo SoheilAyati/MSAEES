@@ -17,8 +17,8 @@ A point-and-click panel for generate / train / infer, with the result graphs
 shown inline and each inference saved to its own timestamped folder:
 
 ```bash
-pip install streamlit          # or: uv pip install streamlit
-streamlit run app.py
+uv pip install streamlit
+uv run streamlit run app.py
 ```
 
 Opens in the browser with three tabs: **Infer**, **Train**, **Generate corpus**.
