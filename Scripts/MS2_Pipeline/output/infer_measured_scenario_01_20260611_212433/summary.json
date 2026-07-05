@@ -1,8 +1,0 @@
-{
-  "input": "measured_scenario_01",
-  "task": "identify",
-  "is_scenario": true,
-  "active_seconds_per_appliance": {
-    "laptop_ravi": 275.0
-  }
-}

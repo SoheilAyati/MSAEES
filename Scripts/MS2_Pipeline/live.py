@@ -24,6 +24,11 @@ Usage
     # no hardware (exercise the whole loop with the simulated meter):
     python live.py --simulate
 
+    # no hardware, REAL data: replay a pre-measured file through the exact
+    # same pipeline, at its recorded rate (.h5 recording/scenario or csv):
+    python live.py --replay ../PAC4200_reader/recordings/<file>.h5
+    python live.py --replay ../../Pre_Measured/pac4200_toaster_200ms.csv
+
     # real meter:
     python live.py --host 192.168.168.1
 
@@ -125,6 +130,114 @@ class ThdReader(pr.BaseReader):
                         if i_fund > 1e-3:
                             thd = 100.0 * float(np.sqrt(np.nansum(mag ** 2))) / i_fund
                 s.scalars[f"THD_I_{ph}"] = thd
+        return s
+
+
+# =============================================================================
+# Replay reader -- pre-measured file in place of the meter
+# =============================================================================
+class ReplayReader(pr.BaseReader):
+    """Plays a pre-measured file (.h5 recording/scenario or PAC4200 .csv --
+    anything nilm_pipeline.load_signal accepts) through the live pipeline as if
+    the meter were connected: every poll returns the next recorded sample,
+    stamped with the current wall time. At the file's own sample rate the
+    engine, event log, and teach loop behave exactly as with hardware."""
+
+    def __init__(self, path: str, loop: bool = False):
+        self.path = os.path.abspath(path)
+        self.loop = loop
+        self.finished = False
+        self.read_harmonics = False           # THD_I arrives as a scalar channel
+        self.extra_channels = {"THD_I_L1": 0}
+        self._i = 0
+
+        sig = nl.load_signal(self.path)
+        self.sample_rate_hz = float(sig.sample_rate_hz) if sig.sample_rate_hz > 0 else 5.0
+        self.label = str(sig.label or sig.name or os.path.basename(self.path))
+        self._P = np.asarray(sig.P, float)
+        self._Q = np.asarray(sig.Q, float)
+        self._S = np.asarray(sig.S, float)
+        self._PF = np.asarray(sig.PF, float)
+        if sig.P_phase is not None:
+            self._Pph = np.asarray(sig.P_phase, float)
+        else:                                  # single-phase source (csv): all on L1
+            z = np.zeros_like(self._P)
+            self._Pph = np.column_stack([self._P, z, z])
+        thd = np.asarray(sig.THD_I, float)
+        if not np.isfinite(thd).any() and sig.harm_I is not None:
+            thd = self._thd_from_harmonics(sig)
+        self._thd = thd
+        self._n = len(self._P)
+        if self._n < 2:
+            raise ValueError(f"{self.path}: too few samples to replay")
+
+    def _thd_from_harmonics(self, sig) -> np.ndarray:
+        """THD_I_L1 from the per-order spectrum, same formula as ThdReader /
+        the aggregator (100 * sqrt(sum h^2) / I_fundamental). V_L1 is read from
+        the file when recorded; otherwise nominal 230 V."""
+        harm = np.asarray(sig.harm_I, float)
+        if harm.shape[0] != len(self._P):
+            return np.full(len(self._P), np.nan)
+        V = None
+        if self.path.lower().endswith(".h5"):
+            try:
+                with h5py.File(self.path, "r") as f:
+                    if "measurements/V_L1" in f:
+                        V = np.asarray(f["measurements/V_L1"][:], float)
+            except OSError:
+                V = None
+        if V is None or len(V) != len(self._P):
+            V = np.full(len(self._P), 230.0)
+        i_fund = np.hypot(np.nan_to_num(self._P), np.nan_to_num(self._Q)) \
+            / np.maximum(np.nan_to_num(V, nan=230.0), 1.0)
+        energy = np.sqrt(np.nansum(harm ** 2, axis=1))
+        return np.where(i_fund > 1e-3, 100.0 * energy / np.maximum(i_fund, 1e-9),
+                        np.nan)
+
+    # -- reader interface ------------------------------------------------------
+    def connect(self):
+        self._i = 0
+        self.finished = False
+
+    def disconnect(self):
+        pass
+
+    def read_raw(self, address, count):
+        return None                            # no register inspector for a file
+
+    @property
+    def is_simulated(self):
+        return False
+
+    @property
+    def host(self):
+        return f"replay:{os.path.basename(self.path)}"
+
+    @property
+    def port(self):
+        return None
+
+    @property
+    def n_samples(self):
+        return self._n
+
+    def read_sample(self):
+        i = self._i
+        if i >= self._n:
+            if self.loop:
+                i = 0
+            else:
+                self.finished = True           # live.py freezes the dashboard
+                i = self._n - 1                # hold the final state meanwhile
+        self._i = i + 1
+        s = pr.Sample(timestamp_us=int(time.time() * 1e6))
+        s.scalars = {
+            "P_total": float(self._P[i]), "Q_total": float(self._Q[i]),
+            "S_total": float(self._S[i]), "PF_total": float(self._PF[i]),
+            "P_L1": float(self._Pph[i, 0]), "P_L2": float(self._Pph[i, 1]),
+            "P_L3": float(self._Pph[i, 2]),
+            "THD_I_L1": float(self._thd[i]),
+        }
         return s
 
 
@@ -872,9 +985,9 @@ LIVE_HTML = r"""<!DOCTYPE html>
 <header>
   <h1>Live NILM</h1>
   <span class="pill"><span id="conn-dot" class="dot" style="background:var(--bad)"></span><b id="conn-txt">connecting…</b></span>
-  <span class="pill">total <b id="p-total">–</b></span>
-  <span class="pill">explained <b id="explained">–</b></span>
-  <span class="pill">model <b id="model-info">–</b></span>
+  <span class="pill">total <b id="p-total">-</b></span>
+  <span class="pill">explained <b id="explained">-</b></span>
+  <span class="pill">model <b id="model-info">-</b></span>
   <span class="grow"></span>
   <span class="pill" id="sim-pill" style="display:none">simulated meter:
     <button onclick="simLoad(0)" style="padding:2px 8px">0%</button>
@@ -900,7 +1013,7 @@ LIVE_HTML = r"""<!DOCTYPE html>
 
     <div class="panel">
       <h2>Currently on</h2>
-      <div id="on-list" class="muted small">–</div>
+      <div id="on-list" class="muted small">-</div>
       <div id="retrainbar"><span class="spin"></span><span id="retrain-step">retraining…</span></div>
       <div id="teach-note" class="small muted" style="margin-top:6px"></div>
     </div>
@@ -914,7 +1027,7 @@ LIVE_HTML = r"""<!DOCTYPE html>
     <div class="panel">
       <h2>Teach a device by recording it</h2>
       <div class="small muted" style="margin-bottom:8px">
-        Plug in ONLY the new device, give it a name, record ~60 s, stop — the
+        Plug in ONLY the new device, give it a name, record ~60 s, stop - the
         model retrains automatically with the new device included.
       </div>
       <input type="text" id="rec-name" placeholder="device name, e.g. desk_lamp">
@@ -933,7 +1046,7 @@ LIVE_HTML = r"""<!DOCTYPE html>
       <div id="legend" class="small muted" style="margin-top:6px"></div>
     </div>
     <div class="panel">
-      <h2>Event log — what switched, exactly when</h2>
+      <h2>Event log: what switched, exactly when</h2>
       <div style="max-height:340px;overflow:auto">
         <table>
           <thead><tr><th>time</th><th>event</th><th>device</th><th>ΔP (W)</th><th>ΔQ (var)</th><th>conf</th><th>detail</th></tr></thead>
@@ -954,9 +1067,9 @@ function col(nm){
   return deviceColor[nm];
 }
 async function j(url, opts){ const r = await fetch(url, opts); return r.json(); }
-function fmtW(v){ return v==null ? "–" : (Math.abs(v)>=1000 ? (v/1000).toFixed(2)+" kW" : v.toFixed(0)+" W"); }
-function hms(iso){ return iso ? iso.substring(11,19) : "–"; }
-function hmsMs(iso){ return iso ? iso.substring(11,23) : "–"; }
+function fmtW(v){ return v==null ? "-" : (Math.abs(v)>=1000 ? (v/1000).toFixed(2)+" kW" : v.toFixed(0)+" W"); }
+function hms(iso){ return iso ? iso.substring(11,19) : "-"; }
+function hmsMs(iso){ return iso ? iso.substring(11,23) : "-"; }
 
 async function pollStatus(){
   try{
@@ -972,16 +1085,16 @@ async function pollStatus(){
     let mi = (m.appliances||[]).length + " devices";
     if(acc.presence_macro_f1 != null) mi += " · F1 " + acc.presence_macro_f1.toFixed(2);
     if(acc.power_mae_W != null) mi += " · ±" + acc.power_mae_W.toFixed(0) + " W";
-    document.getElementById("model-info").textContent = m.source === "none" ? "none — teach devices!" : mi;
+    document.getElementById("model-info").textContent = m.source === "none" ? "none - teach devices!" : mi;
 
     const kv = document.getElementById("model-kv");
     kv.innerHTML = "";
     const add = (k,v)=>{ kv.innerHTML += "<div>"+k+"</div><div>"+v+"</div>"; };
-    add("bundle", m.source||"–");
-    add("held-out presence F1", acc.presence_macro_f1!=null ? acc.presence_macro_f1.toFixed(3) : "–");
-    add("held-out power MAE", acc.power_mae_W!=null ? acc.power_mae_W.toFixed(1)+" W" : "–");
-    add("window", (m.window_s||"–")+" s");
-    add("trained", m.trained_utc ? m.trained_utc.replace("T"," ").substring(0,19) : "–");
+    add("bundle", m.source||"-");
+    add("held-out presence F1", acc.presence_macro_f1!=null ? acc.presence_macro_f1.toFixed(3) : "-");
+    add("held-out power MAE", acc.power_mae_W!=null ? acc.power_mae_W.toFixed(1)+" W" : "-");
+    add("window", (m.window_s||"-")+" s");
+    add("trained", m.trained_utc ? m.trained_utc.replace("T"," ").substring(0,19) : "-");
     add("signatures", m.n_signatures);
     document.getElementById("model-devices").textContent =
       (m.appliances||[]).length ? "knows: " + m.appliances.join(", ") : "no devices yet";
@@ -997,14 +1110,14 @@ async function pollStatus(){
       bar.style.display = "none";
       document.getElementById("retrain-btn").disabled = false;
       if(rt.state === "error") document.getElementById("teach-note").textContent =
-        "retrain FAILED — see console/log";
+        "retrain FAILED - see console/log";
     }
     const sess = s.session;
     recActive = !!sess;
     document.getElementById("rec-start").disabled = !!sess;
     document.getElementById("rec-stop").disabled = !sess;
     document.getElementById("rec-status").textContent = sess ?
-      ("recording '"+sess.label+"' — "+sess.samples+" samples") : "";
+      ("recording '"+sess.label+"' - "+sess.samples+" samples") : "";
   }catch(e){}
 }
 
@@ -1013,7 +1126,7 @@ async function pollState(){
     const st = await j("/api/state");
     document.getElementById("p-total").textContent = fmtW(st.total_W);
     document.getElementById("explained").textContent =
-      st.explained_frac!=null ? (100*st.explained_frac).toFixed(0)+"%" : "–";
+      st.explained_frac!=null ? (100*st.explained_frac).toFixed(0)+"%" : "-";
 
     const box = document.getElementById("on-list");
     if(!st.currently_on.length){
@@ -1160,6 +1273,18 @@ def main():
     p.add_argument("--unit-id", type=int, default=1)
     p.add_argument("--rate", type=float, default=pr.DEFAULT_SAMPLE_RATE_HZ)
     p.add_argument("--simulate", action="store_true", help="synthetic meter (no hardware)")
+    p.add_argument("--replay", default=None, metavar="FILE",
+                   help="replay a pre-measured file (.h5 recording/scenario or "
+                        "PAC4200 .csv) as if it were the live meter -- no "
+                        "hardware needed; plays at the file's own sample rate "
+                        "(--rate is ignored)")
+    p.add_argument("--replay-speed", type=float, default=1.0,
+                   help="replay speed factor (2 = twice as fast; note that "
+                        "wall-clock windows then span 2x the recorded time, "
+                        "so use 1.0 when judging accuracy)")
+    p.add_argument("--replay-loop", action="store_true",
+                   help="restart the replay from the beginning when it ends "
+                        "(default: freeze the dashboard at the final state)")
     p.add_argument("--no-harmonics", action="store_true",
                    help="skip per-order harmonic reads (THD_I then unavailable live)")
     p.add_argument("--stride", type=float, default=2.0,
@@ -1181,11 +1306,22 @@ def main():
     p.add_argument("--no-browser", action="store_true")
     args = p.parse_args()
 
-    if not args.simulate and args.host is None:
-        p.error("--host is required unless --simulate")
+    if args.simulate and args.replay:
+        p.error("--simulate and --replay are mutually exclusive")
+    if not args.simulate and not args.replay and args.host is None:
+        p.error("--host is required unless --simulate or --replay")
 
     harmonics = not args.no_harmonics
-    if args.simulate:
+    if args.replay:
+        harmonics = False                 # THD_I comes from the file as a scalar
+        inner = ReplayReader(args.replay, loop=args.replay_loop)
+        args.rate = inner.sample_rate_hz * max(0.1, float(args.replay_speed))
+        dur = inner.n_samples / inner.sample_rate_hz
+        print(f"Live NILM REPLAYING {os.path.basename(args.replay)} "
+              f"('{inner.label}': {inner.n_samples} samples, {dur:.0f} s @ "
+              f"{inner.sample_rate_hz:g} Hz, speed x{args.replay_speed:g}"
+              f"{', looping' if args.replay_loop else ''})")
+    elif args.simulate:
         inner = pr.SimulatedReader(extra_channels=pr.EXTENDED_CHANNELS,
                                    read_harmonics=harmonics)
         print("Live NILM with a SIMULATED meter (demo mode, no hardware).")
@@ -1208,7 +1344,7 @@ def main():
 
     info = models.info()
     if info["source"] == "none":
-        print("NOTE: no trained model found — the dashboard still shows the live "
+        print("NOTE: no trained model found - the dashboard still shows the live "
               "signal and edge events; teach/record devices and hit Retrain.")
     else:
         print(f"model: {info['source']}  ({len(info['appliances'])} devices, "
@@ -1218,6 +1354,18 @@ def main():
     svc.start()
     svc.request_connect()
     engine.start()
+
+    if args.replay and not args.replay_loop:
+        def _end_replay():
+            while not inner.finished:
+                time.sleep(0.5)
+            svc.request_disconnect()
+            print(f"replay of {os.path.basename(args.replay)} finished -- "
+                  "dashboard frozen at the final state (Ctrl-C to quit)",
+                  flush=True)
+        threading.Thread(target=_end_replay, daemon=True,
+                         name="replay-end").start()
+
     app = create_app(svc, engine, models, retrainer)
     url = f"http://127.0.0.1:{args.web_port}/"
     print(f"\nLive dashboard:  {url}\nCtrl-C to quit.\n")

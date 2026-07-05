@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-NILM Project — Preprocessing Pipeline
+NILM Project - Preprocessing Pipeline
 ======================================
 Universal preprocessor for scenario HDF5 files. Operates identically on:
   - Synthetic scenarios (output of scenario_aggregator.py)
-  - Real scenarios (output of pac4200_reader.py — Milestone 2)
+  - Real scenarios (output of pac4200_reader.py - Milestone 2)
 
 Reads `/measurements`, produces `/preprocessed` with cleaned channels
 and derived features. Does NOT modify `/measurements` or `/ground_truth`;
 they remain as the audit trail.
 
-The script makes no assumption about the input source — it handles whatever
+The script makes no assumption about the input source - it handles whatever
 data quality issues are present (gaps, NaN, outliers) and produces a
 consistent feature set regardless.
 
@@ -55,7 +55,7 @@ except ImportError:
 PREPROCESSOR_VERSION = "0.1.0"
 
 # Physical bounds for outlier detection.
-# (lo, hi) — values outside this range are clipped (or flagged) by the
+# (lo, hi) - values outside this range are clipped (or flagged) by the
 # outlier step. Bounds are deliberately generous so legitimate extremes
 # (EV fast charging at 22 kW, PV generation, synchronous machine in
 # generator mode) are not flagged.

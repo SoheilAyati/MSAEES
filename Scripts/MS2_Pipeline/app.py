@@ -65,7 +65,7 @@ tab_live, tab_infer, tab_train, tab_gen, tab_agg = st.tabs(
 
 # ---------------- LIVE ----------------
 with tab_live:
-    st.subheader("Live NILM — connect the meter, see what's on, teach new devices")
+    st.subheader("Live NILM: connect the meter, see what's on, teach new devices")
     st.caption("Starts the live monitor (live.py): sliding-window recognition of "
                "which devices are ON (with watts + confidence), an event log with "
                "exact switch times, and the teach-and-retrain loop for unknown "
@@ -74,6 +74,16 @@ with tab_live:
     host = lc1.text_input("PAC4200 host/IP", value="192.168.168.1")
     lport = lc2.number_input("Dashboard port", value=8300, min_value=1024, step=1)
     simulate = lc3.checkbox("Simulate (no hardware)", value=False)
+    replay_choices = find([
+        os.path.join(REPO, "Scripts", "PAC4200_reader", "recordings", "*.h5"),
+        os.path.join(REPO, "Scripts", "PAC4200_reader", "recordings", "test", "*.h5"),
+        os.path.join(REPO, "Scripts", "Aggregator", "*measured_scenarios*", "*.h5"),
+        os.path.join(REPO, "Pre_Measured", "*.csv"),
+    ])
+    replay_pick = st.selectbox(
+        "…or replay a pre-measured file (no meter needed; overrides host/simulate)",
+        ["(none - use live meter / simulate)"] + replay_choices)
+    replay = None if replay_pick.startswith("(") else replay_pick
     lc4, lc5 = st.columns(2)
     lmodel_dir = lc4.text_input("Models dir", value="output", key="lmodels")
     lstride = lc5.number_input("Re-evaluate every (s)", value=2.0, min_value=0.5, step=0.5)
@@ -81,7 +91,7 @@ with tab_live:
     running = st.session_state.get("live_proc") is not None and \
         st.session_state["live_proc"].poll() is None
     if running:
-        st.success("Live monitor is running — dashboard: http://127.0.0.1:%d/" % int(lport))
+        st.success("Live monitor is running - dashboard: http://127.0.0.1:%d/" % int(lport))
         if st.button("Stop live monitor"):
             st.session_state["live_proc"].terminate()
             st.session_state["live_proc"] = None
@@ -92,7 +102,12 @@ with tab_live:
                    "--web-port", str(int(lport)),
                    "--models-dir", lmodel_dir,
                    "--stride", str(lstride)]
-            cmd += ["--simulate"] if simulate else ["--host", host]
+            if replay:
+                cmd += ["--replay", replay]
+            elif simulate:
+                cmd += ["--simulate"]
+            else:
+                cmd += ["--host", host]
             st.session_state["live_proc"] = subprocess.Popen(cmd, cwd=HERE)
             st.info("Starting… the dashboard opens in a new browser tab "
                     "(http://127.0.0.1:%d/). Click Stop here when done." % int(lport))
@@ -107,9 +122,10 @@ with tab_infer:
         os.path.join(REPO, "Synthetic_Data", "Single", "*.h5"),
         os.path.join(HERE, "corpus", "scenario_*.h5"),
         os.path.join(REPO, "Scripts", "PAC4200_reader", "recordings", "*.h5"),
-        os.path.join(REPO, "Scripts", "Aggregator", "measured_scenarios", "*.h5"),
+        os.path.join(REPO, "Scripts", "PAC4200_reader", "recordings", "test", "*.h5"),
+        os.path.join(REPO, "Scripts", "Aggregator", "*measured_scenarios*", "*.h5"),
     ])
-    st.caption("Tip: recordings named `a__b__c` are real multi-device mixes — "
+    st.caption("Tip: recordings named `a__b__c` are real multi-device mixes - "
                "inference on them reports device-set accuracy (expected vs detected) "
                "parsed from the name.")
     model_choices = find([os.path.join(HERE, "output", "**", "*.joblib")])

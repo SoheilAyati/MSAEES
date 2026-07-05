@@ -1,9 +1,0 @@
-{
-  "input": "stand_cooler_2_swing",
-  "task": "identify",
-  "is_scenario": false,
-  "active_seconds_per_appliance": {
-    "stand_cooler_2_swing": 20.0
-  },
-  "most_likely_appliance": "stand_cooler_2_swing"
-}

@@ -137,7 +137,7 @@ def run_identify(sig, bundle, args, out):
         ax.legend(handles=handles, fontsize=7, ncol=2, loc="upper left")
     ttl = "Identification (per-window prediction; area colored by appliance)"
     if not has_gt and summary.get("most_likely_appliance"):
-        ttl = f"Identification — most likely: {summary['most_likely_appliance']}"
+        ttl = f"Identification - most likely: {summary['most_likely_appliance']}"
     ax.set_title(f"{ttl}\n{sig.name}"); ax.set_ylabel("P (W)")
 
     if has_gt:                            # ground-truth comparison panel
@@ -148,7 +148,7 @@ def run_identify(sig, bundle, args, out):
             if np.nanmax(np.abs(p)) > 5:
                 ax2.plot(hrs, p, color=colors.get(base, "0.5"), lw=0.9, label=base)
         ax2.axhline(0, color="0.7", lw=0.5)
-        ax2.set_title("Ground truth — actual per-appliance power")
+        ax2.set_title("Ground truth: actual per-appliance power")
         ax2.set_ylabel("P (W)"); ax2.set_xlabel("hour")
         ax2.legend(fontsize=7, ncol=2, loc="upper left")
     else:
@@ -188,7 +188,7 @@ def run_disaggregate(sig, bundle, args, out):
             ax[k].plot(hours, Y[:, j], color="#1f4e79", lw=1.0, ls="--", label="true")
         ax[k].set_ylabel(f"{names[j]}\nP (W)"); ax[k].legend(fontsize=8, loc="upper right")
     ax[-1].set_xlabel("hour")
-    ax[0].set_title(f"Disaggregation — {sig.name}")
+    ax[0].set_title(f"Disaggregation - {sig.name}")
     plt.tight_layout(); plt.savefig(os.path.join(out, "disaggregation.png"), dpi=110); plt.close()
     print(f"  wrote disaggregation.csv, summary.json, disaggregation.png")
 
@@ -242,7 +242,7 @@ def run_presence(sig, bundle, args, out):
         ax.set_yticks([i + 0.5 for i in range(len(names))]); ax.set_yticklabels(names, fontsize=8)
         ax.set_ylim(0, len(names)); ax.set_title(title)
 
-    gantt(axes[0, 0], Pp, f"Predicted appliance presence — {sig.name}\n{acc_line}")
+    gantt(axes[0, 0], Pp, f"Predicted appliance presence - {sig.name}\n{acc_line}")
     if Ytrue is not None:
         gantt(axes[1, 0], Ytrue, "Ground-truth presence")
     axes[-1, 0].set_xlabel("hour")
@@ -336,7 +336,7 @@ def run_mix(sig, bundle, args, out):
     ax.plot(hours, Ptot_meas, color="black", lw=1.3, label="measured total")
     ax.legend(fontsize=7, ncol=3, loc="upper right")
     ax.set_ylabel("P (W)")
-    ax.set_title(f"Mix (presence + disaggregation) — {sig.name}\n" + " · ".join(acc_bits))
+    ax.set_title(f"Mix (presence + disaggregation) - {sig.name}\n" + " · ".join(acc_bits))
 
     def gantt(ax, M, title):
         for i, nm in enumerate(names):

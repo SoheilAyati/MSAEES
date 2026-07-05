@@ -1,5 +1,0 @@
-start_s,end_s,active,predicted,confidence,pred2,conf2
-0.0,59.911,True,laptop_ravi,0.9999794391403296,stand_cooler_2_swing,8.927157732881845e-06
-5.025,64.938,True,laptop_ravi,0.9999794391403296,stand_cooler_2_swing,8.927157732881845e-06
-10.058,69.963,True,laptop_ravi,0.9999794391403296,stand_cooler_2_swing,8.927157732881845e-06
-15.086,74.985,True,laptop_ravi,0.9999794391403296,stand_cooler_2_swing,8.927157732881845e-06

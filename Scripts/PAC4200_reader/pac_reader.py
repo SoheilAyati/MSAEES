@@ -1081,8 +1081,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <h1>PAC4200 Monitor</h1>
   <span class="pill"><span id="dot" class="dot"></span><b id="state">…</b></span>
   <span class="pill" id="hostpill">host: …</span>
-  <span class="pill">rate: <b id="rate">–</b> Hz</span>
-  <span class="pill">uptime: <b id="uptime">–</b></span>
+  <span class="pill">rate: <b id="rate">-</b> Hz</span>
+  <span class="pill">uptime: <b id="uptime">-</b></span>
   <span class="pill">samples: <b id="samples">0</b> · drops: <b id="drops">0</b></span>
   <span class="grow"></span>
   <button id="btnConnect" class="primary">Connect</button>
@@ -1104,7 +1104,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div id="sessNow" class="hint"></div>
       <div class="sess-list" id="sessList"></div>
       <div class="hint">Each appliance is saved to its own <code>.h5</code> file in the
-        output folder. Plug in an appliance, start, stop, then plug in the next —
+        output folder. Plug in an appliance, start, stop, then plug in the next -
         the meter connection stays up the whole time.</div>
     </div>
 
@@ -1133,7 +1133,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     <div class="panel chart-card">
       <h3>Active power P</h3>
-      <p class="sub">Total and per-phase (W) — the primary disaggregation signal</p>
+      <p class="sub">Total and per-phase (W) - the primary disaggregation signal</p>
       <canvas id="chartP" height="200"></canvas>
       <div class="legend">
         <span><i style="background:var(--p)"></i>P total</span>
@@ -1145,7 +1145,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     <div class="panel chart-card">
       <h3>Reactive power Q<sub>total</sub></h3>
-      <p class="sub">var — sign/shape distinguishes capacitive vs inductive loads</p>
+      <p class="sub">var - sign/shape distinguishes capacitive vs inductive loads</p>
       <canvas id="chartQ" height="160"></canvas>
       <div class="legend"><span><i style="background:var(--q)"></i>Q total</span></div>
     </div>
@@ -1184,10 +1184,10 @@ const READOUTS = [
 function buildReadout(){
   $("readout").innerHTML = READOUTS.map(([k,lab,u])=>
     `<div class="kv"><span class="k">${lab}</span>
-       <span class="v" id="ro_${k}">–<span class="u"> ${u}</span></span></div>`).join("");
+       <span class="v" id="ro_${k}">-<span class="u"> ${u}</span></span></div>`).join("");
 }
 function fmt(v){
-  if(v===undefined||v===null||Number.isNaN(v)) return "–";
+  if(v===undefined||v===null||Number.isNaN(v)) return "-";
   const a=Math.abs(v);
   if(a>=1000) return v.toFixed(0);
   if(a>=100) return v.toFixed(1);
@@ -1259,9 +1259,9 @@ async function pollStatus(){
       reconnecting:"var(--warn)",error:"var(--bad)",disconnected:"var(--muted)"};
     $("dot").style.background = colors[s.state]||"var(--muted)";
     $("state").textContent = s.state + (s.simulated?" (sim)":"");
-    $("hostpill").textContent = "host: "+(s.host||"–");
-    $("rate").textContent = s.effective_rate_hz ? s.effective_rate_hz.toFixed(2) : "–";
-    $("uptime").textContent = s.uptime_s ? Math.floor(s.uptime_s)+"s" : "–";
+    $("hostpill").textContent = "host: "+(s.host||"-");
+    $("rate").textContent = s.effective_rate_hz ? s.effective_rate_hz.toFixed(2) : "-";
+    $("uptime").textContent = s.uptime_s ? Math.floor(s.uptime_s)+"s" : "-";
     $("samples").textContent = s.total_samples;
     $("drops").textContent = s.total_failures;
 

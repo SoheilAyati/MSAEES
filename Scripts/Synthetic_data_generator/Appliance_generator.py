@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NILM Project — Appliance Generators
+NILM Project - Appliance Generators
 ===================================
 Single entry point for generating synthetic per-appliance traces for any
 of the 8 project appliances (plus an always-on baseload). Output matches
@@ -83,7 +83,7 @@ class ApplianceTrace:
 
 
 # ---------------------------------------------------------------------------
-# Helpers — time-of-day intensity profiles
+# Helpers - time-of-day intensity profiles
 # ---------------------------------------------------------------------------
 
 def time_of_day_intensity(hour: np.ndarray, profile_name: str) -> np.ndarray:
@@ -119,7 +119,7 @@ def solar_intensity(hour: np.ndarray, anchor_datetime: datetime,
 
 
 # ---------------------------------------------------------------------------
-# Helpers — harmonic synthesis
+# Helpers - harmonic synthesis
 # ---------------------------------------------------------------------------
 
 def synthesize_harmonics(I_fund_A: np.ndarray,
@@ -265,7 +265,7 @@ class FridgeGenerator(ApplianceGenerator):
                 Q[i0:i1] = 5.0
                 state[i0:i1] = "defrost"
 
-        # Harmonics — applied where compressor is active
+        # Harmonics - applied where compressor is active
         S = np.sqrt(P ** 2 + Q ** 2)
         I_fund = (S / V_NOMINAL).astype(np.float32)
         h_mag = np.zeros((N, N_HARMONICS), dtype=np.float32)
@@ -679,7 +679,7 @@ class EVGenerator(ApplianceGenerator):
             self._smart_session(P, Q, state, t_plug, session_dur, P_target, pf,
                                 N, sample_rate_hz)
         else:
-            # Overnight: plug in 21:00–23:00
+            # Overnight: plug in 21:00-23:00
             t_plug = self.rng.uniform(21.0, 23.0) * 3600.0
             # Realistic session duration
             session_dur = energy_needed_Wh / P_target * 3600.0
@@ -976,7 +976,7 @@ def plot_trace(trace: ApplianceTrace, sample_rate_hz: float, name: str = ""):
     fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
     axes[0].plot(t_h, trace.P, lw=0.6)
     axes[0].set_ylabel("P (W)")
-    axes[0].set_title(f"{name} — P, Q, harmonic 3rd magnitude")
+    axes[0].set_title(f"{name} - P, Q, harmonic 3rd magnitude")
     axes[0].grid(alpha=0.3)
     axes[1].plot(t_h, trace.Q, lw=0.6, color="orange")
     axes[1].set_ylabel("Q (var)")

@@ -1,9 +1,0 @@
-{
-  "input": "table_fan_mix",
-  "task": "identify",
-  "is_scenario": false,
-  "active_seconds_per_appliance": {
-    "table_fan_mix": 89.0
-  },
-  "most_likely_appliance": "table_fan_mix"
-}

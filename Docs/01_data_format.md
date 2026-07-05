@@ -1,316 +1,229 @@
-# NILM Project — Data Format Specification
+# NILM Project - Data Format Specification
 
-**Version:** 0.3    
-**Milestone:** 1    
-**Owners:** Soheil Ayati, Marc Steffgen   
-**Last updated:** 2026-05-13
+**Version:** 0.4
+**Milestone:** 1 & 2
+**Owners:** Soheil Ayati, Marc Steffgen
+**Last updated:** 2026-07-05
 
 ---
 
 ## 1. Purpose and scope
 
-This document defines the on-disk data format for synthetic (and future real) measurements in the NILM project. Every channel, rate, and structural decision is justified either by a documented capability of the **Siemens SENTRON PAC4200** power monitoring device, or by an explicit NILM requirement, or by an advantage that synthetic data offers over real datasets.
+This document defines the on-disk data formats actually written by the project code. There are four HDF5 layouts (single-appliance, scenario/aggregate, PAC4200 recording, preprocessed additions) plus one CSV format for the early hand-measured device runs. Every layout was verified against the writer code:
 
-**In scope:** channels, sampling rates, timing reference, scenario duration, file format, naming, metadata schema, sign conventions, units, numeric precision.
-
-**Out of scope:** appliance generator internals (separate doc), preprocessing pipeline details (separate doc), ML feature extraction (Milestone 2).
-
----
-
-## 2. Conceptual model
-
-Each scenario file represents 24 hours of measurements at a single point of common coupling (PCC), as if a PAC4200 were continuously polling the bus over Modbus TCP.
-
-Two parallel views are stored:
-
-- **`/measurements`** — the aggregate signal the meter would actually see. This is what a real NILM algorithm operates on.
-- **`/ground_truth`** — the per-appliance breakdown. The sum of all per-appliance contributions equals the aggregate signal (within numerical precision). This view is only possible because we control the data generation; real datasets do not have it.
-
-Plus metadata describing the scenario.
-
----
-
-## 3. PAC4200 capabilities this spec is grounded in
-
-| Capability | Value | Source |
+| Layout | Writer | Section |
 |---|---|---|
-| Internal sampling | 170 samples per cycle (~8.5 kHz at 50 Hz) | Siemens datasheet |
-| Voltage / current measurement | True-RMS, sinusoidal or distorted | Siemens datasheet |
-| Connection types supported | 3P4W, 3P3W, 3P4WB, 3P3WB, 1P2W | Siemens manual |
-| Harmonics measured | 1st through 64th, V and I per phase, mag + phase | Siemens manual |
-| THD | Per phase, V and I | Siemens datasheet |
-| Power quantities | P, Q, S, PF, cos φ per phase and total | Siemens datasheet |
-| Frequency range | 45–65 Hz | Siemens datasheet |
-| Accuracy | Class 0.2 per IEC 61557-12 | Siemens datasheet |
-| Communication | Modbus TCP (standard) | Siemens datasheet |
-| Realistic poll cycle (full register block) | ~200 ms | Modbus TCP practical bound |
-| Native load-profile storage | 15-min fixed/rolling block, 40 days buffer | Siemens manual |
+| (a) Single-appliance | `Scripts/Synthetic_data_generator/Appliance_generator.py` (`save_trace_hdf5`) and the adapter in `Scripts/Aggregator/mix_measured_scenarios.py` (`write_appliance`) | 4 |
+| (b) Scenario / aggregate | `Scripts/Aggregator/aggregator.py` (`write_scenario`), also used by `mix_measured_scenarios.py` | 5 |
+| (c) PAC4200 recording | `Scripts/PAC4200_reader/pac_reader.py` (`IncrementalHDF5Writer`) | 6 |
+| (d) Preprocessed additions | `Scripts/Preprocessor/preprocessor.py` (`write_preprocessed`) | 7 |
+| CSV (Pre_Measured) | external logging tool, files in `Pre_Measured/*.csv` | 8 |
 
-**What is NOT possible with the PAC4200 over Modbus TCP:** streaming raw waveform samples at 8.5 kHz. The device exposes processed values (RMS, P, Q, harmonics) at whatever rate the client can poll Modbus, not waveform-level data.
-
-This is the load-bearing constraint behind the sampling-rate decision in section 5.
+**In scope:** dataset names, shapes, dtypes, metadata attributes, units, sign conventions, sampling rate, compression.
+**Out of scope:** generator internals (`02_appliance_generator.md`), aggregation math (`03_aggregator.md`), preprocessing behaviour (`04_preprocessor.md`), the reader itself (`05_pac4200_reader.md`).
 
 ---
 
-## 4. Channels
+## 2. Common invariants
 
-### 4.1 Timestamp
+These hold across all four HDF5 layouts:
 
-| Name | Unit | Type | Rate | Why |
-|---|---|---|---|---|
-| `timestamp` | µs since Unix epoch (UTC) | `int64` / `datetime64[us]` | 5 Hz | µs precision because Modbus reply latency varies; ms could lose ordering on close events. UTC because no DST ambiguity. |
+- **Timestamps:** top-level `/timestamp` dataset, `int64`, microseconds since the Unix epoch, UTC. Microsecond precision because Modbus reply latency varies; UTC because it has no DST ambiguity.
+- **Measurement data:** `float32`. The PAC4200 is accuracy class 0.2 (about 3 significant digits); `float32` gives about 7, so `float64` would only double storage.
+- **Strings:** fixed-length bytes, dtype `S32` (state labels, appliance names).
+- **Compression:** LZF on every dataset (fast decompression, modest ratio; appropriate for ML loops that re-read files often).
+- **Nominal sample rate:** 5 Hz (200 ms). This is what a Modbus TCP client realistically sustains for a full PAC4200 register block, and it is fast enough to catch inrush transients (1-2 samples) and multi-state transitions.
+- **Harmonics:** 39 orders, 2 through 40. Harmonic arrays have shape `(N, 39)`; order n sits at column n-2. Magnitudes in ampere (current) and phases in radians. Note the PAC4200 itself only provides magnitudes (see section 6).
+- **Version caveat:** `format_version` is per-writer and intentionally not unified: `"0.2"` for single-appliance files, `"0.1"` for scenario files and PAC4200 recordings. Check `metadata` attrs, not the filename, when a consumer needs to distinguish layouts.
 
-### 4.2 Voltage (raw electrical, RMS line-to-neutral)
-
-| Name | Unit | Type | Rate |
-|---|---|---|---|
-| `V_L1`, `V_L2`, `V_L3` | V | `float32` | 5 Hz |
-
-**Why included:** voltage is the reference signal; needed for power calculations and to detect grid disturbances/dips.
-**Why this rate:** PAC4200 internally updates per cycle (20 ms); Modbus TCP poll cycle for a full register block is ~200 ms (5 Hz). 5 Hz captures all voltage dynamics relevant to load monitoring.
-
-### 4.3 Current (raw electrical, RMS, per phase + neutral)
-
-| Name | Unit | Type | Rate |
-|---|---|---|---|
-| `I_L1`, `I_L2`, `I_L3`, `I_N` | A | `float32` | 5 Hz |
-
-**Why included:** current is the primary load signature; the heart of NILM. When an appliance switches, current changes first.
-**Note:** PAC4200 *calculates* `I_N` from the three phase currents rather than measuring it directly. Documented here so it isn't treated as an independent measurement.
-**Why this rate:** same as voltage.
-
-### 4.4 Power
-
-| Name | Unit | Type | Rate |
-|---|---|---|---|
-| `P_L1`, `P_L2`, `P_L3`, `P_total` | W | `float32` | 5 Hz |
-| `Q_L1`, `Q_L2`, `Q_L3`, `Q_total` | var | `float32` | 5 Hz |
-| `S_L1`, `S_L2`, `S_L3`, `S_total` | VA | `float32` | 5 Hz |
-| `PF_L1`, `PF_L2`, `PF_L3`, `PF_total` | — | `float32` | 5 Hz |
-| `cosphi_L1`, `cosphi_L2`, `cosphi_L3`, `cosphi_total` | — | `float32` | 5 Hz |
-
-**Why P:** primary NILM disaggregation feature; every appliance has a characteristic P signature.
-**Why Q:** separates inductive (motors, transformers), resistive (heaters), and capacitive loads. The (P, Q) feature plane is the classical Hart-1992 NILM signature space; without Q you can't distinguish a fridge from an oven at similar wattage.
-**Why S:** derivable from P and Q, but stored to match PAC4200 native output and for fast access.
-**Why PF and cos φ:** distinguishes power-electronic loads (low PF, distorted current) from linear loads. PF is total (includes distortion); cos φ is displacement only. Storing both is cheap and disambiguating.
-**Why this rate:** same as voltage.
-
-### 4.5 Distortion
-
-| Name | Unit | Type | Rate |
-|---|---|---|---|
-| `freq` | Hz | `float32` | 5 Hz |
-| `THD_V_L1`, `THD_V_L2`, `THD_V_L3` | % | `float32` | 5 Hz |
-| `THD_I_L1`, `THD_I_L2`, `THD_I_L3` | % | `float32` | 5 Hz |
-
-**Why `freq`:** context channel for grid state and PV-grid interaction analysis. Not used directly for NILM disaggregation.
-**Why THD:** fast distortion summary; cheap to compute; coarse appliance feature. Sharp THD changes also serve as cheap event triggers.
-**Why this rate:** same as voltage.
-
-### 4.6 Harmonics
-
-| Name pattern | Unit | Type | Rate |
-|---|---|---|---|
-| `H_V_L{1,2,3}_n_mag`, n = 2..40 | V | `float32` | 5 Hz |
-| `H_V_L{1,2,3}_n_phase`, n = 2..40 | rad | `float32` | 5 Hz |
-| `H_I_L{1,2,3}_n_mag`, n = 2..40 | A | `float32` | 5 Hz |
-| `H_I_L{1,2,3}_n_phase`, n = 2..40 | rad | `float32` | 5 Hz |
-
-**Column count:** 39 harmonics × 3 phases × 2 (V, I) × 2 (mag, phase) = **468 columns**.
-
-**Why harmonics 2 through 40:** each appliance has a harmonic fingerprint. Power electronics and motors produce characteristic harmonic patterns. PAC4200 exposes up to the 64th, but appliance harmonic content decays rapidly above the 25th — truncating at 40 keeps headroom while saving ~38% storage on this section.
-
-**Why phases retained (not just magnitudes):** the same harmonic order from two different sources (e.g. PV inverter and motor) has different phase relationships relative to the fundamental. Phases are diagnostic for source attribution — directly relevant to angle 3 (PV-aware disaggregation) and angle 4 (multi-feature fusion).
-
-**Why 5 Hz (not 1 Hz):**
-- *Alignment.* All measured channels at one rate means one timestamp column applies to everything. No resampling needed for ML feature construction.
-- *Switching transients.* Inrush currents on motor start-up contain disproportionate harmonic energy that decays within ~500 ms. 1 Hz risks missing it; 5 Hz gives ~2-3 samples across the transient.
-- *Multi-state transitions.* Washing-machine and EV-mode transitions complete in 2–5 s; harmonic signatures change between phases. 1 Hz can smear two phases together.
-- *Adversarial scenarios.* Distinguishing near-simultaneous events needs joint feature vectors at one common rate.
-- *Storage is acceptable.* See appendix A.
-
-### 4.7 Ground truth (synthetic-data advantage)
-
-| Name pattern | Unit | Type | Rate |
-|---|---|---|---|
-| `state_<appliance>` | enum (string) | `category` | 5 Hz |
-| `P_contribution_<appliance>` | W | `float32` | 5 Hz |
-
-For each appliance instance in the scenario, two channels: the discrete state (e.g. `"off"`, `"spin_phase"`, `"fast_charge"`) and its active-power contribution to the aggregate signal.
-
-**Why:** real datasets don't have per-sample ground truth. This is the central synthetic-data advantage and is what makes:
-- Supervised ML in M2 trivial (every sample has a correct label).
-- Probabilistic disaggregation (angle 2) directly trainable.
-- Per-appliance error metrics computable without manual annotation.
-
-**Why same rate as measurements:** so labels and features align without resampling.
-
-**Invariant:** `sum(P_contribution_<a>) ≈ P_total` for every timestep, within numerical precision plus injected noise.
-
----
-
-## 5. Sampling rate summary
-
-| Channel group | Rate | Anchor for the rate |
-|---|---|---|
-| Voltage, current, power (P, Q, S, PF, cos φ), distortion (freq, THD), harmonics (2nd–40th, mag + phase) | **5 Hz (200 ms)** | Realistic Modbus TCP poll cycle for full PAC4200 register block |
-| Ground truth (states + contributions) | **5 Hz** | Aligned with measurements |
-| Metadata | **Once per file** | Static per scenario |
-
-No event log channel. Events can be derived post-hoc from continuous channels using change-point detection on P_total in Milestone 2.
-
----
-
-## 6. Sign conventions
-
-Defined once. Never deviated from.
+### 2.1 Sign conventions
 
 - **Active power P:** positive = consumption from grid; negative = generation (PV, synchronous machine in generator mode).
 - **Reactive power Q:** positive = inductive (lagging); negative = capacitive (leading).
-- **Apparent power S:** always non-negative (magnitude).
-- **Power factor PF:** in [0, 1], unsigned.
-- **cos φ:** in [-1, 1], signed (sign indicates leading/lagging).
+- **Apparent power S:** non-negative magnitude.
+- **Power factor PF:** signed, in [-1, +1]. The PAC4200 reports signed PF (sign indicates direction of real power flow) and the preprocessor bounds match that.
+- **cos phi:** signed, in [-1, +1] (displacement factor, fundamental only).
+- **I_N:** non-negative magnitude.
 
 ---
 
-## 7. Phase reference for harmonics
+## 3. File format choice: HDF5
 
-All harmonic phases are referred to the zero crossing of `V_L1` fundamental. Required for cross-appliance comparison when appliances sit on different phases.
+Use https://myhdf5.hdfgroup.org/ to inspect and visualize `.h5` files.
 
----
-
-## 8. Phase assignment for single-phase appliances
-
-Most household appliances (fridge, hair dryer, PCs) are single-phase. At scenario generation time, each appliance instance is assigned to a specific phase (L1, L2, or L3) and that assignment is recorded in metadata.
-
-**Why this matters:** phase assignment is a free disambiguation feature. Two identical hair dryers on different phases are distinguishable in the data; an algorithm that uses phase information will outperform one that doesn't.
-
----
-
-## 9. Timing reference and scenario duration
-
-### 9.1 Atomic unit: 24-hour scenarios
-
-Each file covers exactly 24 hours, starting at 00:00:00 UTC of a synthetic anchor date.
-
-**Why 24 hours:**
-- PV has a strong diurnal cycle. Angle 3 (PV-aware NILM) requires a full day to make sense.
-- Fridge cycles ~30–60 min → 24 h contains ~30 cycles, statistically meaningful.
-- Washing machine cycles ~1–2 h with long idle periods → 24 h captures one cycle in realistic context.
-- EV charging is typically overnight → requires a full 24 h.
-- PC and hair-dryer usage follows morning/evening time-of-day patterns.
-- These daily patterns are themselves NILM signatures; algorithms that exploit prior knowledge of when appliances run will disaggregate better.
-
-**Why not 1 hour:** too short — half the appliances never run in a 1 h window, no PV cycle, no overnight EV charging context.
-
-**Why not 1 week:** files become ~1.5 GB each, iteration is slow, one seed per file gives less variety than seven 24 h files. Weekly patterns (weekday vs weekend) are recoverable across multiple 24 h files with appropriate weekday metadata.
-
-### 9.2 Anchor datetimes
-
-Each scenario has an anchor datetime in ISO 8601 UTC stored in metadata. Anchor dates vary across scenarios so that solar elevation and weekday context vary — useful for PV realism and for generalization testing (angle 5).
-
-### 9.3 Total dataset for Milestone 1
-
-| Purpose | Count | Notes |
-|---|---|---|
-| Training scenarios (mixed easy/normal, varied parameters) | 1 day | ML training in M2 |
-| Easy tier | 1 day | Sparse, non-overlapping events |
-| Normal tier | 1 day | Realistic concurrent events |
-| Hard tier | 1 day | Concurrent events, similar-power appliances |
-| Adversarial tier | 1 day | EV mirroring hair dryer + PCs; PV cancelling fridge |
-
----
-
-## 10. File format
-
-### 10.1 Choice: HDF5 (`.h5`)
-Use https://myhdf5.hdfgroup.org/ to see and visualize .h5 files.
 | Option | Pros | Cons | Verdict |
 |---|---|---|---|
-| HDF5 | Hierarchical (measurements + ground truth + metadata in one file); efficient mixed types; built-in compression; self-describing | Slightly heavier dependency than CSV/Parquet | **Chosen** |
-| Parquet | Excellent columnar storage; great pandas/Polars integration | No native hierarchical structure; would split metadata into separate file | Rejected |
-| CSV | Universally readable | No types, no compression, slow, no nested structures | Rejected |
-
-
-Useful links:
-https://towardsdatascience.com/which-data-format-to-use-for-your-big-data-project-837a48d3661d/
-
-### 10.2 Internal structure
-
-```
-scenario_<id>.h5
-├── /timestamp                              (1D, 5 Hz)
-├── /measurements                           (group)
-│   ├── voltage      (2D: time × {V_L1, V_L2, V_L3})
-│   ├── current      (2D: time × {I_L1, I_L2, I_L3, I_N})
-│   ├── power        (2D: time × {P_L1..P_total, Q_L1..Q_total, S_*, PF_*, cosphi_*})
-│   ├── distortion   (2D: time × {freq, THD_V_L1..3, THD_I_L1..3})
-│   └── harmonics    (2D: time × 468 harmonic columns)
-├── /ground_truth                           (group)
-│   ├── states           (2D: time × N_appliances, categorical)
-│   └── contributions    (2D: time × N_appliances, W)
-├── /metadata                               (group of attributes)
-│   ├── tier                 ("easy" | "normal" | "hard" | "adversarial" | "train")
-│   ├── seed                 (int)
-│   ├── generator_version    (semver string, e.g. "0.1.0")
-│   ├── format_version       ("0.1")
-│   ├── anchor_datetime      (ISO 8601 UTC string)
-│   ├── duration_seconds     (86400)
-│   ├── sample_rate_hz       (5)
-│   └── appliances           (subgroup)
-│       └── <appliance_name>
-│           ├── phase             ("L1" | "L2" | "L3" | "all")
-│           ├── parameters        (JSON-encoded dict)
-│           └── instance_id       (int)
-└── /preprocessed                           (group, populated after preprocessing)
-    └── (mirrors /measurements structure with cleaned data)
-```
-
-### 10.3 Compression and chunking
-
-- **Compression:** LZF (fast decompression, modest ratio). Trades 2× larger files for ~3× faster read vs gzip — appropriate for ML training loops that re-read often.
-- **Chunk size:** 3600 samples per chunk (= 12 minutes at 5 Hz). Balances random access against compression efficiency.
+| HDF5 | Hierarchical (measurements + ground truth + metadata in one file); mixed types; built-in compression; self-describing; supports incremental resizable writes (needed by the live recorder) | Heavier dependency than CSV | **Chosen** |
+| Parquet | Excellent columnar storage | No native hierarchy; metadata would need a sidecar file | Rejected |
+| CSV | Universally readable | No types, no compression, no nesting | Rejected |
 
 ---
 
-## 11. File naming
+## 4. Layout (a): single-appliance file
+
+Produced by `Appliance_generator.py` for synthetic traces, and by the `mix_measured_scenarios.py` adapter when it rewrites a real PAC4200 recording into this shape. This is the only layout `aggregator.py` accepts as input.
 
 ```
-scenario_{tier}_{anchor_date}_{seed}.h5
+<appliance>.h5
+|-- /timestamp                       int64 (N,)   microseconds UTC
+|-- /measurements
+|   |-- P                            float32 (N,)     W, contribution to aggregate
+|   |-- Q                            float32 (N,)     var
+|   |-- harmonics_I_mag              float32 (N, 39)  A, orders 2..40
+|   `-- harmonics_I_phase            float32 (N, 39)  rad
+|-- /ground_truth
+|   |-- state                        S32 (N,)         per-sample state label
+|   `-- P_contribution               float32 (N,)     identical to /measurements/P
+`-- /metadata                        (attrs)
+    |-- format_version               "0.2"
+    |-- generator_version            "0.1.0" (or "pac_adapter_0.1" from the mix adapter)
+    |-- sample_rate_hz               float
+    |-- anchor_datetime              ISO 8601 UTC string
+    |-- tier                         "single_appliance" (or "measured_single")
+    `-- appliance_metadata           JSON: name, appliance_type, instance_id,
+                                     phase ("L1"|"L2"|"L3"|"all"), is_three_phase,
+                                     seed, params (+ instance_params or source_label)
 ```
 
-Examples:
-- `scenario_train_20240101_42.h5`
-- `scenario_hard_20240315_137.h5`
-- `scenario_adversarial_20240601_999.h5`
-
-`tier` ∈ {train, easy, normal, hard, adversarial}.
-`anchor_date` in `YYYYMMDD`.
-`seed` is the random seed (int).
-
-The name alone identifies the file uniquely without opening it.
+For three-phase appliances (PV, synchronous machine), P and Q are the totals across all phases; the aggregator distributes them equally to L1/L2/L3 based on `is_three_phase`.
 
 ---
 
-## 12. Numeric precision
+## 5. Layout (b): scenario / aggregate file
 
-- **All measurement and ground-truth channels:** `float32`. PAC4200 accuracy is class 0.2 (~0.2%), giving ~3 significant digits; `float32` provides ~7 significant digits, well beyond meter accuracy. `float64` doubles storage with no real benefit.
-- **Timestamps:** `int64` microseconds since Unix epoch, displayed as `datetime64[us]`.
-- **States:** pandas categorical (compact integer-backed string enum).
+Produced by `aggregator.py::write_scenario`. This is what the MS2 pipeline trains on. `mix_measured_scenarios.py` writes the same layout with `tier="measured"`.
+
+All measurement channels are **1D per-channel datasets** (not 2D column blocks):
+
+```
+scenario.h5  /  measured_scenario_NN.h5
+|-- /timestamp                       int64 (N,)
+|-- /measurements
+|   |-- V_L1, V_L2, V_L3             float32 (N,)  RMS line-to-neutral, V
+|   |-- I_L1, I_L2, I_L3             float32 (N,)  true-RMS current, A
+|   |-- I_N                          float32 (N,)  neutral current magnitude, A
+|   |-- P_L1..L3, P_total            float32 (N,)  W
+|   |-- Q_L1..L3, Q_total            float32 (N,)  var
+|   |-- S_L1..L3, S_total            float32 (N,)  VA
+|   |-- PF_L1..L3, PF_total          float32 (N,)  true PF (includes distortion)
+|   |-- cosphi_L1..L3, cosphi_total  float32 (N,)  displacement factor
+|   |-- THD_V_L1..L3                 float32 (N,)  %, per phase (line-to-neutral)
+|   |-- THD_I_L1..L3                 float32 (N,)  %
+|   |-- freq                         float32 (N,)  Hz
+|   `-- harmonics/
+|       |-- I_mag_{L1,L2,L3}         float32 (N, 39)
+|       |-- I_phase_{L1,L2,L3}       float32 (N, 39)
+|       |-- V_mag_{L1,L2,L3}         float32 (N, 39)
+|       `-- V_phase_{L1,L2,L3}       float32 (N, 39)
+|-- /ground_truth
+|   |-- appliance_names              S32 (n_app,)   e.g. "fridge_1"
+|   |-- P_contribution               float32 (N, n_app)
+|   |-- Q_contribution               float32 (N, n_app)
+|   |-- state                        S32 (N, n_app)
+|   `-- attrs: appliance_<i>_metadata  (JSON per appliance)
+`-- /metadata                        (attrs)
+    |-- format_version               "0.1"
+    |-- aggregator_version           "0.1.0"
+    |-- sample_rate_hz, anchor_datetime
+    |-- tier                         train|easy|normal|hard|adversarial|measured
+    |-- scenario_seed, n_appliances, n_samples, duration_seconds
+```
+
+**Invariant:** `sum over appliances of P_contribution[:, a]` equals `P_total` at every sample, within float32 precision. The aggregator prints this check on every run.
+
+---
+
+## 6. Layout (c): PAC4200 recording
+
+Produced by `pac_reader.py` per recording session. It shares the scenario skeleton (top-level `/timestamp`, per-channel 1D float32 datasets under `/measurements`) so `preprocessor.py` runs on it unchanged, but the channel set is the meter's **verified core register map**, which differs from layout (b):
+
+- **Present:** `V_L1..L3`, `V_L12`, `V_L23`, `V_L31` (line-to-line voltages), `I_L1..L3`, `S_L1..L3`, `P_L1..L3`, `Q_L1..L3`, `PF_L1..L3`, `THD_V_L12`, `THD_V_L23`, `THD_V_L31`, `freq`, `V_avg_LN`, `V_avg_LL`, `I_avg`, `S_total`, `P_total`, `Q_total`, `PF_total`, `unbalance_V`, `unbalance_I`.
+- **Absent:** `I_N`, `cosphi_*`, per-phase `THD_I_*`, per-phase `THD_V_L1..L3`. THD voltage on this meter's core block is **line-to-line**, not line-to-neutral. THD current and cos phi live in unverified register regions and are only added once confirmed (see `05_pac4200_reader.md`).
+- **No `/ground_truth` group.** Real aggregate measurements have no per-appliance breakdown; the label of what was plugged in is in `appliance_label`.
+- **Gaps:** a failed poll is stored as a NaN sample with an estimated timestamp, so gaps are visible to the preprocessor.
+
+```
+<label>_<YYYYmmdd_HHMMSS>.h5
+|-- /timestamp                       int64 (N,)  resizable, chunked (512,)
+|-- /measurements/<channel>          float32 (N,) for each core channel above
+|-- /measurements/harmonics/         only when recorded with --harmonics
+|   |-- I_mag_{L1,L2,L3}             float32 (N, 39)
+|   |-- I_phase_{L1,L2,L3}           float32 (N, 39)  ALWAYS ZERO (see below)
+|   |-- V_mag_{L1,L2,L3}             float32 (N, 39)
+|   `-- V_phase_{L1,L2,L3}           float32 (N, 39)  ALWAYS ZERO
+`-- /metadata                        (attrs)
+    |-- format_version               "0.1"
+    |-- app_version                  "1.0.0"
+    |-- sample_rate_hz, anchor_datetime
+    |-- source                       "pac4200_monitor"
+    |-- appliance_label              the session label
+    |-- channels                     JSON list of channel names
+    |-- harmonics_enabled            bool
+    |-- harmonic_orders              JSON [2..40]        (only with harmonics)
+    |-- harmonic_phase_captured      False               (only with harmonics)
+    `-- recording_summary            JSON, written on close: appliance_label,
+                                     duration_s, n_samples, n_gaps,
+                                     configured_sample_rate_hz,
+                                     harmonics_enabled, completed_utc
+```
+
+The PAC4200 exposes per-order harmonic **magnitudes only** (via Modbus FC 0x14 file records). The `*_phase` datasets exist to keep the array shape identical to layout (b) but are always zero on real recordings; `harmonic_phase_captured=False` makes that explicit so downstream code does not mistake them for measured zeros.
+
+---
+
+## 7. Layout (d): preprocessed additions
+
+`preprocessor.py` modifies a layout (b) or (c) file in place, adding one group and leaving `/measurements`, `/ground_truth`, and `/metadata` untouched as the audit trail. Re-running replaces only `/preprocessed`.
+
+```
+/preprocessed
+|-- /cleaned/<channel>               float32 (N,)  one per 1D input channel
+|-- /features/<name>                 float32 (N,)  the 12 derived features
+`-- attrs
+    |-- report                       JSON (counts of NaN/inf/outliers/gaps, etc.)
+    `-- preprocessor_version         "0.1.0"
+```
+
+The feature catalogue and the report schema are specified in `04_preprocessor.md`. 2D harmonic arrays are not cleaned; consumers read them from `/measurements/harmonics/` directly.
+
+---
+
+## 8. CSV format: Pre_Measured device runs
+
+`Pre_Measured/pac4200_*_200ms.csv` are early single-device measurements (toaster, hair dryer stage 1, fluorescent tube, LED lamp, USB charger, mixer) logged at 200 ms from the PAC4200 before the HDF5 recorder existed. Format:
+
+- Separator: `;` (semicolon). Decimal point is `.`.
+- One row per sample; single phase (L1) plus totals only; no per-order harmonics.
+- Columns: `timestamp_iso` (ISO 8601, Z suffix), `device_name`, `run_id`, `sample_interval_ms`, `u_l1_n_v`, `i_l1_a`, `p_total_w`, `s_total_va`, `s_calc_va`, `q_total_var`, `pf_total`, `frequency_hz`, `thd_u_l1_percent`, `thd_i_l1_percent`, `block_time_difference_ms`.
+- `pf_total` and `thd_i_l1_percent` contain the literal token `NaN` when the load draws no current; parsers must handle it.
+
+These files drive the "common channel" (no-harmonics, single-phase) transfer experiments in MS2.
+
+---
+
+## 9. File naming
+
+| Layout | Pattern | Example |
+|---|---|---|
+| Single-appliance (synthetic) | `<appliance>.h5` (CLI `--output` overrides) | `fridge.h5` |
+| Scenario (synthetic) | `--output`, conventionally `scenario_<tier>_*.h5` | `scenario_hard_20240315_137.h5` |
+| Scenario (measured mix) | `measured_scenario_NN.h5` + `manifest.json` | `measured_scenario_03.h5` |
+| PAC4200 recording | `<safe_label>_<YYYYmmdd_HHMMSS>.h5` | `table_fan_med_20260701_135036.h5` |
+
+PAC4200 recording labels follow the convention `<device>_<setting>`; simultaneous multi-device recordings join labels with a double underscore (`water_boiler_on__table_lamp_on`); see `05_pac4200_reader.md` section 10.
 
 ---
 
 ## Appendix A: Storage budget
 
-At 5 Hz over 24 h = 432 000 samples per channel.
+At 5 Hz over 24 h = 432 000 samples per channel (float32 = 4 bytes):
 
-| Section | Columns | Raw size (float32) |
+| Section (layout b) | Datasets | Raw size |
 |---|---|---|
-| Voltage | 3 | 5.2 MB |
-| Current | 4 | 6.9 MB |
-| Power (P, Q, S, PF, cos φ each × 4) | 20 | 34.6 MB |
-| Distortion (freq + 6 × THD) | 7 | 12.1 MB |
-| Harmonics (468) | 468 | 808 MB |
-| Ground truth (~10 appliance × 2) | ~20 | 34.6 MB |
-| **Total raw** | ~520 | **~900 MB / day** |
-| **After LZF compression (~25% ratio)** | | **~225–450 MB/day depending on noise level and harmonic variability.** |
+| Scalar channels | 34 | 59 MB |
+| Harmonics (12 arrays x 39 cols) | 468 columns | 808 MB |
+| Ground truth (10 appliances) | ~21 columns | 36 MB |
+| **Total raw** | | **~900 MB / day** |
+| After LZF | | roughly 25-50% of raw, depending on harmonic variability |
+
+Short measured scenarios (300 s) and PAC4200 recordings (minutes each) are far smaller, typically well under 1 MB.

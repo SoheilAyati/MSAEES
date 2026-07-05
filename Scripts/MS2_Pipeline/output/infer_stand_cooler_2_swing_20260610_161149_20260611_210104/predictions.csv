@@ -1,5 +1,0 @@
-start_s,end_s,active,predicted,confidence,pred2,conf2
-0.0,29.799844,True,stand_cooler_2_swing,0.999755019902073,stand_cooler_mixed_withSwing,0.00024468006373057
-4.994598,34.7905,True,stand_cooler_2_swing,0.999767413632165,stand_cooler_mixed_withSwing,0.00011144163639287097
-9.998027,39.794869,True,stand_cooler_2_swing,0.9999826749632306,stand_cooler_mixed_withSwing,8.167350432271048e-06
-15.000073,44.791296,True,stand_cooler_2_swing,0.9999475622187491,stand_cooler_mixed_withSwing,2.462499578556694e-05

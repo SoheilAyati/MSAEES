@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-NILM Project — Scenario Aggregator
+NILM Project - Scenario Aggregator
 ===================================
 Combines per-appliance HDF5 files (from Appliance_generator.py) into a
 single scenario file that mimics what a Siemens PAC4200 would log at the
 Point of Common Coupling.
 
 This is a SYNTHETIC-DATA-ONLY step. In a real deployment the PAC4200
-already provides aggregated signals — the aggregator simulates that
+already provides aggregated signals - the aggregator simulates that
 physics so the downstream preprocessing/ML pipeline is identical for
 real and synthetic data.
 
@@ -137,7 +137,7 @@ def aggregate_power_per_phase(appliances: List[dict], N: int) -> Tuple[Dict, Dic
 def aggregate_harmonics_per_phase(appliances: List[dict], N: int
                                   ) -> Dict[str, Dict[str, np.ndarray]]:
     """Sum current harmonics as COMPLEX vectors per phase. The same harmonic
-    order from two appliances doesn't simply add in magnitude — phases
+    order from two appliances doesn't simply add in magnitude - phases
     interact. This is the correct physics and what makes harmonic-based
     NILM disaggregation non-trivial when multiple appliances run together."""
     complex_per_phase = {
@@ -160,7 +160,7 @@ def aggregate_harmonics_per_phase(appliances: List[dict], N: int
 def synthesize_voltage(N: int, sample_rate_hz: float, rng: np.random.Generator
                       ) -> Dict[str, np.ndarray]:
     """Generate per-phase RMS voltage as nominal + small slow drift.
-    Stiff infinite-bus assumption — voltage is independent of load."""
+    Stiff infinite-bus assumption - voltage is independent of load."""
     V = {}
     for phase in ("L1", "L2", "L3"):
         # Slow random walk on 30-second scale, bounded to ±2 V
@@ -288,12 +288,12 @@ def aggregate(input_files: List[str], scenario_seed: int = 0,
     P_total = sum(P_phase.values())
     Q_total = sum(Q_phase.values())
 
-    # Voltage and frequency (independent of load — stiff bus)
+    # Voltage and frequency (independent of load - stiff bus)
     V_phase = synthesize_voltage(N, sample_rate, rng)
     V_harmonics = synthesize_voltage_harmonics(V_phase, rng)
     freq = synthesize_frequency(N, sample_rate, rng)
 
-    # Current — fundamental and true RMS
+    # Current - fundamental and true RMS
     I_harmonics = aggregate_harmonics_per_phase(appliances, N)
     I_fund, I_rms = compute_phase_currents(P_phase, Q_phase, V_phase, I_harmonics)
     I_neutral = compute_neutral_current(I_rms)
@@ -350,7 +350,7 @@ def write_scenario(path: str, agg: dict, tier: str = "train"):
     with h5py.File(path, "w") as f:
         f.create_dataset("timestamp", data=agg["timestamp"], compression="lzf")
 
-        # /measurements — clean aggregate data, format-matched to PAC4200 outputs
+        # /measurements - clean aggregate data, format-matched to PAC4200 outputs
         m = f.create_group("measurements")
         for phase in ("L1", "L2", "L3"):
             m.create_dataset(f"V_{phase}", data=agg["V"][phase], compression="lzf")
@@ -371,7 +371,7 @@ def write_scenario(path: str, agg: dict, tier: str = "train"):
         m.create_dataset("cosphi_total", data=agg["cosphi_total"], compression="lzf")
         m.create_dataset("freq", data=agg["freq"], compression="lzf")
 
-        # /measurements/harmonics — per-phase mag and phase, V and I
+        # /measurements/harmonics - per-phase mag and phase, V and I
         h = m.create_group("harmonics")
         for phase in ("L1", "L2", "L3"):
             h.create_dataset(f"I_mag_{phase}", data=agg["I_harmonics"][phase]["mag"],
@@ -383,7 +383,7 @@ def write_scenario(path: str, agg: dict, tier: str = "train"):
             h.create_dataset(f"V_phase_{phase}", data=agg["V_harmonics"][phase]["phase"],
                              compression="lzf")
 
-        # /ground_truth — only available because we control generation
+        # /ground_truth - only available because we control generation
         gt = f.create_group("ground_truth")
         appliance_names = [a["metadata"]["name"] + f"_{a['metadata']['instance_id']}"
                            for a in agg["appliances"]]
@@ -452,7 +452,7 @@ def print_summary(agg: dict):
     invariant_err = np.abs(P_sum_contrib - agg["P_total"]).max()
     P_scale = max(1.0, np.abs(agg["P_total"]).max())
     rel_err = invariant_err / P_scale
-    status = "OK" if rel_err < 1e-5 else "WARNING — should be ~ float32 precision"
+    status = "OK" if rel_err < 1e-5 else "WARNING - should be ~ float32 precision"
     print(f"  Invariant check: max |sum(P_contrib) - P_total| = {invariant_err:.3e} W "
           f"({rel_err*100:.2e}% of peak)  [{status}]")
 

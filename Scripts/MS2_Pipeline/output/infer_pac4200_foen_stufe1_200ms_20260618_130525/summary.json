@@ -1,9 +1,0 @@
-{
-  "input": "Foen Stufe 1",
-  "task": "identify",
-  "is_scenario": false,
-  "active_seconds_per_appliance": {
-    "laptop_ravi": 20.0
-  },
-  "most_likely_appliance": "laptop_ravi"
-}

@@ -10,7 +10,7 @@ which the feature-based RF/LightGBM models can't see.
 It uses scikit-learn's MLP, so it needs NO extra dependency and runs in your
 existing environment (a true PyTorch CNN/LSTM is a heavier future upgrade that
 needs a torch env). Supported tasks: disaggregate (regression) and presence
-(multi-label) — the scenario tasks where waveform shape helps most.
+(multi-label) - the scenario tasks where waveform shape helps most.
 
 Called from train.py (--model mlp) and infer.py (when the model bundle is a DL
 model). Models are saved as model_<task>_mlp.joblib so they don't overwrite the
@@ -139,7 +139,7 @@ def infer(sig, bundle, args, out):
             if Ypow is not None:
                 ax[k].plot(hours, Ypow[:, j], color="#1f4e79", lw=1.0, ls="--", label="true")
             ax[k].set_ylabel(f"{names[j]}\nP (W)"); ax[k].legend(fontsize=8, loc="upper right")
-        ax[-1].set_xlabel("hour"); ax[0].set_title(f"Disaggregation (MLP) — {sig.name}")
+        ax[-1].set_xlabel("hour"); ax[0].set_title(f"Disaggregation (MLP) - {sig.name}")
         plt.tight_layout(); plt.savefig(os.path.join(out, "disaggregation.png"), dpi=110); plt.close()
         print("  wrote disaggregation.csv, summary.json, disaggregation.png")
     else:  # presence
@@ -165,7 +165,7 @@ def infer(sig, bundle, args, out):
             ax.set_yticks([i + 0.5 for i in range(len(names))]); ax.set_yticklabels(names, fontsize=8)
             ax.set_ylim(0, len(names)); ax.set_title(title)
 
-        gantt(axes[0, 0], Pp, f"Predicted presence (MLP) — {sig.name}")
+        gantt(axes[0, 0], Pp, f"Predicted presence (MLP) - {sig.name}")
         if Ypres is not None:
             gantt(axes[1, 0], Ypres, "Ground-truth presence")
         axes[-1, 0].set_xlabel("hour")
