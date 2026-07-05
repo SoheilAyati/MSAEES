@@ -52,7 +52,6 @@ import argparse
 import glob
 import json
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -73,22 +72,14 @@ sys.path.insert(0, os.environ.get("AGG_DIR", HERE))
 sys.path.insert(0, HERE)
 import aggregator as agg  # noqa: E402
 
+# Label -> family parsing is shared with the MS2 pipeline (single source of
+# truth), so 'standing_fan_high_no_rotation' and 'standing_fan_low_rotation'
+# collapse to the same family here AND at training/inference time.
+sys.path.insert(0, os.path.join(HERE, "..", "MS2_Pipeline"))
+from nilm_pipeline import parse_family as family, is_mixed_label  # noqa: E402
+
 N_HARMONICS = 39
-
-
-# ---------------------------------------------------------------------------
-# Appliance "family" grouping (so we never sum two variants of one device)
-# ---------------------------------------------------------------------------
-_FAMILY_PREFIXES = ("stand_cooler", "table_fan", "table_pv", "laptop")
-
-
-def family(label: str) -> str:
-    """Collapse a recording label to its base appliance family."""
-    l = (label or "appliance").lower()
-    for fam in _FAMILY_PREFIXES:
-        if l.startswith(fam):
-            return fam
-    return re.split(r"[_\d]", l)[0] or l
+MIN_SAMPLES = 25            # skip recordings shorter than ~5 s @ 5 Hz
 
 
 # ---------------------------------------------------------------------------
@@ -122,16 +113,47 @@ def _tile_to(arr: np.ndarray, N: int) -> np.ndarray:
     return np.concatenate([arr] * reps, axis=0)[:N]
 
 
+def _make_schedule(N: int, sr: float, rng) -> np.ndarray:
+    """Random ON/OFF usage schedule (bool mask) with realistic block lengths.
+
+    Without this, every appliance is ON for the whole scenario (the looped
+    recording), the model never sees per-device OFF periods inside a mix, and
+    it learns 'everything is always on' -- exactly the false-alarm failure the
+    real mixed recordings exposed. Alternating ON (30-120 s) and OFF (15-90 s)
+    blocks give every window a random device subset instead.
+    """
+    sched = np.zeros(N, dtype=bool)
+    pos = 0
+    on = bool(rng.uniform() < 0.6)
+    while pos < N:
+        dur_s = rng.uniform(30, 120) if on else rng.uniform(15, 90)
+        L = max(1, int(dur_s * sr))
+        if on:
+            sched[pos:pos + L] = True
+        pos += L
+        on = not on
+    if not sched.any():                 # guarantee the appliance runs at all
+        sched[: max(1, int(45 * sr))] = True
+    return sched
+
+
 # ---------------------------------------------------------------------------
 # Write one PAC recording as an Appliance_generator-format file
 # ---------------------------------------------------------------------------
 def write_appliance(path: str, rec: dict, N: int, sr: float,
                     anchor: datetime, name: str, instance_id: int,
-                    phase: str = "L1", on_W: float = 3.0) -> None:
+                    phase: str = "L1", on_W: float = 3.0, rng=None,
+                    schedule: bool = True) -> None:
     P = _tile_to(rec["P"], N).astype(np.float32)
     Q = _tile_to(rec["Q"], N).astype(np.float32)
     hm = _tile_to(rec["h_mag"], N).astype(np.float32)
     hp = _tile_to(rec["h_phase"], N).astype(np.float32)
+    if schedule and rng is not None:
+        mask = _make_schedule(N, sr, rng)
+        P = P * mask
+        Q = Q * mask
+        hm = hm * mask[:, None]
+        hp = hp * mask[:, None]
     state = np.where(np.abs(P) > on_W, b"on", b"off").astype("S32")
 
     dt_us = int(round(1e6 / sr))
@@ -196,9 +218,31 @@ def _plot_scenario(path: str, out_png: str) -> None:
 # ---------------------------------------------------------------------------
 def build(args) -> None:
     files = sorted(glob.glob(os.path.join(args.recordings, "*.h5")))
+    if args.exclude:
+        import fnmatch
+        files = [f for f in files
+                 if not fnmatch.fnmatch(os.path.basename(f), args.exclude)]
     if not files:
         sys.exit(f"no .h5 recordings found in {args.recordings}")
-    recs = [load_pac(p) for p in files]
+
+    recs = []
+    for p in files:
+        r = load_pac(p)
+        # mixed recordings ('a__b__c' = several devices at once) have no
+        # per-device ground truth -> not usable as single-appliance sources;
+        # they serve as real test inputs for infer/live instead.
+        if is_mixed_label(r["label"]):
+            print(f"  skip (mixed recording, keep for testing): {os.path.basename(p)}")
+            continue
+        if r["n"] < MIN_SAMPLES:
+            print(f"  skip (too short, {r['n']} samples): {os.path.basename(p)}")
+            continue
+        if float(np.abs(r["P"]).max()) < 1.0:
+            print(f"  note: '{r['label']}' never draws power (max |P| < 1 W) - "
+                  f"kept, but it can only teach 'always off'")
+        recs.append(r)
+    if not recs:
+        sys.exit("no usable single-appliance recordings after filtering")
 
     pool: dict = {}
     for r in recs:
@@ -212,12 +256,35 @@ def build(args) -> None:
     os.makedirs(args.out, exist_ok=True)
     rng = np.random.default_rng(args.seed)
 
-    lo = max(2, min(args.min_app, len(fam_names)))
+    lo = max(1, min(args.min_app, len(fam_names)))
     hi = min(args.max_app, len(fam_names))
+
+    # ---- plan scenario compositions, then guarantee coverage ---------------
+    # Every family must appear in >= min_cover scenarios; otherwise a grouped
+    # train/test split can end up with a device ONLY in the held-out set (the
+    # model then never learns it) or only in training (its score is untestable).
+    plans = []
+    for _ in range(args.n_scenarios):
+        n_app = int(rng.integers(lo, hi + 1)) if hi > lo else lo
+        plans.append([str(x) for x in rng.choice(fam_names, size=n_app, replace=False)])
+    min_cover = min(4, args.n_scenarios)
+    for fam in fam_names:
+        cover = sum(fam in pl for pl in plans)
+        while cover < min_cover:
+            candidates = [pl for pl in plans if fam not in pl]
+            if not candidates:
+                break
+            pl = min(candidates, key=len)
+            if len(pl) < hi:
+                pl.append(fam)
+            else:                       # swap out the most-covered member
+                counts = {f: sum(f in q for q in plans) for f in pl}
+                pl[pl.index(max(counts, key=counts.get))] = fam
+            cover = sum(fam in pl for pl in plans)
+
     manifest = []
     for k in range(args.n_scenarios):
-        n_app = int(rng.integers(lo, hi + 1)) if hi > lo else lo
-        chosen = [str(x) for x in rng.choice(fam_names, size=n_app, replace=False)]
+        chosen = plans[k]
         tmp = tempfile.mkdtemp(prefix=f"scn{k}_")
         try:
             app_files = []
@@ -225,7 +292,9 @@ def build(args) -> None:
                 variants = pool[fam]
                 rec = variants[int(rng.integers(0, len(variants)))]
                 ap = os.path.join(tmp, f"{fam}_{i + 1}.h5")
-                write_appliance(ap, rec, N, args.rate, anchor, name=fam, instance_id=i + 1)
+                write_appliance(ap, rec, N, args.rate, anchor, name=fam,
+                                instance_id=i + 1, rng=rng,
+                                schedule=not args.no_schedule)
                 app_files.append(ap)
             a = agg.aggregate(app_files, scenario_seed=int(rng.integers(0, 1_000_000)))
             out = os.path.join(args.out, f"measured_scenario_{k:02d}.h5")
@@ -262,6 +331,12 @@ def main():
     p.add_argument("--min-app", type=int, default=2, help="min appliances per scenario")
     p.add_argument("--max-app", type=int, default=4, help="max appliances per scenario")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--exclude", default=None, metavar="GLOB",
+                   help="skip recordings whose filename matches this pattern "
+                        "(e.g. 'test_*' to hold test recordings out of training)")
+    p.add_argument("--no-schedule", action="store_true",
+                   help="keep every appliance ON for the whole scenario instead "
+                        "of the random usage schedule")
     p.add_argument("--plot", action="store_true",
                    help="also save a per-scenario decomposition PNG (needs matplotlib)")
     args = p.parse_args()

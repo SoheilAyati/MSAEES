@@ -30,7 +30,7 @@
     "table_pv"
   ],
   "on_W": 15.0,
-  "macro_f1": 0.17735198678150427,
+  "macro_f1": 0.21367521367521367,
   "per_appliance_f1": {
     "baseload": 0.0,
     "ev": 0.0,
@@ -41,9 +41,9 @@
     "resistive": 0.0,
     "synchronous": 0.0,
     "washing_machine": 0.0,
-    "laptop": 0.9946871310507674,
-    "stand_cooler": 0.9461942257217848,
-    "table_fan": 0.3646944713870029,
+    "laptop": 1.0,
+    "stand_cooler": 1.0,
+    "table_fan": 0.7777777777777778,
     "table_pv": 0.0
   }
 }

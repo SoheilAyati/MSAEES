@@ -1,11 +1,11 @@
 # NILM Project — MS2 Pipeline Reference
 
-**Version:** 1.0
-**Milestone:** 2
+**Version:** 1.2
+**Milestone:** 2 (+ live extensions)
 **Location:** `Scripts/MS2_Pipeline/`
-**Companion to:** `06_milestone2_plan.md` (the plan) — this document describes what was actually built.
+**Companion to:** `06_milestone2_plan.md` (the plan), `08_live_nilm.md` (live monitor + training-on-the-go) — this document describes what was actually built.
 **Owners:** Soheil Ayati, Marc Steffgen
-**Last updated:** 2026-06-07
+**Last updated:** 2026-07-02
 
 ---
 
@@ -18,9 +18,16 @@ train.py    labelled data in   ->  a trained model (+ metrics)
 infer.py    one signal in      ->  results (CSV + JSON + plots)
 ```
 
-Plus a shared library (`nilm_pipeline.py`), the neural-network module (`deep_models.py`), a corpus generator (`generate_corpus.py`), and a point-and-click UI (`app.py`). Nothing here depends on the old `Scripts/MS2/` exploration folder.
+Plus a shared library (`nilm_pipeline.py`), the neural-network module (`deep_models.py`), a corpus generator (`generate_corpus.py`), the **live monitor** (`live.py`, see `08_live_nilm.md`), and a point-and-click UI (`app.py`). Nothing here depends on the old `Scripts/MS2/` exploration folder.
 
-The pipeline supports **three tasks** (identify, disaggregate, presence) and **three model families** (Random Forest, LightGBM, MLP neural network).
+The pipeline supports **four tasks** (identify, disaggregate, presence, **mix** = presence + disaggregate in one bundle) and **three model families** (Random Forest, LightGBM, MLP neural network).
+
+**The appliance vocabulary is dynamic.** `train.py` derives the device list from whatever the training data contains (`nilm_pipeline.scan_canon`) and stores it in the model bundle; inference and the live monitor read it back. Teaching a new device and retraining is therefore enough to grow the model — no code change. The legacy `CANON` list is only a fallback.
+
+**Recording label conventions** (`nilm_pipeline.parse_family/parse_families`):
+- state/setting suffixes are stripped: `standing_fan_high_no_rotation` → family `standing_fan`;
+- session prefixes are stripped: `test_water_boiler_on` → `water_boiler`;
+- a double underscore separates SIMULTANEOUS devices: `pv__water_boiler_on` is a real two-device mix. Such recordings are excluded from single-appliance training and serve as *test* inputs — inference parses the expected device set from the name and reports set-accuracy against it.
 
 ---
 
@@ -29,14 +36,15 @@ The pipeline supports **three tasks** (identify, disaggregate, presence) and **t
 | File | Role |
 |---|---|
 | `app.py` | Streamlit UI for everything (`streamlit run app.py`) |
+| `live.py` | **live monitor**: real-time recognition + event log + teach/retrain on the go (`08_live_nilm.md`) |
 | `train.py` | training pipeline — learn a model from labelled data |
 | `infer.py` | inference pipeline — run a trained model on one signal |
-| `nilm_pipeline.py` | shared library: file loading + feature/sequence extraction |
+| `nilm_pipeline.py` | shared library: file loading, label→family parsing, feature/sequence extraction |
 | `deep_models.py` | neural-network (MLP) training + inference |
 | `generate_corpus.py` | build a multi-seed synthetic corpus (calls the MS1 generator + aggregator) |
 | `requirements.txt` | Python dependencies |
 | `README.md` | short usage guide |
-| `output/` | trained models, metrics, and per-run inference results |
+| `output/` | trained models, metrics, per-run inference results, live session logs |
 
 ---
 
@@ -113,9 +121,12 @@ The MLP path does **not** use the summary features above. `aggregate_sequences()
 
 | Task | Question it answers | Training data | Output per window |
 |---|---|---|---|
-| **identify** | "what single appliance is this?" | single-appliance / single-device files (label per file) | one appliance label |
+| **identify** | "what single appliance is this?" | single-appliance / single-device files (label per file, mapped to its family) | one appliance label |
 | **disaggregate** | "how much power does each appliance draw?" | scenario `.h5` with ground truth | per-appliance power (W) |
 | **presence** | "which appliances are ON right now?" | scenario `.h5` with ground truth | multi-label on/off per appliance |
+| **mix** | both of the above at once: "which devices are ON *and* how many watts each?" | scenario `.h5` with ground truth | on/off + P(on) + gated watts per appliance |
+
+`mix` trains a presence classifier and a power regressor on the same windows and saves them as ONE bundle (`model_mix.joblib`). Inference gates the power by presence (a device predicted OFF contributes 0 W) and additionally reports the *unexplained residual* (measured total − Σ estimates). This is the bundle the live monitor uses.
 
 **When to use which:**
 - `identify` is for *single-device* signals — the real PAC4200 device CSVs, or single-appliance synthetic files. On a mixed scenario it can only name the one appliance each window most resembles (a known limitation; the infer plot shows this against ground truth).
@@ -144,13 +155,17 @@ python train.py --data <files|globs|dirs> [options]
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--task` | identify | identify / disaggregate / presence |
+| `--task` | identify | identify / disaggregate / presence / mix |
 | `--model` | rf | rf / lgbm / mlp |
 | `--features` | auto | identify only: auto / common / full |
-| `--window` | 30 | window length (s) |
+| `--window` | 30 | window length (s); 10 s recommended for measured scenarios |
 | `--stride` | 30 | stride (s); identify only |
 | `--on-threshold` | 5 | "active window" power floor (W) |
+| `--on-w` | 15 | presence/mix: \|appliance power\| above this counts as ON (use 5 W for the measured devices — the table fan draws 11 W) |
+| `--raw-labels` | off | identify: keep full recording labels instead of collapsing to device families |
 | `--out` | `output` | where models + metrics are written |
+
+Every bundle now also stores its **held-out metrics** (`bundle["metrics"]`), so inference outputs and the live dashboard can display the model's accuracy without hunting for the metrics JSON. Multi-label F1 is macro-averaged **only over appliances that occur** in the held-out data (an appliance that is absent and never falsely predicted scores `null`, not 0).
 
 **Honest evaluation.** When the data contains several instances (e.g. multiple seeds in sub-folders), the held-out split keeps **whole instances apart** (`GroupShuffleSplit`), so the reported score reflects generalisation to appliances the model never saw — not memorisation. With only one instance per class it falls back to a stratified row split (and says so).
 
@@ -179,7 +194,10 @@ The model file remembers its own task and (for disaggregate/presence/mlp) its wi
 |---|---|---|
 | identify | `predictions.csv`, `summary.json` | `identify_timeline.png` — signal with the area under it **coloured by predicted appliance**; a hatched overlay marks the model's 2nd-best guess; if the scenario has ground truth, a **truth panel** is drawn below for comparison |
 | disaggregate | `disaggregation.csv`, `summary.json` (energy kWh/appliance, MAE if GT) | `disaggregation.png` — predicted vs true power for the top appliances |
-| presence | `presence.csv`, `summary.json` (fraction on, F1 if GT) | `presence_timeline.png` — **Gantt** of predicted presence, with ground-truth presence below when available |
+| presence | `presence.csv` (incl. per-device probabilities), `summary.json` (fraction on, mean confidence, F1 if GT) | `presence_timeline.png` — **Gantt** of predicted presence, with ground-truth presence below when available |
+| mix | `mix_timeline.csv` (on/off + probability + watts per device, measured total, residual), `summary.json` | `mix_timeline.png` — stacked per-device power under the measured total + presence Gantt (+ truth Gantt if GT) |
+
+**Accuracy is always part of the result.** Every summary carries the model's held-out metrics; with ground truth it adds F1/MAE against the truth; and for **labelled real recordings** (including `a__b__c` multi-device mixes) it parses the expected device set from the label and reports `label_set_accuracy` — expected vs detected devices, misses, false alarms, set-F1. The plot title shows the headline numbers.
 
 For short real-device CSV runs use a small window (e.g. `--window 10 --stride 5`); the 80 s runs give too few 30 s windows.
 
@@ -199,13 +217,15 @@ Note: intermittent appliances (EV, washing machine) don't run every day, so a si
 
 ## 11. The UI — `app.py`
 
-`streamlit run app.py` opens a browser app with three tabs:
+`streamlit run app.py` opens a browser app with five tabs:
 
-- **Infer** — pick a signal file and a trained model (dropdowns auto-list Pre_Measured, Synthetic_Data, corpus, and `output/` models), set window/stride, run; the result graphs render inline and are saved to a fresh timestamped folder.
-- **Train** — choose task, model, features, window; trains and shows the held-out metrics (+ confusion matrix for identify).
-- **Generate corpus** — enter seeds and build a corpus.
+- **Live** — starts/stops the live monitor (`live.py`): real-time recognition of what is ON (watts + confidence), event log with exact switch times, unknown-device teach-and-retrain loop. Opens its own dashboard; see `08_live_nilm.md`.
+- **Infer** — pick a signal file and a trained model (dropdowns auto-list Pre_Measured, Synthetic_Data, corpus, PAC4200 recordings, measured scenarios, and `output/` models), set window/stride, run; the result graphs render inline and are saved to a fresh timestamped folder.
+- **Train** — choose task (mix/identify/disaggregate/presence), model, window, ON threshold; trains and shows the held-out metrics (+ confusion matrix for identify).
+- **Generate corpus** — enter seeds and build a synthetic corpus.
+- **Aggregate (measured)** — mix real PAC4200 recordings into ground-truth training scenarios (random per-appliance ON/OFF schedules, family coverage guaranteed; `test_*`/mixed recordings handled automatically).
 
-The UI is a thin wrapper: each button runs the same `train.py` / `infer.py` / `generate_corpus.py` and displays their outputs.
+The UI is a thin wrapper: each button runs the same `live.py` / `train.py` / `infer.py` / `generate_corpus.py` / `mix_measured_scenarios.py` and displays their outputs.
 
 ---
 

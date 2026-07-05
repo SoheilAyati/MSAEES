@@ -1,6 +1,6 @@
 {
   "task": "identify",
-  "model": "lgbm",
+  "model": "rf",
   "features": [
     "P_mean",
     "Q_mean",
@@ -17,23 +17,17 @@
     "h_centroid",
     "h_energy"
   ],
-  "split": "stratified rows (one instance per class)",
-  "n_windows": 850,
+  "split": "grouped: tested on held-out instances",
+  "n_windows": 265,
   "classes": [
-    "laptop_ravi",
-    "stand_cooler_1",
-    "stand_cooler_1_swing",
-    "stand_cooler_2",
-    "stand_cooler_2_swing",
-    "stand_cooler_3",
-    "stand_cooler_3_swing",
-    "stand_cooler_mixed_withSwing",
-    "table_fan_lvl1",
-    "table_fan_lvl2",
-    "table_fan_lvl2_directOff",
-    "table_fan_mix",
-    "table_pv_2"
+    "coffee_machine",
+    "standing_fan",
+    "standing_lamp",
+    "table_fan",
+    "table_lamp",
+    "water_boiler"
   ],
-  "holdout_macro_f1": 0.9815254624615544,
-  "holdout_accuracy": 0.9812206572769953
+  "trained_utc": "2026-07-02T17:59:07+00:00",
+  "holdout_macro_f1": 0.5751879699248119,
+  "holdout_accuracy": 0.8571428571428571
 }

@@ -10,17 +10,12 @@ Team: Soheil Ayati (11153003), Marc Steffgen (11149043).
 A complete data pipeline for three-phase synthetic data designed to match what a Siemens SENTRON PAC4200 power meter delivers in the lab:
 
 - **`Scripts/Synthetic_data_generator/`** — generates synthetic per-appliance HDF5 traces (8 appliances + baseload, each with its own state machine, harmonic content, and time-of-day usage pattern).
-- **`Scripts/Aggregator/`** — combines per-appliance traces into a scenario file, performing the physics the meter does at the PCC (phase distribution, complex harmonic summation, voltage synthesis).
+- **`Scripts/Aggregator/`** — combines per-appliance traces into a scenario file, performing the physics the meter does at the PCC (phase distribution, complex harmonic summation, voltage synthesis). `mix_measured_scenarios.py` does the same for *real* PAC4200 recordings (random on/off schedules → ground-truth training mixes).
 - **`Scripts/Preprocessor/`** — universal data cleaning and feature engineering: validation, NaN/Inf handling, gap imputation, outlier clipping, and 12 derived features for downstream ML.
-- **`Scripts/Reader/`** — polls a real PAC4200 over Modbus TCP and writes scenario files structurally identical to the aggregator output, so downstream code is unchanged. Includes a simulation mode for testing without hardware.
+- **`Scripts/PAC4200_reader/`** — live monitor + per-appliance session recorder for the real PAC4200 over Modbus TCP (browser dashboard, harmonics via FC 0x14). Includes a simulation mode.
+- **`Scripts/MS2_Pipeline/`** — the ML side: train / infer / UI for **identify**, **disaggregate**, **presence**, and **mix** (presence + power in one bundle), plus **`live.py`** — the live NILM monitor that shows which devices are ON right now (watts + confidence), logs every switch event with exact timestamps, and *learns unknown devices on the go* (teach → auto-retrain → hot reload). See `Docs/07_ms2_pipeline.md` and `Docs/08_live_nilm.md`.
 
 Detailed specifications for each component live in `Docs/`.
-
-## What's next
-
-- Connect the real PAC4200 in the lab and record actual measurements.
-- Tune preprocessing parameters against real data.
-- Build the ML side: event detection, feature extraction, appliance classification, and disaggregation.
 
 ## Requirements
 

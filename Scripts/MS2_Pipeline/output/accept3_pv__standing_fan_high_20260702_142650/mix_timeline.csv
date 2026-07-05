@@ -1,0 +1,4 @@
+hour,P_total_measured_W,residual_W,on_coffee_machine,prob_coffee_machine,P_coffee_machine_W,on_pv,prob_pv,P_pv_W,on_standing_fan,prob_standing_fan,P_standing_fan_W,on_standing_lamp,prob_standing_lamp,P_standing_lamp_W,on_table_fan,prob_table_fan,P_table_fan_W,on_table_lamp,prob_table_lamp,P_table_lamp_W,on_water_boiler,prob_water_boiler,P_water_boiler_W
+0.0,13.1,13.1,0,0.09,0.0,0,0.0,0.0,0,0.115,0.0,0,0.005,0.0,0,0.375,0.0,0,0.195,0.0,0,0.01,0.0
+0.002777777777777778,30.0,30.0,0,0.195,0.0,0,0.0,0.0,0,0.485,0.0,0,0.0,0.0,0,0.205,0.0,0,0.135,0.0,0,0.0,0.0
+0.005555555555555556,30.1,30.1,0,0.215,0.0,0,0.0,0.0,0,0.49,0.0,0,0.0,0.0,0,0.195,0.0,0,0.135,0.0,0,0.0,0.0

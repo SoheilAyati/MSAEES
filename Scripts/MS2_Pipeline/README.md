@@ -1,27 +1,27 @@
 # MS2 Pipeline
 
-Two clean pipelines for Milestone 2. Both take a `.csv` (real PAC4200 run) or
-`.h5` (synthetic) file and just work — no other setup.
+Clean pipelines for Milestone 2 + the live system. Everything takes a `.csv`
+(real PAC4200 run) or `.h5` (synthetic / recorded) file and just works.
 
 ```
 app.py     Streamlit UI for all of the below (recommended)
-infer.py   signal file + trained model  ->  results (csv + json + plot)
-train.py   labelled files               ->  trained model (+ metrics)
+live.py    LIVE monitor: what is ON right now, exact switch times,
+           unknown-device teach + retrain on the go   (Docs/08_live_nilm.md)
+infer.py   signal file + trained model  ->  results (csv + json + plot + accuracy)
+train.py   labelled files               ->  trained model (+ held-out metrics)
 ```
 
 Everything needed is in this folder; nothing imports the old `Scripts/MS2`.
 
 ## UI (recommended)
 
-A point-and-click panel for generate / train / infer, with the result graphs
-shown inline and each inference saved to its own timestamped folder:
-
 ```bash
-uv pip install streamlit
+uv pip install -r requirements.txt
 uv run streamlit run app.py
 ```
 
-Opens in the browser with three tabs: **Infer**, **Train**, **Generate corpus**.
+Opens in the browser with five tabs: **Live**, **Infer**, **Train**,
+**Generate corpus**, **Aggregate (measured)**.
 Everything below is the command-line equivalent the UI runs for you.
 
 ## Files
@@ -29,32 +29,41 @@ Everything below is the command-line equivalent the UI runs for you.
 | File | Role |
 |---|---|
 | `app.py` | **Streamlit UI** for everything below (`streamlit run app.py`) |
+| `live.py` | **live monitor** — connect the meter, see per-device watts/confidence live, event log with exact timestamps, teach unknown devices and retrain automatically |
 | `generate_corpus.py` | make a multi-seed synthetic corpus (calls the MS1 generator + aggregator) |
-| `nilm_pipeline.py` | shared library: `load_signal()` (auto-detects csv/h5), feature extraction. Both scripts import it. |
+| `nilm_pipeline.py` | shared library: `load_signal()`, label→family parsing, feature extraction |
 | `train.py` | TRAINING pipeline — learn a model from labelled data |
 | `infer.py` | INFERENCE pipeline — run a trained model on one signal file |
 | `output/` | trained models, metrics, and example results |
 
-## Quick start
+## Quick start (measured devices, end to end)
 
 ```bash
-# install once (Python 3.10+):  numpy pandas scikit-learn h5py matplotlib joblib  (lightgbm optional)
+# 0. record single devices with the PAC4200 monitor (../PAC4200_reader/pac_reader.py)
+#    naming: '<device>_<setting>' e.g. water_boiler_on, standing_fan_high_no_rotation
+#    a recording of SEVERAL devices at once uses '__': pv__water_boiler_on
 
-# ---- TRAIN ----
-# appliance identification (real-meter-compatible features):
-python train.py --data <folder-of-single-appliance-h5> --task identify --features common
+# 1. mix recordings into ground-truth training scenarios (random on/off schedules)
+python ../Aggregator/mix_measured_scenarios.py --recordings ../PAC4200_reader/recordings \
+       --out ../Aggregator/measured_scenarios --n-scenarios 30 --duration 300 \
+       --min-app 2 --max-app 4 --seed 11
 
-# power disaggregation (needs scenario .h5 with /ground_truth):
-python train.py --data <folder-of-scenario-h5> --task disaggregate --model lgbm
+# 2. train the MIX model (presence + per-device power in one bundle)
+python train.py --task mix --data "../Aggregator/measured_scenarios/measured_scenario_*.h5" \
+       --window 10 --on-w 5
 
-# appliance presence — which appliances are ON per window (multi-label; needs scenarios):
-python train.py --data <folder-of-scenario-h5> --task presence --model lgbm
+# 3. offline check on a real multi-device recording — the expected devices are
+#    parsed from the '__' name and a set-accuracy is reported automatically
+python infer.py --input "../PAC4200_reader/recordings/water_boiler_on__table_lamp_on_<ts>.h5" \
+       --model output/model_mix.joblib
 
-# ---- INFER ---- (the model file knows its own task)
-python infer.py --input <signal.csv|.h5> --model output/model_identify.joblib
-python infer.py --input <scenario.h5>    --model output/model_disaggregate.joblib
-python infer.py --input <scenario.h5>    --model output/model_presence.joblib
+# 4. go LIVE: recognition + event log + unknown-device teach/retrain loop
+python live.py --host 192.168.168.1          # or: --simulate
 ```
+
+Also available: `--task identify` (single-device window classifier),
+`--task disaggregate`, `--task presence` (the mix model's two halves separately),
+`--model mlp` (neural net on the raw waveform).
 
 ## Pipeline 1 — `infer.py` (signal in → result out)
 

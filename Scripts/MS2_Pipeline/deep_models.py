@@ -34,19 +34,21 @@ from sklearn.metrics import mean_absolute_error, f1_score
 import nilm_pipeline as nl
 
 
-def _colors():
+def _colors(names=None):
     cmap = plt.get_cmap("tab10")
-    return {n: cmap(i % 10) for i, n in enumerate(nl.CANON)}
+    return {n: cmap(i % 10) for i, n in enumerate(names if names is not None else nl.CANON)}
 
 
 def _collect(files, window_s, on_W=15.0):
-    """Stack raw-sequence windows + targets across scenario files."""
-    Xs, YPOW, YPRES, gs, k, names = [], [], [], [], 0, nl.CANON
+    """Stack raw-sequence windows + targets across scenario files. The appliance
+    vocabulary is derived from the data (falls back to CANON if scan finds none)."""
+    names = nl.scan_canon(files) or nl.CANON
+    Xs, YPOW, YPRES, gs, k = [], [], [], [], 0
     for f in files:
         s = nl.load_signal(f)
         if s.gt_P is None:
             del s; continue
-        Xf, Ypow, Ypres, names = nl.aggregate_sequences(s, window_s, on_W=on_W)
+        Xf, Ypow, Ypres, _ = nl.aggregate_sequences(s, window_s, on_W=on_W, canon=names)
         Xs.append(Xf); YPOW.append(Ypow); YPRES.append(Ypres)
         gs.append(np.full(len(Xf), k)); k += 1
         del s
@@ -64,7 +66,8 @@ def _split(n, g, k, test_size=0.3):
 
 
 def train(files, args, out):
-    X, Ypow, Ypres, g, k, names = _collect(files, args.window)
+    on_w = getattr(args, "on_w", 15.0)
+    X, Ypow, Ypres, g, k, names = _collect(files, args.window, on_W=on_w)
     tr, te = _split(len(X), g, k)
     print(f"MLP {args.task}: {X.shape[0]} windows x {X.shape[1]} raw inputs "
           f"from {k} scenarios")
@@ -95,14 +98,15 @@ def train(files, args, out):
         per = {names[i]: float(f1_score(Ypres[te][:, i], Pp[:, i], zero_division=0))
                for i in range(len(names))}
         metrics = {"task": "presence", "model": "mlp", "dl": True,
-                   "appliances": names, "window_s": args.window, "on_W": 15.0,
+                   "appliances": names, "window_s": args.window, "on_W": on_w,
                    "macro_f1": float(np.mean(list(per.values()))), "per_appliance_f1": per}
         bundle = {"task": "presence", "dl": True, "model": net,
-                  "appliances": names, "window_s": args.window, "on_W": 15.0}
+                  "appliances": names, "window_s": args.window, "on_W": on_w}
         fn, mn = "model_presence_mlp.joblib", "train_presence_mlp_metrics.json"
         print(f"  [MLP] held-out presence macro-F1 = {metrics['macro_f1']:.3f}")
         print("  per-appliance F1: " + ", ".join(f"{a}={v:.2f}" for a, v in per.items()))
 
+    bundle["metrics"] = metrics
     joblib.dump(bundle, os.path.join(out, fn))
     json.dump(metrics, open(os.path.join(out, mn), "w"), indent=2)
     print(f"  saved -> {out}/{fn}")
@@ -111,9 +115,9 @@ def train(files, args, out):
 def infer(sig, bundle, args, out):
     model, names = bundle["model"], bundle["appliances"]
     ws = bundle.get("window_s", 30.0); on_W = bundle.get("on_W", 15.0)
-    Xf, Ypow, Ypres, _ = nl.aggregate_sequences(sig, ws, on_W=on_W)
+    Xf, Ypow, Ypres, _ = nl.aggregate_sequences(sig, ws, on_W=on_W, canon=names)
     hours = np.arange(Xf.shape[0]) * ws / 3600.0
-    colors = _colors()
+    colors = _colors(names)
 
     if bundle["task"] == "disaggregate":
         P = model.predict(Xf)

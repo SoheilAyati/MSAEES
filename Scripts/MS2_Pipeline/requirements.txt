@@ -6,3 +6,5 @@ matplotlib
 joblib
 lightgbm
 streamlit
+flask
+pymodbus

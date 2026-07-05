@@ -1,0 +1,51 @@
+time_iso,unix_ms,kind,device,confidence,dP_W,dQ_var,P_total_W,detail
+2026-07-02T19:57:14.583+02:00,1783015034583,edge_on,unrecognized,,517.6,151.5,3306.4,step matches no known device signature
+2026-07-02T19:57:16.379+02:00,1783015036379,device_on,coffee_machine,0.73,,,3128.7,~985 W
+2026-07-02T19:57:16.379+02:00,1783015036379,device_on,table_lamp,0.96,,,3128.7,~29 W
+2026-07-02T19:57:16.379+02:00,1783015036379,device_on,water_boiler,0.59,,,3128.7,~757 W
+2026-07-02T19:57:17.973+02:00,1783015037973,edge_on,unrecognized,,248.8,72.8,3437.9,step matches no known device signature
+2026-07-02T19:57:24.581+02:00,1783015044581,edge_off,unrecognized,,-94.8,-27.8,3321.9,step matches no known device signature
+2026-07-02T19:57:21.379+02:00,1783015041379,unknown_detected,unknown,,1393.8,,3343.3,sustained unexplained power - please name this device (Teach)
+2026-07-02T19:57:28.777+02:00,1783015048777,edge_off,standing_lamp,0.14,-409.5,-119.8,2989.6,step matched to device signature
+2026-07-02T19:57:32.177+02:00,1783015052177,edge_off,unrecognized,,-594.9,-174.1,2548.4,step matches no known device signature
+2026-07-02T19:57:36.174+02:00,1783015056174,edge_off,standing_lamp,0.14,-514.2,-150.5,1989.5,step matched to device signature
+2026-07-02T19:57:39.974+02:00,1783015059974,edge_off,unrecognized,,-244.1,-71.4,1862.0,step matches no known device signature
+2026-07-02T19:57:45.383+02:00,1783015065383,unknown_cleared,unknown,,277.2,,2033.4,
+2026-07-02T19:57:46.774+02:00,1783015066774,edge_on,unrecognized,,100.2,29.3,1981.7,step matches no known device signature
+2026-07-02T19:57:50.779+02:00,1783015070779,edge_on,unrecognized,,416.5,121.9,2319.4,step matches no known device signature
+2026-07-02T19:57:54.977+02:00,1783015074977,edge_on,unrecognized,,603.2,176.5,2785.1,step matches no known device signature
+2026-07-02T19:57:58.374+02:00,1783015078374,edge_on,unrecognized,,506.5,148.2,3336.6,step matches no known device signature
+2026-07-02T19:57:55.573+02:00,1783015075573,unknown_detected,unknown,,1245.9,,2992.6,sustained unexplained power - please name this device (Teach)
+2026-07-02T19:58:02.185+02:00,1783015082185,edge_on,unrecognized,,227.8,66.7,3452.0,step matches no known device signature
+2026-07-02T19:58:08.784+02:00,1783015088784,edge_off,unrecognized,,-118.5,-34.7,3319.1,step matches no known device signature
+2026-07-02T19:58:12.975+02:00,1783015092975,edge_off,standing_lamp,0.18,-430.4,-125.9,2972.3,step matched to device signature
+2026-07-02T19:58:16.975+02:00,1783015096975,edge_off,unrecognized,,-605.2,-177.1,2526.4,step matches no known device signature
+2026-07-02T19:58:20.373+02:00,1783015100373,edge_off,standing_lamp,0.16,-506.2,-148.1,1974.8,step matched to device signature
+2026-07-02T19:58:24.181+02:00,1783015104181,edge_off,unrecognized,,-229.1,-67.1,1858.8,step matches no known device signature
+2026-07-02T19:58:29.576+02:00,1783015109576,unknown_cleared,unknown,,266.9,,2020.4,
+2026-07-02T19:58:31.178+02:00,1783015111178,edge_on,unrecognized,,133.0,38.9,2002.3,step matches no known device signature
+2026-07-02T19:58:34.973+02:00,1783015114973,edge_on,unrecognized,,438.1,128.2,2353.2,step matches no known device signature
+2026-07-02T19:58:38.372+02:00,1783015118372,edge_on,unrecognized,,602.6,176.4,2796.7,step matches no known device signature
+2026-07-02T19:58:42.384+02:00,1783015122384,edge_on,unrecognized,,488.5,142.9,3329.1,step matches no known device signature
+2026-07-02T19:58:46.376+02:00,1783015126376,edge_on,unrecognized,,206.3,60.4,3428.9,step matches no known device signature
+2026-07-02T19:58:52.978+02:00,1783015132978,edge_off,unrecognized,,-139.2,-40.7,3280.9,step matches no known device signature
+2026-07-02T19:58:56.983+02:00,1783015136983,edge_off,standing_lamp,0.19,-442.3,-129.4,2927.2,step matched to device signature
+2026-07-02T19:59:00.379+02:00,1783015140379,edge_off,unrecognized,,-605.1,-177.1,2481.7,step matches no known device signature
+2026-07-02T19:59:04.375+02:00,1783015144375,edge_off,standing_lamp,0.18,-491.4,-143.8,1946.1,step matched to device signature
+2026-07-02T19:59:06.787+02:00,1783015146787,device_off,coffee_machine,0.27,,,2115.4,
+2026-07-02T19:59:06.787+02:00,1783015146787,device_on,table_fan,0.58,,,2115.4,~12 W
+2026-07-02T19:59:08.574+02:00,1783015148574,edge_off,unrecognized,,-194.9,-57.0,1843.1,step matches no known device signature
+2026-07-02T19:59:15.383+02:00,1783015155383,edge_on,unrecognized,,151.0,44.2,2000.4,step matches no known device signature
+2026-07-02T19:59:09.782+02:00,1783015149782,unknown_detected,unknown,,1125.2,,1909.6,sustained unexplained power - please name this device (Teach)
+2026-07-02T19:59:19.374+02:00,1783015159374,edge_on,unrecognized,,448.5,131.3,2357.4,step matches no known device signature
+2026-07-02T19:59:23.176+02:00,1783015163176,edge_on,unrecognized,,603.1,176.5,2799.8,step matches no known device signature
+2026-07-02T19:59:26.581+02:00,1783015166581,edge_on,unrecognized,,476.4,139.4,3318.2,step matches no known device signature
+2026-07-02T19:59:30.578+02:00,1783015170578,edge_on,unrecognized,,191.5,56.0,3407.8,step matches no known device signature
+2026-07-02T19:59:37.377+02:00,1783015177377,edge_off,unrecognized,,-152.9,-44.7,3249.3,step matches no known device signature
+2026-07-02T19:59:41.376+02:00,1783015181376,edge_off,standing_lamp,0.19,-449.2,-131.4,2891.9,step matched to device signature
+2026-07-02T19:59:44.982+02:00,1783015184982,edge_off,unrecognized,,-603.3,-176.5,2448.7,step matches no known device signature
+2026-07-02T19:59:48.974+02:00,1783015188974,edge_off,standing_lamp,0.2,-464.3,-135.9,1919.9,step matched to device signature
+2026-07-02T19:59:52.783+02:00,1783015192783,edge_off,unrecognized,,-173.9,-50.9,1843.7,step matches no known device signature
+2026-07-02T19:59:59.577+02:00,1783015199577,edge_on,unrecognized,,172.5,50.5,2016.5,step matches no known device signature
+2026-07-02T20:00:03.584+02:00,1783015203584,edge_on,unrecognized,,465.4,136.2,2384.4,step matches no known device signature
+2026-07-02T20:00:06.782+02:00,1783015206782,edge_on,unrecognized,,610.8,178.7,2830.8,step matches no known device signature

@@ -60,8 +60,43 @@ def show_images(folder):
 st.set_page_config(page_title="NILM MS2 Pipeline", layout="wide")
 st.title("NILM Pipeline")
 
-tab_infer, tab_train, tab_gen, tab_agg = st.tabs(
-    ["Infer", "Train", "Generate corpus", "Aggregate (measured)"])
+tab_live, tab_infer, tab_train, tab_gen, tab_agg = st.tabs(
+    ["Live", "Infer", "Train", "Generate corpus", "Aggregate (measured)"])
+
+# ---------------- LIVE ----------------
+with tab_live:
+    st.subheader("Live NILM — connect the meter, see what's on, teach new devices")
+    st.caption("Starts the live monitor (live.py): sliding-window recognition of "
+               "which devices are ON (with watts + confidence), an event log with "
+               "exact switch times, and the teach-and-retrain loop for unknown "
+               "devices. It opens its own dashboard in the browser.")
+    lc1, lc2, lc3 = st.columns([2, 1, 1])
+    host = lc1.text_input("PAC4200 host/IP", value="192.168.168.1")
+    lport = lc2.number_input("Dashboard port", value=8300, min_value=1024, step=1)
+    simulate = lc3.checkbox("Simulate (no hardware)", value=False)
+    lc4, lc5 = st.columns(2)
+    lmodel_dir = lc4.text_input("Models dir", value="output", key="lmodels")
+    lstride = lc5.number_input("Re-evaluate every (s)", value=2.0, min_value=0.5, step=0.5)
+
+    running = st.session_state.get("live_proc") is not None and \
+        st.session_state["live_proc"].poll() is None
+    if running:
+        st.success("Live monitor is running — dashboard: http://127.0.0.1:%d/" % int(lport))
+        if st.button("Stop live monitor"):
+            st.session_state["live_proc"].terminate()
+            st.session_state["live_proc"] = None
+            st.rerun()
+    else:
+        if st.button("Start live monitor", type="primary"):
+            cmd = [PY, os.path.join(HERE, "live.py"),
+                   "--web-port", str(int(lport)),
+                   "--models-dir", lmodel_dir,
+                   "--stride", str(lstride)]
+            cmd += ["--simulate"] if simulate else ["--host", host]
+            st.session_state["live_proc"] = subprocess.Popen(cmd, cwd=HERE)
+            st.info("Starting… the dashboard opens in a new browser tab "
+                    "(http://127.0.0.1:%d/). Click Stop here when done." % int(lport))
+            st.rerun()
 
 # ---------------- INFER ----------------
 with tab_infer:
@@ -71,7 +106,12 @@ with tab_infer:
         os.path.join(REPO, "Synthetic_Data", "Mixed", "*.h5"),
         os.path.join(REPO, "Synthetic_Data", "Single", "*.h5"),
         os.path.join(HERE, "corpus", "scenario_*.h5"),
+        os.path.join(REPO, "Scripts", "PAC4200_reader", "recordings", "*.h5"),
+        os.path.join(REPO, "Scripts", "Aggregator", "measured_scenarios", "*.h5"),
     ])
+    st.caption("Tip: recordings named `a__b__c` are real multi-device mixes — "
+               "inference on them reports device-set accuracy (expected vs detected) "
+               "parsed from the name.")
     model_choices = find([os.path.join(HERE, "output", "**", "*.joblib")])
 
     c1, c2 = st.columns(2)
@@ -109,32 +149,39 @@ with tab_infer:
 # ---------------- TRAIN ----------------
 with tab_train:
     st.subheader("Train a model")
-    task = st.radio("Task", ["identify", "disaggregate", "presence"], horizontal=True,
-                    help="identify = window→appliance (single-device); "
+    task = st.radio("Task", ["mix", "identify", "disaggregate", "presence"], horizontal=True,
+                    help="mix = presence + disaggregate in ONE bundle (which devices are "
+                         "ON and their watts; used by the live monitor); "
+                         "identify = window→appliance (single-device); "
                          "disaggregate = aggregate→per-appliance power; "
                          "presence = which appliances are ON per window (multi-label)")
-    default_data = ("corpus/scenario_*.h5" if task in ("disaggregate", "presence")
-                    else os.path.join(REPO, "Synthetic_Data", "Single"))
+    default_data = (os.path.join(REPO, "Scripts", "Aggregator", "measured_scenarios",
+                                 "measured_scenario_*.h5")
+                    if task in ("mix", "disaggregate", "presence")
+                    else os.path.join(REPO, "Scripts", "PAC4200_reader", "recordings"))
     data = st.text_input("Training data (folder, glob, or files)", value=default_data)
     c1, c2, c3 = st.columns(3)
     model = c1.selectbox("Model", ["rf", "lgbm", "mlp"],
                          help="mlp = neural net on raw waveform (disaggregate/presence)")
     feats = c2.selectbox("Features (identify)", ["auto", "common", "full"])
     outdir = c3.text_input("Model out dir", value="output")
-    c4, c5 = st.columns(2)
-    twin = c4.number_input("Window (s)", value=30.0, min_value=1.0, key="twin")
-    tstride = c5.number_input("Stride (s)", value=30.0, min_value=1.0, key="tstride")
+    c4, c5, c6 = st.columns(3)
+    twin = c4.number_input("Window (s)", value=10.0, min_value=1.0, key="twin")
+    tstride = c5.number_input("Stride (s)", value=5.0, min_value=1.0, key="tstride")
+    tonw = c6.number_input("Presence ON threshold (W)", value=5.0, min_value=0.5, key="tonw",
+                           help="presence/mix: |appliance power| above this counts as ON")
 
     if st.button("Train model", type="primary"):
         cmd = [PY, "train.py", "--task", task, "--data", *data.split(),
                "--model", model, "--features", feats,
-               "--window", str(twin), "--stride", str(tstride), "--out", outdir]
+               "--window", str(twin), "--stride", str(tstride),
+               "--on-w", str(tonw), "--out", outdir]
         if run_cmd(cmd, "Training..."):
             st.success("Model saved in %s" % outdir)
             suffix = "_mlp" if model == "mlp" else ""
             mj = os.path.join(HERE, outdir, f"train_{task}{suffix}_metrics.json")
             if os.path.exists(mj):
-                st.subheader("Held-out metrics")
+                st.subheader("Held-out metrics (this is the model's accuracy)")
                 st.json(json.load(open(mj)))
             cm = os.path.join(HERE, outdir, "train_identify_confusion.png")
             if task == "identify" and os.path.exists(cm):

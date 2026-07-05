@@ -39,6 +39,34 @@ def _appliance_colors(names=None):
     return {name: cmap(i % 10) for i, name in enumerate(names)}
 
 
+def expected_set_accuracy(sig, names, Pon, min_frac=0.15):
+    """Device-set accuracy from the recording's own label, no ground truth needed.
+
+    Real recordings are named after what was plugged in ('water_boiler_on',
+    'pv__table_lamp_on'), so the expected device set is known even though there
+    is no per-sample ground truth. A device counts as DETECTED when it is
+    predicted ON in at least `min_frac` of the windows. Returns a summary dict
+    (or None when the label carries no usable device names).
+    """
+    if sig.gt_P is not None or not sig.label:
+        return None          # scenarios have real ground truth; use that instead
+    expected = [f for f in nl.parse_families(sig.label) if f in names]
+    if not expected:
+        return None
+    frac = {names[i]: float(np.asarray(Pon)[:, i].mean()) for i in range(len(names))}
+    detected = [n for n, v in frac.items() if v >= min_frac]
+    tp = len(set(expected) & set(detected))
+    prec = tp / len(detected) if detected else 0.0
+    rec = tp / len(expected) if expected else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+    return {"expected_devices": expected, "detected_devices": detected,
+            "missed": sorted(set(expected) - set(detected)),
+            "false_alarms": sorted(set(detected) - set(expected)),
+            "set_precision": round(prec, 3), "set_recall": round(rec, 3),
+            "set_f1": round(f1, 3),
+            "fraction_windows_on": {k: round(v, 3) for k, v in frac.items() if v > 0}}
+
+
 def run_identify(sig, bundle, args, out):
     feats, model = bundle["features"], bundle["model"]
     wf = nl.window_features(sig, args.window, args.stride, args.on_threshold)
@@ -134,7 +162,8 @@ def run_identify(sig, bundle, args, out):
 def run_disaggregate(sig, bundle, args, out):
     model, names = bundle["model"], bundle["appliances"]
     ws = bundle.get("window_s", 30.0)
-    X, Y, _ = nl.aggregate_windows(sig, ws)
+    X, Y, _ = nl.aggregate_windows(sig, ws, canon=names)
+    X = nl.slice_features(X, bundle.get("features"))
     P = model.predict(X)
     hours = np.arange(X.shape[0]) * ws / 3600.0
     df = pd.DataFrame(P, columns=names); df.insert(0, "hour", hours)
@@ -167,23 +196,41 @@ def run_disaggregate(sig, bundle, args, out):
 def run_presence(sig, bundle, args, out):
     model, names = bundle["model"], bundle["appliances"]
     ws = bundle.get("window_s", 30.0); on_W = bundle.get("on_W", 15.0)
-    X, Ytrue, _ = nl.aggregate_presence(sig, ws, on_W=on_W)
+    X, Ytrue, _ = nl.aggregate_presence(sig, ws, on_W=on_W, canon=names)
+    X = nl.slice_features(X, bundle.get("features"))
     Pp = np.asarray(model.predict(X)).astype(int)
+    proba = nl.presence_proba(model, X)
     hours = np.arange(X.shape[0]) * ws / 3600.0
     df = pd.DataFrame(Pp, columns=names); df.insert(0, "hour", hours)
+    for i, nm in enumerate(names):
+        df[f"prob_{nm}"] = np.round(proba[:, i], 3)
     df.to_csv(os.path.join(out, "presence.csv"), index=False)
 
     frac = {names[i]: float(Pp[:, i].mean()) for i in range(len(names))}
-    summary = {"input": sig.name, "task": "presence", "fraction_on": frac}
+    # confidence = how sure the model is of the on/off calls it made
+    conf = float(np.mean(np.where(Pp.astype(bool), proba, 1.0 - proba)))
+    summary = {"input": sig.name, "task": "presence", "fraction_on": frac,
+               "mean_confidence": round(conf, 3)}
+    if bundle.get("metrics"):
+        summary["model_holdout_metrics"] = bundle["metrics"]
+    acc_line = f"mean confidence {conf:.2f}"
     if Ytrue is not None:
-        from sklearn.metrics import f1_score
-        summary["per_appliance_f1"] = {names[i]: float(f1_score(Ytrue[:, i], Pp[:, i], zero_division=0))
-                                       for i in range(len(names))}
-        summary["macro_f1"] = float(np.mean(list(summary["per_appliance_f1"].values())))
+        per, macro, support = nl.presence_f1(Ytrue, Pp, names)
+        summary["per_appliance_f1"] = per
+        summary["macro_f1"] = macro
+        summary["gt_on_windows"] = support
+        acc_line = f"macro-F1 {summary['macro_f1']:.2f} vs ground truth · " + acc_line
         print(f"  presence macro-F1 vs ground truth: {summary['macro_f1']:.3f}")
+    setacc = expected_set_accuracy(sig, names, Pp)
+    if setacc:
+        summary["label_set_accuracy"] = setacc
+        acc_line = (f"device set F1 {setacc['set_f1']:.2f} "
+                    f"(expected {'+'.join(setacc['expected_devices'])}) · " + acc_line)
+        print(f"  expected devices: {setacc['expected_devices']}  ->  "
+              f"detected: {setacc['detected_devices']}  (set-F1 {setacc['set_f1']:.2f})")
     json.dump(summary, open(os.path.join(out, "summary.json"), "w"), indent=2)
 
-    colors = _appliance_colors()
+    colors = _appliance_colors(names)
     nrows = 2 if Ytrue is not None else 1
     fig, axes = plt.subplots(nrows, 1, figsize=(12, 0.45 * len(names) * nrows + 1.5),
                              squeeze=False, sharex=True)
@@ -195,12 +242,115 @@ def run_presence(sig, bundle, args, out):
         ax.set_yticks([i + 0.5 for i in range(len(names))]); ax.set_yticklabels(names, fontsize=8)
         ax.set_ylim(0, len(names)); ax.set_title(title)
 
-    gantt(axes[0, 0], Pp, f"Predicted appliance presence — {sig.name}")
+    gantt(axes[0, 0], Pp, f"Predicted appliance presence — {sig.name}\n{acc_line}")
     if Ytrue is not None:
         gantt(axes[1, 0], Ytrue, "Ground-truth presence")
     axes[-1, 0].set_xlabel("hour")
     plt.tight_layout(); plt.savefig(os.path.join(out, "presence_timeline.png"), dpi=110); plt.close()
     print("  wrote presence.csv, summary.json, presence_timeline.png")
+
+
+def run_mix(sig, bundle, args, out):
+    """Combined presence + disaggregation: which devices are ON and how much
+    power each one draws, in one timeline. Power is gated by presence (a device
+    predicted OFF contributes 0 W), and the leftover between the measured total
+    and the sum of per-device estimates is reported as unexplained residual."""
+    names = bundle["appliances"]
+    ws = bundle.get("window_s", 30.0); on_W = bundle.get("on_W", 15.0)
+    X, Ypow, _ = nl.aggregate_windows(sig, ws, canon=names)
+    X = nl.slice_features(X, bundle.get("features"))
+    Ytrue_on = None if Ypow is None else (np.abs(Ypow) > on_W).astype(int)
+    Pon = np.asarray(bundle["presence"].predict(X)).astype(int)
+    proba = nl.presence_proba(bundle["presence"], X)
+    Pw = bundle["power"].predict(X)
+    Pgated = Pw * Pon
+    hours = np.arange(X.shape[0]) * ws / 3600.0
+    Ptot_meas = X[:, 0]                                   # Ptot_mean feature
+    residual = Ptot_meas - Pgated.sum(axis=1)
+
+    df = pd.DataFrame({"hour": hours, "P_total_measured_W": np.round(Ptot_meas, 1),
+                       "residual_W": np.round(residual, 1)})
+    for i, nm in enumerate(names):
+        df[f"on_{nm}"] = Pon[:, i]
+        df[f"prob_{nm}"] = np.round(proba[:, i], 3)
+        df[f"P_{nm}_W"] = np.round(Pgated[:, i], 1)
+    df.to_csv(os.path.join(out, "mix_timeline.csv"), index=False)
+
+    energy = {names[i]: float(Pgated[:, i].sum() * ws / 3600.0 / 1000.0)
+              for i in range(len(names))}
+    conf = float(np.mean(np.where(Pon.astype(bool), proba, 1.0 - proba)))
+    expl = 1.0 - (np.abs(residual).sum() / max(np.abs(Ptot_meas).sum(), 1e-9))
+    summary = {"input": sig.name, "task": "mix",
+               "fraction_on": {names[i]: float(Pon[:, i].mean()) for i in range(len(names))},
+               "energy_kWh_per_appliance": energy,
+               "mean_confidence": round(conf, 3),
+               "explained_power_fraction": round(float(expl), 3),
+               "mean_abs_residual_W": round(float(np.abs(residual).mean()), 1)}
+    if bundle.get("metrics"):
+        summary["model_holdout_metrics"] = bundle["metrics"]
+    acc_bits = [f"confidence {conf:.2f}", f"explained power {100*expl:.0f}%"]
+    if Ypow is not None:
+        from sklearn.metrics import mean_absolute_error
+        per, macro, support = nl.presence_f1(Ytrue_on, Pon, names)
+        summary["per_appliance_f1"] = per
+        summary["macro_f1"] = macro
+        summary["gt_on_windows"] = support
+        summary["per_appliance_mae_W"] = {
+            names[i]: float(mean_absolute_error(Ypow[:, i], Pgated[:, i]))
+            for i in range(len(names))}
+        summary["overall_mae_W"] = float(np.mean(list(summary["per_appliance_mae_W"].values())))
+        acc_bits.insert(0, f"presence F1 {summary['macro_f1']:.2f} · "
+                           f"power MAE {summary['overall_mae_W']:.0f} W vs ground truth")
+        print(f"  vs ground truth: presence macro-F1 {summary['macro_f1']:.3f}, "
+              f"gated power MAE {summary['overall_mae_W']:.1f} W")
+    setacc = expected_set_accuracy(sig, names, Pon)
+    if setacc:
+        summary["label_set_accuracy"] = setacc
+        acc_bits.insert(0, f"device set F1 {setacc['set_f1']:.2f} "
+                           f"(expected {'+'.join(setacc['expected_devices'])})")
+        print(f"  expected devices: {setacc['expected_devices']}  ->  "
+              f"detected: {setacc['detected_devices']}  (set-F1 {setacc['set_f1']:.2f})")
+    json.dump(summary, open(os.path.join(out, "summary.json"), "w"), indent=2)
+
+    # ---- combined plot: stacked per-device power + presence gantt ----
+    colors = _appliance_colors(names)
+    if hours[-1] < 0.5:                      # short recording -> minutes axis
+        hours = hours * 60.0
+        xlab = "minute"
+    else:
+        xlab = "hour"
+    live = [i for i in range(len(names)) if np.abs(Pgated[:, i]).max() > 1]
+    nrows = 3 if Ytrue_on is not None else 2
+    fig, axes = plt.subplots(nrows, 1, figsize=(12, 3.2 + 2.6 + 0.4 * len(names) * (nrows - 1)),
+                             sharex=True,
+                             gridspec_kw={"height_ratios": [2.2] + [1] * (nrows - 1)})
+    ax = axes[0]
+    if live:
+        ax.stackplot(hours, [np.clip(Pgated[:, i], 0, None) for i in live],
+                     labels=[names[i] for i in live],
+                     colors=[colors[names[i]] for i in live], alpha=0.8)
+    neg = np.clip(Pgated, None, 0)
+    if (neg < 0).any():
+        ax.stackplot(hours, [neg[:, i] for i in live],
+                     colors=[colors[names[i]] for i in live], alpha=0.8)
+    ax.plot(hours, Ptot_meas, color="black", lw=1.3, label="measured total")
+    ax.legend(fontsize=7, ncol=3, loc="upper right")
+    ax.set_ylabel("P (W)")
+    ax.set_title(f"Mix (presence + disaggregation) — {sig.name}\n" + " · ".join(acc_bits))
+
+    def gantt(ax, M, title):
+        for i, nm in enumerate(names):
+            ax.fill_between(hours, i + 0.05, i + 0.95, where=M[:, i].astype(bool),
+                            color=colors.get(nm, "0.5"), step="mid", linewidth=0)
+        ax.set_yticks([i + 0.5 for i in range(len(names))]); ax.set_yticklabels(names, fontsize=8)
+        ax.set_ylim(0, len(names)); ax.set_title(title, fontsize=9)
+
+    gantt(axes[1], Pon, "Predicted presence")
+    if Ytrue_on is not None:
+        gantt(axes[2], Ytrue_on, "Ground-truth presence")
+    axes[-1].set_xlabel(xlab)
+    plt.tight_layout(); plt.savefig(os.path.join(out, "mix_timeline.png"), dpi=110); plt.close()
+    print("  wrote mix_timeline.csv, summary.json, mix_timeline.png")
 
 
 def main():
@@ -226,6 +376,8 @@ def main():
         run_identify(sig, bundle, args, out)
     elif bundle["task"] == "presence":
         run_presence(sig, bundle, args, out)
+    elif bundle["task"] == "mix":
+        run_mix(sig, bundle, args, out)
     else:
         run_disaggregate(sig, bundle, args, out)
 

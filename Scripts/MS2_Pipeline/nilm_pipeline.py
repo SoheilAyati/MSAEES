@@ -19,6 +19,7 @@ PAC4200 CSV also provides, so a model can transfer to the real meter.
 """
 from __future__ import annotations
 import json
+import re
 import numpy as np
 import pandas as pd
 
@@ -27,10 +28,13 @@ try:
 except ImportError as e:                                    # pragma: no cover
     raise ImportError("h5py required: pip install h5py") from e
 
-# Canonical appliance vocabulary: it both sizes the disaggregate/presence model
+# Default appliance vocabulary: it both sizes the disaggregate/presence model
 # output and is the set of names a scenario's ground truth can map to. A target
 # column is filled only when the base of a ground-truth appliance name
 # ("<name>_<instance>") is in this list (see aggregate_windows / _presence).
+# Since the vocabulary became DYNAMIC (train.py derives it from the training
+# data and stores it in the model bundle), CANON is only the fallback used when
+# no explicit vocabulary is passed.
 SYNTHETIC_APPLIANCES = ["baseload", "ev", "fridge", "hair_dryer", "pc", "pv",
                         "resistive", "synchronous", "washing_machine"]
 # Real PAC4200 appliance families produced by mix_measured_scenarios.py. Appended
@@ -40,14 +44,89 @@ SYNTHETIC_APPLIANCES = ["baseload", "ev", "fridge", "hair_dryer", "pc", "pv",
 MEASURED_APPLIANCES = ["laptop", "stand_cooler", "table_fan", "table_pv"]
 CANON = SYNTHETIC_APPLIANCES + MEASURED_APPLIANCES
 
+
+# --------------------------------------------------------------------------
+# Label parsing: recording label / filename  ->  device families
+# --------------------------------------------------------------------------
+# Recording labels encode the device plus its *setting*, e.g.
+# "standing_fan_high_no_rotation" or "water_boiler_on". A double underscore
+# separates SIMULTANEOUS devices in one recording: "pv__water_boiler_on" means
+# PV and the water boiler were both connected. parse_family() collapses a
+# single-device label to its family by stripping trailing state/setting words;
+# parse_families() first splits on '__'.
+STATE_WORDS = {
+    "on", "off", "run", "running", "standby", "idle", "only", "trig",
+    "low", "med", "medium", "high", "min", "max",
+    "rotation", "no", "swing", "withswing", "mix", "mixed", "directoff",
+    "small", "delay", "slow", "fast", "test", "again", "new",
+}
+# leading session prefixes: 'test_water_boiler_on' is the same physical device
+# as 'water_boiler_on', recorded in a test session
+PREFIX_WORDS = {"test", "tmp", "temp", "demo", "trial", "probe", "check"}
+_TS_RE = re.compile(r"_\d{8}_\d{6}$")        # trailing _YYYYmmdd_HHMMSS
+_LVL_RE = re.compile(r"^(lvl|level|stufe|speed|st)\d*$")
+
+
+def strip_timestamp(stem: str) -> str:
+    """Remove the recorder's trailing _YYYYmmdd_HHMMSS from a file stem."""
+    return _TS_RE.sub("", str(stem))
+
+
+def parse_family(label: str) -> str:
+    """Collapse one single-device label to its appliance family.
+
+    'standing_fan_high_no_rotation' -> 'standing_fan'
+    'coffee_machine_run'            -> 'coffee_machine'
+    'pv_only'                       -> 'pv'
+    Trailing state/setting tokens and pure numbers are stripped; if everything
+    would be stripped the original label is kept.
+    """
+    lab = strip_timestamp(str(label or "").strip().lower())
+    toks = [t for t in lab.split("_") if t]
+    while len(toks) > 1 and toks[0] in PREFIX_WORDS:
+        toks.pop(0)
+    while len(toks) > 1:
+        t = toks[-1]
+        if t in STATE_WORDS or t.isdigit() or _LVL_RE.match(t):
+            toks.pop()
+        else:
+            break
+    return "_".join(toks) if toks else (lab or "appliance")
+
+
+def parse_families(label: str) -> list:
+    """'pv__water_boiler_on' -> ['pv', 'water_boiler'] (order kept, deduped)."""
+    lab = strip_timestamp(str(label or "").strip().lower())
+    fams = []
+    for part in lab.split("__"):
+        f = parse_family(part)
+        if f and f not in fams:
+            fams.append(f)
+    return fams
+
+
+def is_mixed_label(label: str) -> bool:
+    """True when the label names more than one simultaneous device."""
+    return "__" in strip_timestamp(str(label or ""))
+
 FEATURES_COMMON = ["P_mean", "Q_mean", "S_mean", "PF_mean", "QP_ratio",
                    "THD_I_mean", "P_std", "P_min", "P_max"]
 FEATURES_HARM = ["h3", "h5", "h7", "h_centroid", "h_energy"]
 FEATURES_FULL = FEATURES_COMMON + FEATURES_HARM
 
-# aggregate (disaggregation) feature set
+# aggregate (disaggregation) feature set. ORDER MATTERS and new features are
+# only ever APPENDED: a model bundle stores the feature list it was trained
+# with, and inference slices the freshly built matrix to that length, so old
+# models keep working after the set grows.
 AGG_FEATURES = ["Ptot_mean", "Ptot_std", "Ptot_min", "Ptot_max", "Qtot_mean",
-                "PL1_mean", "PL2_mean", "PL3_mean", "PF_mean", "THDI_mean", "hour"]
+                "PL1_mean", "PL2_mean", "PL3_mean", "PF_mean", "THDI_mean", "hour",
+                "Qtot_std", "QP_ratio", "Stot_mean"]
+
+
+def slice_features(X, bundle_features):
+    """Trim the feature matrix to what the (possibly older) model was trained on."""
+    k = len(bundle_features) if bundle_features else X.shape[1]
+    return X[:, :k] if X.shape[1] > k else X
 
 
 class Signal:
@@ -77,6 +156,26 @@ class Signal:
 # --------------------------------------------------------------------------
 # Loading
 # --------------------------------------------------------------------------
+def scan_canon(files) -> list:
+    """Appliance vocabulary = every family that appears in the ground truth of
+    the given scenario files. Cheap pre-pass (reads only the name list), so the
+    model output adapts to whatever devices the corpus contains -- this is what
+    lets newly taught devices enter the model on the next retrain."""
+    bases = set()
+    for f in files:
+        if not str(f).lower().endswith(".h5"):
+            continue
+        try:
+            with h5py.File(f, "r") as h:
+                if "ground_truth" in h and "appliance_names" in h["ground_truth"]:
+                    for nm in h["ground_truth"]["appliance_names"][:]:
+                        nm = nm.decode() if isinstance(nm, (bytes, bytearray)) else str(nm)
+                        bases.add(nm.rsplit("_", 1)[0])
+        except OSError:
+            continue
+    return sorted(bases)
+
+
 def load_signal(path: str) -> Signal:
     if str(path).lower().endswith(".csv"):
         return _load_csv(path)
@@ -234,8 +333,32 @@ def feature_set_for(signals):
 # --------------------------------------------------------------------------
 # Disaggregation features (aggregate window -> per-appliance power)
 # --------------------------------------------------------------------------
-def aggregate_windows(sig: Signal, window_s=30.0):
-    """Return (X, Y, appliance_names). Y is None if the file has no ground truth."""
+def gt_bases(sig: Signal) -> list:
+    """Appliance families present in a scenario's ground truth (sorted, unique)."""
+    if sig.gt_names is None:
+        return []
+    return sorted({nm.rsplit("_", 1)[0] for nm in sig.gt_names})
+
+
+def _gt_matrix(sig, Wfn, n_rows, canon):
+    """Window-mean per-appliance power mapped onto `canon` columns."""
+    Y = np.zeros((n_rows, len(canon)))
+    for col, nm in enumerate(sig.gt_names):
+        base = nm.rsplit("_", 1)[0]
+        if base in canon:
+            Y[:, canon.index(base)] += np.nanmean(Wfn(sig.gt_P[:, col]), 1)
+    return Y
+
+
+def aggregate_windows(sig: Signal, window_s=30.0, canon=None):
+    """Return (X, Y, appliance_names). Y is None if the file has no ground truth.
+
+    `canon` is the appliance vocabulary that sizes/orders the target columns;
+    it defaults to the legacy CANON list. train.py passes the vocabulary it
+    derived from the training data, infer/live pass the one stored in the
+    model bundle.
+    """
+    canon = list(canon) if canon is not None else list(CANON)
     sr = sig.sample_rate_hz
     w = max(1, int(round(window_s * sr)))
     n = (sig.n // w) * w
@@ -243,35 +366,39 @@ def aggregate_windows(sig: Signal, window_s=30.0):
         return np.asarray(a[:n], float).reshape(-1, w)
     hour = ((sig.t - sig.t[0]) / 3600.0) % 24
     Pph = sig.P_phase if sig.P_phase is not None else np.zeros((sig.n, 3))
-    X = np.column_stack([
-        np.nanmean(W(sig.P), 1), np.nanstd(W(sig.P), 1), np.nanmin(W(sig.P), 1), np.nanmax(W(sig.P), 1),
-        np.nanmean(W(sig.Q), 1),
-        np.nanmean(W(Pph[:, 0]), 1), np.nanmean(W(Pph[:, 1]), 1), np.nanmean(W(Pph[:, 2]), 1),
-        np.nanmean(W(sig.PF), 1), np.nanmean(W(sig.THD_I), 1), np.nanmean(W(hour), 1),
-    ])
+    import warnings
+    with warnings.catch_warnings():
+        # all-NaN windows (e.g. PF or THD_I of an idle phase) are legitimate
+        # here; they become 0 via nan_to_num below
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        Pm = np.nanmean(W(sig.P), 1)
+        Qm = np.nanmean(W(sig.Q), 1)
+        X = np.column_stack([
+            Pm, np.nanstd(W(sig.P), 1), np.nanmin(W(sig.P), 1), np.nanmax(W(sig.P), 1),
+            Qm,
+            np.nanmean(W(Pph[:, 0]), 1), np.nanmean(W(Pph[:, 1]), 1), np.nanmean(W(Pph[:, 2]), 1),
+            np.nanmean(W(sig.PF), 1), np.nanmean(W(sig.THD_I), 1), np.nanmean(W(hour), 1),
+            np.nanstd(W(sig.Q), 1), Qm / (np.abs(Pm) + 1e-6), np.hypot(Pm, Qm),
+        ])
     X = np.nan_to_num(X)
     Y = None
     if sig.gt_P is not None:
-        Y = np.zeros((X.shape[0], len(CANON)))
-        for col, nm in enumerate(sig.gt_names):
-            base = nm.rsplit("_", 1)[0]
-            if base in CANON:
-                Y[:, CANON.index(base)] = np.nanmean(W(sig.gt_P[:, col]), 1)
-    return X, Y, CANON
+        Y = _gt_matrix(sig, W, X.shape[0], canon)
+    return X, Y, canon
 
 
-def aggregate_presence(sig, window_s=30.0, on_W=15.0):
+def aggregate_presence(sig, window_s=30.0, on_W=15.0, canon=None):
     """Multi-hot 'appliance active' targets per aggregate window (|power| > on_W).
 
     Reuses aggregate_windows; returns (X, Y_multihot, names). Y is None when the
     file has no ground truth.
     """
-    X, Yp, names = aggregate_windows(sig, window_s)
+    X, Yp, names = aggregate_windows(sig, window_s, canon=canon)
     Y = None if Yp is None else (np.abs(Yp) > on_W).astype(int)
     return X, Y, names
 
 
-def aggregate_sequences(sig, window_s=30.0, on_W=15.0):
+def aggregate_sequences(sig, window_s=30.0, on_W=15.0, canon=None):
     """Flatten the raw P/Q/THD waveform of each (non-overlapping) window.
 
     Returns (X_flat, Y_power, Y_presence, names):
@@ -282,6 +409,7 @@ def aggregate_sequences(sig, window_s=30.0, on_W=15.0):
     Used by the neural-network (MLP) path, which learns from the waveform shape
     itself rather than the hand-crafted summary features.
     """
+    canon = list(canon) if canon is not None else list(CANON)
     sr = sig.sample_rate_hz
     w = max(1, int(round(window_s * sr)))
     n = (sig.n // w) * w
@@ -293,10 +421,54 @@ def aggregate_sequences(sig, window_s=30.0, on_W=15.0):
     Xf = np.concatenate(chans, axis=1).astype(np.float32)        # (N, 3*W)
     Ypow = Ypres = None
     if sig.gt_P is not None:
-        Ypow = np.zeros((Xf.shape[0], len(CANON)))
-        for col, nm in enumerate(sig.gt_names):
-            base = nm.rsplit("_", 1)[0]
-            if base in CANON:
-                Ypow[:, CANON.index(base)] = np.nanmean(Wn(sig.gt_P[:, col]), 1)
+        Ypow = _gt_matrix(sig, Wn, Xf.shape[0], canon)
         Ypres = (np.abs(Ypow) > on_W).astype(int)
-    return Xf, Ypow, Ypres, CANON
+    return Xf, Ypow, Ypres, canon
+
+
+# --------------------------------------------------------------------------
+# Multi-label F1 that is honest about absent classes
+# --------------------------------------------------------------------------
+def presence_f1(Y_true, Y_pred, names):
+    """Per-appliance F1 + macro over the appliances that actually occur.
+
+    An appliance with no ON window in the evaluation data AND no ON prediction
+    is scored None (nothing to detect, nothing falsely detected) instead of 0,
+    so it does not drag the macro average down. Returns (per_dict, macro,
+    support_dict); support = number of truly-ON windows per appliance.
+    """
+    from sklearn.metrics import f1_score
+    Y_true = np.asarray(Y_true); Y_pred = np.asarray(Y_pred)
+    per, support, scored = {}, {}, []
+    for i, nm in enumerate(names):
+        support[nm] = int(Y_true[:, i].sum())
+        if Y_true[:, i].any() or Y_pred[:, i].any():
+            v = float(f1_score(Y_true[:, i], Y_pred[:, i], zero_division=0))
+            per[nm] = v; scored.append(v)
+        else:
+            per[nm] = None
+    macro = float(np.mean(scored)) if scored else 0.0
+    return per, macro, support
+
+
+# --------------------------------------------------------------------------
+# Presence probabilities (works around MultiOutputClassifier quirks)
+# --------------------------------------------------------------------------
+def presence_proba(model, X):
+    """P(on) per appliance from a MultiOutputClassifier, shape (n, n_appliances).
+
+    Handles single-class outputs (an appliance that is always-on or always-off
+    in the training data has only one class; predict_proba then has one column).
+    """
+    n = X.shape[0]
+    try:
+        per_out = model.predict_proba(X)          # list of (n, n_classes)
+    except AttributeError:
+        pred = np.asarray(model.predict(X), float)
+        return pred if pred.ndim == 2 else pred.reshape(n, -1)
+    cols = []
+    for est, p in zip(model.estimators_, per_out):
+        classes = list(getattr(est, "classes_", [0, 1]))
+        p = np.asarray(p)
+        cols.append(p[:, classes.index(1)] if 1 in classes else np.zeros(n))
+    return np.column_stack(cols)

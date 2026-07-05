@@ -1,0 +1,35 @@
+{
+  "input": "measured_scenario_01",
+  "task": "presence",
+  "fraction_on": {
+    "baseload": 0.0,
+    "ev": 0.0,
+    "fridge": 0.0,
+    "hair_dryer": 0.0,
+    "pc": 0.0,
+    "pv": 0.0,
+    "resistive": 0.0,
+    "synchronous": 0.0,
+    "washing_machine": 0.0,
+    "laptop": 1.0,
+    "stand_cooler": 0.9833333333333333,
+    "table_fan": 0.0,
+    "table_pv": 0.0
+  },
+  "per_appliance_f1": {
+    "baseload": 0.0,
+    "ev": 0.0,
+    "fridge": 0.0,
+    "hair_dryer": 0.0,
+    "pc": 0.0,
+    "pv": 0.0,
+    "resistive": 0.0,
+    "synchronous": 0.0,
+    "washing_machine": 0.0,
+    "laptop": 1.0,
+    "stand_cooler": 0.9915966386554622,
+    "table_fan": 0.0,
+    "table_pv": 0.0
+  },
+  "macro_f1": 0.15319974143503556
+}
