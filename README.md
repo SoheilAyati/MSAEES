@@ -120,6 +120,7 @@ pip install -r Scripts/MS2_Pipeline/requirements.txt
 | `Docs/06_milestone2_plan.md` | Milestone 2 plan |
 | `Docs/07_ms2_pipeline.md` | ML pipeline reference (train / infer / tasks / models) |
 | `Docs/08_live_nilm.md` | live NILM monitor and training-on-the-go |
+| `Docs/09_design_rationale.md` | design rationale and feature justification: the *why* behind every decision (features, harmonics, models, evaluation), collected for the scientific paper |
 | `Docs/MS1/`, `Docs/MS2/` | milestone report PDFs |
 
 ## Data and version control

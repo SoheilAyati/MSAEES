@@ -1,11 +1,11 @@
 # NILM Project: MS2 Pipeline Reference
 
-**Version:** 1.3
+**Version:** 1.4
 **Milestone:** 2 (+ live extensions)
 **Location:** `Scripts/MS2_Pipeline/`
-**Companion to:** `06_milestone2_plan.md` (the plan), `08_live_nilm.md` (live monitor + training-on-the-go). This document describes what was actually built.
+**Companion to:** `06_milestone2_plan.md` (the plan), `08_live_nilm.md` (live monitor + training-on-the-go), `09_design_rationale.md` (why each feature/model/threshold was chosen). This document describes what was actually built.
 **Owners:** Soheil Ayati, Marc Steffgen
-**Last updated:** 2026-07-05
+**Last updated:** 2026-07-06
 
 ---
 
@@ -106,6 +106,8 @@ The signal is 5 Hz. Models need fixed-size chunks, so the pipeline slides a **wi
 - Rule of thumb: make the window about as long as the shortest event you care about. Keep `window` consistent between train and infer for `identify` (for the other tasks the window is stored in the model and reused automatically).
 
 ### 5.2 Feature sets (classical models)
+
+Per-feature justification (what each column separates and why it is in the set) lives in `09_design_rationale.md` section 5; this section documents the sets as implemented.
 
 For single-device windows, the **steady state** is the median over the middle 20-80 % of the window, so switch-on transients at the edges don't pollute the summary statistics. THD_I is used as measured when the file provides it, and otherwise derived from the per-order harmonic magnitudes relative to the fundamental current estimated at 230 V.
 

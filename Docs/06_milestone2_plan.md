@@ -9,7 +9,7 @@
 **Owners:** Soheil Ayati, Marc Steffgen
 **Last updated:** 2026-06-07
 
-> **Status note (2026-07-05):** this is the original Milestone 2 planning document, kept for reference. The starter-code folder it describes (formerly `Scripts/MS2`) was reorganized into `Scripts/MS2_Pipeline`, and the module names listed below were superseded during that rewrite. For the system as actually built, see `07_ms2_pipeline.md` (training/inference pipeline) and `08_live_nilm.md` (live monitor).
+> **Status note (2026-07-05):** this is the original Milestone 2 planning document, kept for reference. The starter-code folder it describes (formerly `Scripts/MS2`) was reorganized into `Scripts/MS2_Pipeline`, and the module names listed below were superseded during that rewrite. For the system as actually built, see `07_ms2_pipeline.md` (training/inference pipeline) and `08_live_nilm.md` (live monitor); the consolidated design/feature rationale for the paper is `09_design_rationale.md`.
 
 ---
 

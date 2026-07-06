@@ -245,7 +245,7 @@ Output files use layout (a) of `01_data_format.md` and are the direct inputs to 
 
 ## Appendix A: Type-vs-feature quick reference
 
-Each appliance's distinguishing features, for MS2 feature selection:
+Each appliance's distinguishing features, for MS2 feature selection (the full feature-justification catalogue is `09_design_rationale.md` section 5):
 
 | Appliance | Best in time domain | Best in (P, Q) plane | Best in harmonics |
 |---|---|---|---|

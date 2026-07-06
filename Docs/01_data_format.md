@@ -33,7 +33,7 @@ These hold across all four HDF5 layouts:
 - **Strings:** fixed-length bytes, dtype `S32` (state labels, appliance names).
 - **Compression:** LZF on every dataset (fast decompression, modest ratio; appropriate for ML loops that re-read files often).
 - **Nominal sample rate:** 5 Hz (200 ms). This is what a Modbus TCP client realistically sustains for a full PAC4200 register block, and it is fast enough to catch inrush transients (1-2 samples) and multi-state transitions.
-- **Harmonics:** 39 orders, 2 through 40. Harmonic arrays have shape `(N, 39)`; order n sits at column n-2. Magnitudes in ampere (current) and phases in radians. Note the PAC4200 itself only provides magnitudes (see section 6).
+- **Harmonics:** 39 orders, 2 through 40. Harmonic arrays have shape `(N, 39)`; order n sits at column n-2. Magnitudes in ampere (current) and phases in radians. Note the PAC4200 itself only provides magnitudes (see section 6). (The Milestone 1 report mentioned truncation at order 15; that statement is outdated. All writers store orders 2..40; rationale in `09_design_rationale.md` section 2.3.)
 - **Version caveat:** `format_version` is per-writer and intentionally not unified: `"0.2"` for single-appliance files, `"0.1"` for scenario files and PAC4200 recordings. Check `metadata` attrs, not the filename, when a consumer needs to distinguish layouts.
 
 ### 2.1 Sign conventions

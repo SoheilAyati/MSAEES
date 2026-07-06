@@ -1,11 +1,11 @@
 # NILM Project: Live NILM and Training-on-the-go Reference
 
-**Version:** 1.1
+**Version:** 1.2
 **Milestone:** 3
 **Location:** `Scripts/MS2_Pipeline/live.py`
-**Companion to:** `07_ms2_pipeline.md` (offline train/infer), `05_pac4200_reader.md` (the meter reader it builds on)
+**Companion to:** `07_ms2_pipeline.md` (offline train/infer), `05_pac4200_reader.md` (the meter reader it builds on), `09_design_rationale.md` (design rationale, incl. the live-system decisions)
 **Owners:** Soheil Ayati, Marc Steffgen
-**Last updated:** 2026-07-05
+**Last updated:** 2026-07-06
 
 ---
 
