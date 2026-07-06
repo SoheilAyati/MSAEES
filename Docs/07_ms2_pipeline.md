@@ -115,13 +115,16 @@ For single-device windows, the **steady state** is the median over the middle 20
 | `FEATURES_HARM` (5) | `h3, h5, h7, h_centroid, h_energy` (3rd/5th/7th harmonic magnitudes, spectral centroid, harmonic energy) | needs per-order harmonics |
 | `FEATURES_FULL` (14) | `FEATURES_COMMON + FEATURES_HARM` | harmonic-capable `.h5` only; higher ceiling |
 
-For aggregate windows (disaggregate / presence / mix), `AGG_FEATURES` currently has **14 columns, in this exact order**:
+For aggregate windows (disaggregate / presence / mix), `AGG_FEATURES` currently has **17 columns, in this exact order**:
 
 ```
 Ptot_mean, Ptot_std, Ptot_min, Ptot_max, Qtot_mean,
 PL1_mean, PL2_mean, PL3_mean, PF_mean, THDI_mean, hour,
-Qtot_std, QP_ratio, Stot_mean
+Qtot_std, QP_ratio, Stot_mean,
+Pstep_max, Qstep_at_Pstep, n_steps
 ```
+
+The last three (added 2026-07-06) are **event features**: the largest settled power step inside the window, the reactive step at the same instant, and the number of steps. Steady-state sums cannot tell "boiler + lamp" from "boiler drawing more", but the switch-on step identifies the joining device.
 
 The order matters and new features are only ever **appended**: a model bundle stores the feature list it was trained with, and `slice_features()` trims a freshly built (possibly wider) feature matrix down to that length at inference time, so old models keep working after the feature set grows.
 

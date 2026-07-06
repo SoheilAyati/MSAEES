@@ -119,6 +119,11 @@ class ThdReader(pr.BaseReader):
             return None
         if getattr(self.inner, "read_harmonics", False):
             for ph in ("L1", "L2", "L3"):
+                # a genuine THD-R I register value (probed at connect) wins
+                # over the spectrum-derived estimate
+                have = s.scalars.get(f"THD_I_{ph}")
+                if have is not None and math.isfinite(have):
+                    continue
                 mag = s.h_I_mag.get(ph)
                 thd = float("nan")
                 if mag is not None and mag.size:
@@ -247,7 +252,15 @@ class ReplayReader(pr.BaseReader):
 class ModelManager:
     """Loads the mix bundle (preferred) or the presence+disaggregate pair, and
     a per-device (P, Q) signature table from the single-appliance recordings.
-    reload() picks up whatever a background retrain just wrote."""
+    reload() picks up whatever a background retrain just wrote.
+
+    Two bundle VARIANTS can coexist in the models dir:
+      * 'latest'   -> model_mix.joblib           (what retraining overwrites;
+                                                  the train-on-the-go model)
+      * 'original' -> model_mix_original.joblib  (a frozen snapshot retraining
+                                                  never touches)
+    set_variant() switches between them at runtime; reload_seq increments on
+    every (re)load so the live engine notices and rebuilds its device state."""
 
     def __init__(self, models_dir: str, recordings_dir: str):
         self.models_dir = models_dir
@@ -262,6 +275,8 @@ class ModelManager:
         self.metrics: dict = {}
         self.source = "none"
         self.loaded_utc = None
+        self.variant = "latest"          # 'latest' | 'original'
+        self.reload_seq = 0
         self.signatures: list = []       # [{family, label, P, Q}]
         self.reload()
 
@@ -270,12 +285,32 @@ class ModelManager:
             self._load_models()
             self._load_signatures()
             self.loaded_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self.reload_seq += 1
             return self.info()
+
+    def variants(self) -> list:
+        out = ["latest"]
+        if os.path.exists(os.path.join(self.models_dir, "model_mix_original.joblib")):
+            out.append("original")
+        return out
+
+    def set_variant(self, variant: str) -> dict:
+        if variant not in ("latest", "original"):
+            raise ValueError(f"unknown model variant '{variant}'")
+        if variant == "original" and "original" not in self.variants():
+            raise ValueError("model_mix_original.joblib not found - train one first")
+        with self.lock:
+            self.variant = variant
+        return self.reload()
 
     def _load_models(self):
         self.presence = self.power = None
         self.appliances, self.metrics, self.source = [], {}, "none"
         mix = os.path.join(self.models_dir, "model_mix.joblib")
+        if self.variant == "original":
+            orig = os.path.join(self.models_dir, "model_mix_original.joblib")
+            if os.path.exists(orig):
+                mix = orig
         if os.path.exists(mix):
             b = joblib.load(mix)
             self.presence, self.power = b["presence"], b["power"]
@@ -284,7 +319,7 @@ class ModelManager:
             self.window_s = float(b.get("window_s", 10.0))
             self.on_W = float(b.get("on_W", 5.0))
             self.metrics = b.get("metrics", {}) or {}
-            self.source = "model_mix.joblib"
+            self.source = os.path.basename(mix)
             return
         pres = os.path.join(self.models_dir, "model_presence.joblib")
         dis = os.path.join(self.models_dir, "model_disaggregate.joblib")
@@ -355,6 +390,7 @@ class ModelManager:
                     "has_power_head": self.power is not None,
                     "holdout_accuracy": acc, "trained_utc": m.get("trained_utc"),
                     "n_signatures": len(self.signatures),
+                    "variant": self.variant, "variants": self.variants(),
                     "loaded_utc": self.loaded_utc}
 
 
@@ -365,9 +401,12 @@ class Retrainer:
     """Background rebuild of scenarios + retrain of the mix (and identify)
     models from everything in the recordings folder, then hot-reload."""
 
+    # 64 scenarios: with 24 the random device combinations dominated model
+    # quality run-to-run (set-F1 on the real mixed recordings swung by 0.1);
+    # 64 stabilizes it and still retrains in well under two minutes.
     def __init__(self, models: ModelManager, scenarios_dir: str,
                  window_s: float = 10.0, on_w: float = 5.0,
-                 n_scenarios: int = 24, scenario_duration: float = 300.0):
+                 n_scenarios: int = 64, scenario_duration: float = 300.0):
         self.models = models
         self.scenarios_dir = scenarios_dir
         self.window_s = window_s
@@ -458,7 +497,8 @@ class LiveEngine:
     def __init__(self, svc: pr.AcquisitionService, models: ModelManager,
                  retrainer: Retrainer, out_dir: str, stride_s: float = 2.0,
                  unknown_min_W: float = 30.0, unknown_frac: float = 0.15,
-                 unknown_persist_s: float = 8.0, edge_min_W: float = 8.0):
+                 unknown_persist_s: float = 8.0, edge_min_W: float = 8.0,
+                 edge_claim_conf: float = 0.30, teach_record_s: float = 45.0):
         self.svc = svc
         self.models = models
         self.retrainer = retrainer
@@ -467,9 +507,31 @@ class LiveEngine:
         self.unknown_frac = unknown_frac
         self.unknown_persist_s = unknown_persist_s
         self.edge_min_W = edge_min_W
+        self.edge_claim_conf = edge_claim_conf
+        self.teach_record_s = teach_record_s
+        self._teach_thread: threading.Thread | None = None
+        self._teach_cancel = False
+        self.guide: dict | None = None   # current guided-teach instruction
 
         self.lock = threading.RLock()
         self.state: dict = {}            # family -> {on, prob, power_W, since_ms}
+        # edge-driven device state (Hart-style event NILM). A matched on-edge
+        # CLAIMS the device on with the step's own watts; a matched off-edge
+        # drops the claim and force-holds the device off until the model window
+        # has flushed the old samples. Claims outrank the window model: the
+        # steady-state features cannot tell "boiler + lamp" from "boiler with
+        # more watts", but the +501 W step at plug-in time identifies the lamp
+        # uniquely.
+        self.claims: dict = {}           # family -> {W, conf, t_ms}
+        self.forced_off: dict = {}       # family -> hold-off-until unix_ms
+        # every settled edge this session, matched or not. After a model
+        # reload (retrain / variant switch) the history is re-matched against
+        # the NEW signatures and the claims rebuilt -- a software version of
+        # "unplug everything and plug it back in": a step that was
+        # 'unrecognized' before a device was taught resolves to that device
+        # afterwards, without touching the hardware.
+        self.edge_history: deque = deque(maxlen=600)   # {t_ms, dP, dQ}
+        self._model_seq = models.reload_seq
         self.smooth: deque = deque(maxlen=3)     # recent proba vectors
         self.residual_W = 0.0
         self.total_W = 0.0
@@ -582,6 +644,101 @@ class LiveEngine:
         return {"t_ms": t_edge, "dP": float(dP), "dQ": float(dQ),
                 "P_after": float(post_P)}
 
+    # ---- edge -> device state (claims) --------------------------------------
+    def _apply_edge(self, edge, direction, dev, conf, record=True):
+        """Turn a detected step into device state: on-edges claim the device ON
+        (with the step's watts), off-edges release the claim and hold the device
+        OFF until the model's window no longer contains the old samples.
+        `record=False` when replaying history so it is not re-appended."""
+        with self.models.lock:
+            ws = self.models.window_s
+        flush_ms = int((ws + 5) * 1000)
+        with self.lock:
+            if record:
+                self.edge_history.append({"t_ms": int(edge["t_ms"]),
+                                          "dP": float(edge["dP"]),
+                                          "dQ": float(edge["dQ"])})
+            if direction == "on":
+                if dev != "unrecognized" and conf is not None and conf >= self.edge_claim_conf:
+                    self.claims[dev] = {"W": abs(float(edge["dP"])),
+                                        "conf": float(conf),
+                                        "t_ms": int(edge["t_ms"])}
+                    self.forced_off.pop(dev, None)
+                return
+            # off-edge: release the claim it belongs to
+            drop = dev if (dev != "unrecognized" and dev in self.claims) else None
+            if drop is None and self.claims:
+                # signature match failed (or named an unclaimed device): release
+                # the active claim whose watts best explain the drop instead
+                best_fam, best_err = None, 0.35
+                for fam, c in self.claims.items():
+                    err = abs(abs(edge["dP"]) - c["W"]) / max(c["W"], 20.0)
+                    if err < best_err:
+                        best_fam, best_err = fam, err
+                drop = best_fam
+            if drop is not None:
+                self.claims.pop(drop, None)
+                self.forced_off[drop] = int(edge["t_ms"]) + flush_ms
+            elif dev != "unrecognized":
+                # no claim existed (device was on before the engine started),
+                # but the step names it: hold it off while the window flushes
+                self.forced_off[dev] = int(edge["t_ms"]) + flush_ms
+
+    def _reconcile_claims(self, instant_W, now_ms):
+        """Physical guard against stale claims: the claimed devices alone can
+        never draw more than the meter reads RIGHT NOW. Compares against the
+        settled instantaneous total (median of the last ~2.5 s), NOT the lagging
+        window mean -- right after a 970 W boiler switches on, the 10 s window
+        mean is still near the pre-switch level and would kill every big claim
+        within one stride (that was the water-boiler regression). Claims also
+        get a short grace period so the guard cannot race the step settling."""
+        with self.lock:
+            for fam in [f for f, until in self.forced_off.items() if now_ms >= until]:
+                self.forced_off.pop(fam, None)
+            while self.claims:
+                mature = {f: c for f, c in self.claims.items()
+                          if now_ms - c["t_ms"] >= 6000}
+                if not mature:
+                    break
+                claimed = sum(c["W"] for c in self.claims.values())
+                if claimed <= instant_W + max(30.0, 0.10 * claimed):
+                    break
+                fam = min(mature, key=lambda f: mature[f]["conf"])
+                c = self.claims.pop(fam)
+                self._log_event(now_ms, "claim_dropped", fam, c["conf"], -c["W"],
+                                None, instant_W,
+                                detail="edge claim exceeds measured power "
+                                       "(missed off-edge?)")
+
+    def _rebuild_state_from_history(self, now_ms):
+        """Software 'unplug everything and plug it back in': after a model
+        reload (retrain finished, or variant switched) every edge this session
+        is RE-MATCHED against the new signature table and the claims rebuilt
+        in order. A step that read 'unrecognized' before a device was taught
+        now resolves to that device; a step that matched the wrong sibling
+        (table fan as standing fan) gets re-decided with the new signatures."""
+        m = self.models
+        with self.lock:
+            hist = list(self.edge_history)
+            self.claims = {}
+            self.forced_off = {}
+            self.smooth.clear()
+        for e in hist:
+            direction = "on" if e["dP"] > 0 else "off"
+            probe = (e["dP"], e["dQ"]) if direction == "on" else (-e["dP"], -e["dQ"])
+            match = m.match_edge(*probe) if abs(e["dP"]) >= self.edge_min_W else None
+            if match and match["confidence"] >= 0.25:
+                dev, conf = match["family"], match["confidence"]
+            else:
+                dev, conf = "unrecognized", None
+            self._apply_edge(e, direction, dev, conf, record=False)
+        with self.lock:
+            on_now = sorted(self.claims)
+        self._log_event(now_ms, "state_rebuilt", ", ".join(on_now) or "-", None,
+                        None, None, None,
+                        detail=f"re-matched {len(hist)} recorded edges against "
+                               "the reloaded model's signatures")
+
     # ---- main loop ----------------------------------------------------------
     def _loop(self):
         while self._run_flag.is_set():
@@ -604,23 +761,28 @@ class LiveEngine:
             names = list(m.appliances)
             presence, power = m.presence, m.power
             ws, on_W = m.window_s, m.on_W
+            seq = m.reload_seq
+        if seq != self._model_seq:       # retrain finished or variant switched
+            self._model_seq = seq
+            self._rebuild_state_from_history(int(arrs["t_ms"][-1]))
 
         # -- edge first (needs only the raw signal, works even with no model) --
         edge = self._detect_edge(arrs)
         if edge is not None:
-            match = m.match_edge(edge["dP"], edge["dQ"]) if abs(edge["dP"]) >= self.edge_min_W else None
             direction = "on" if edge["dP"] > 0 else "off"
+            # an on-edge is the device's own (P, Q); an off-edge is its negative
+            probe = (edge["dP"], edge["dQ"]) if direction == "on" \
+                else (-edge["dP"], -edge["dQ"])
+            match = m.match_edge(*probe) if abs(edge["dP"]) >= self.edge_min_W else None
             if match and match["confidence"] >= 0.25:
                 dev, conf = match["family"], match["confidence"]
-            elif m.match_edge(-edge["dP"], -edge["dQ"]) and edge["dP"] < 0:
-                neg = m.match_edge(-edge["dP"], -edge["dQ"])
-                dev, conf = neg["family"], neg["confidence"]
             else:
                 dev, conf = "unrecognized", None
             self._log_event(edge["t_ms"], f"edge_{direction}", dev, conf,
                             edge["dP"], edge["dQ"], edge["P_after"],
                             detail="step matched to device signature" if dev != "unrecognized"
                                    else "step matches no known device signature")
+            self._apply_edge(edge, direction, dev, conf)
 
         sr = self.svc.sample_rate_hz
         w_samples = max(1, int(round(ws * sr)))
@@ -629,9 +791,14 @@ class LiveEngine:
             return
         now_ms = int(arrs["t_ms"][-1])
         total_W = float(np.nanmean(sig.P))
+        k_now = max(1, int(2.5 * sr))
+        instant_W = float(np.nanmedian(arrs["P"][-k_now:]))
+        self._reconcile_claims(instant_W, now_ms)
+        with self.lock:
+            claims = {f: dict(c) for f, c in self.claims.items()}
+            forced_off = dict(self.forced_off)
 
-        on_map, power_map, prob_map = {}, {}, {}
-        explained = 0.0
+        on_map, power_map, prob_map, src_map = {}, {}, {}, {}
         if presence is not None and names:
             X, _, _ = nl.aggregate_windows(sig, ws, canon=names)
             with m.lock:
@@ -639,6 +806,9 @@ class LiveEngine:
             X = X[-1:].copy()
             proba = nl.presence_proba(presence, X)[0]
             with self.lock:
+                # vocabulary size may change across a retrain hot-reload
+                if self.smooth and len(self.smooth[-1]) != len(proba):
+                    self.smooth.clear()
                 self.smooth.append(proba)
                 proba_s = np.median(np.vstack(list(self.smooth)), axis=0)
             watts = power.predict(X)[0] if power is not None else np.zeros(len(names))
@@ -650,28 +820,63 @@ class LiveEngine:
                 if on and abs(w) < 0.5 and power is None:
                     w = float("nan")
                 on_map[nm], power_map[nm], prob_map[nm] = on, w, float(proba_s[i])
-                if on and math.isfinite(w):
-                    explained += w
+                src_map[nm] = "model"
 
+        # -- merge edge claims over the model ----------------------------------
+        # A claim forces the device ON with the watts its own switch-on step
+        # measured; a fresh off-edge forces it OFF while the model window still
+        # contains pre-switch samples. The model keeps authority over everything
+        # unclaimed, but its watts are rescaled into what the claims leave of
+        # the measured total (this is what splits "boiler at 1444 W" into
+        # boiler 943 W + lamp 501 W).
+        for nm, c in claims.items():
+            on_map[nm] = True
+            power_map[nm] = c["W"]
+            prob_map[nm] = max(prob_map.get(nm, 0.0), c["conf"])
+            src_map[nm] = "edge"
+        for nm in forced_off:
+            if on_map.get(nm):
+                on_map[nm] = False
+                power_map[nm] = 0.0
+                src_map[nm] = "edge"
+        claimed_W = sum(c["W"] for f, c in claims.items() if on_map.get(f))
+        model_on = [nm for nm in on_map
+                    if on_map[nm] and nm not in claims and math.isfinite(power_map.get(nm, 0.0))]
+        pred_sum = sum(power_map[nm] for nm in model_on)
+        remaining = max(0.0, total_W - claimed_W)
+        if pred_sum > 1.0 and pred_sum > remaining:
+            scale = remaining / pred_sum
+            for nm in model_on:
+                power_map[nm] = power_map[nm] * scale
+
+        explained = sum(w for nm, w in power_map.items()
+                        if on_map.get(nm) and math.isfinite(w))
         residual = total_W - explained
         # -- state transitions -> events -------------------------------------
+        # union: an edge claim can name a device the model vocabulary does not
+        # know yet (taught but not retrained) -- it still gets live state
+        track = list(dict.fromkeys(list(names) + list(on_map)))
         with self.lock:
             prev = self.state
             new_state = {}
-            for nm in names:
+            for nm in track:
                 p = prev.get(nm, {})
                 on = on_map.get(nm, False)
                 since = p.get("since_ms")
                 if on and not p.get("on", False):
-                    since = now_ms - int(ws * 1000 / 2)      # window centre-ish
-                    # a recent matching edge gives the exact switch-on moment
-                    for ev in reversed(self.events[-12:]):
-                        if (ev["device"] == nm and ev["kind"].startswith("edge_on")
-                                and now_ms - ev["unix_ms"] < (ws + 6) * 1000):
-                            since = ev["unix_ms"]; break
+                    if nm in claims:                         # exact switch-on moment
+                        since = claims[nm]["t_ms"]
+                    else:
+                        since = now_ms - int(ws * 1000 / 2)  # window centre-ish
+                        # a recent matching edge gives the exact switch-on moment
+                        for ev in reversed(self.events[-12:]):
+                            if (ev["device"] == nm and ev["kind"].startswith("edge_on")
+                                    and now_ms - ev["unix_ms"] < (ws + 6) * 1000):
+                                since = ev["unix_ms"]; break
                     self._log_event(since, "device_on", nm, prob_map.get(nm),
                                     None, None, total_W,
-                                    detail=f"~{power_map.get(nm, 0):.0f} W")
+                                    detail=f"~{power_map.get(nm, 0):.0f} W"
+                                           + (" (edge)" if src_map.get(nm) == "edge" else ""))
                 elif not on and p.get("on", False):
                     self._log_event(now_ms - int(ws * 1000 / 2), "device_off", nm,
                                     prob_map.get(nm), None, None, total_W)
@@ -679,7 +884,8 @@ class LiveEngine:
                 new_state[nm] = {"on": on, "prob": round(prob_map.get(nm, 0.0), 3),
                                  "power_W": None if not math.isfinite(power_map.get(nm, 0.0))
                                  else round(power_map.get(nm, 0.0), 1),
-                                 "since_ms": since}
+                                 "since_ms": since,
+                                 "src": src_map.get(nm, "model")}
             self.state = new_state
             self.total_W = round(total_W, 1)
             self.residual_W = round(residual, 1)
@@ -689,11 +895,18 @@ class LiveEngine:
                 "t_ms": now_ms, "P_total": round(total_W, 1),
                 "residual": round(residual, 1),
                 "devices": {nm: (new_state[nm]["power_W"] if new_state[nm]["on"] else 0.0)
-                            for nm in names}})
+                            for nm in track}})
 
         # -- unknown-device monitor -------------------------------------------
+        # While a fresh claim or a forced-off is still flushing through the
+        # window, the window-mean residual is transiently huge (the mean lags
+        # the step by up to window_s) -- that is settling, not an unknown device.
+        settling = bool(forced_off) or any(
+            now_ms - c["t_ms"] < (ws + 4) * 1000 for c in claims.values())
+        teaching = self._teach_thread is not None and self._teach_thread.is_alive()
         threshold = max(self.unknown_min_W, self.unknown_frac * abs(total_W))
-        over = abs(residual) > threshold and self.retrainer.status()["state"] != "running"
+        over = (abs(residual) > threshold and not settling and not teaching
+                and self.retrainer.status()["state"] != "running")
         with self.lock:
             if over:
                 if self._unknown_first is None:
@@ -718,69 +931,148 @@ class LiveEngine:
             if self.unknown is not None:
                 self.unknown["typical_W"] = round(residual, 1)
 
-    # ---- teach: save the unknown signature as a labelled recording ----------
+    # ---- teach: GUIDED clean recording of exactly one device ----------------
+    # In-mix captures (baseline subtraction while other devices run) gave
+    # visibly worse models than a clean isolated recording, so teach now walks
+    # the user through the same protocol as the manual record button:
+    #   disconnect everything -> 5 s off baseline -> connect the device ->
+    #   teach_record_s ON -> disconnect -> 5 s off tail -> save -> retrain.
+    # Phase changes are driven by the measured power itself (no confirm
+    # clicks); progress/instructions are shown via snapshot()["teach_guide"].
     def teach(self, label: str, retrain: bool = True) -> dict:
         label = (label or "").strip()
         if not label:
             raise ValueError("empty device name")
-        arrs = self._buffer_arrays()
-        if arrs is None:
-            raise RuntimeError("no live data buffered yet")
+        if self.svc.state != "connected":
+            raise RuntimeError("meter not connected")
+        with self.svc._lock:
+            busy = self.svc.session is not None
+        if busy:
+            raise RuntimeError("a manual recording session is active - stop it first")
         with self.lock:
-            unk = dict(self.unknown) if self.unknown else None
-        now_ms = int(arrs["t_ms"][-1])
-        start_ms = (unk["since_ms"] - 4000) if unk else now_ms - 45000
-        sr = self.svc.sample_rate_hz
-
-        t = arrs["t_ms"]
-        seg = t >= start_ms
-        if seg.sum() < 5 * sr:
-            raise RuntimeError("unknown segment too short to save")
-        # baseline = what the OTHER devices were drawing just before it appeared
-        base_win = (t >= start_ms - 12000) & (t < start_ms - 1000)
-        def base(a):
-            return float(np.nanmedian(a[base_win])) if base_win.any() else 0.0
-        dP = np.nan_to_num(arrs["P"][seg] - base(arrs["P"]))
-        dQ = np.nan_to_num(arrs["Q"][seg] - base(arrs["Q"]))
-        dphs = [np.nan_to_num(arrs[k][seg] - base(arrs[k])) for k in ("P1", "P2", "P3")]
-        S = np.hypot(dP, dQ)
-        PF = np.divide(dP, S, out=np.ones_like(dP), where=S > 1e-6)
-
-        safe = pr._safe_label(label)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(self.models.recordings_dir, f"{safe}_{ts}.h5")
-        with h5py.File(path, "w") as f:
-            f.create_dataset("timestamp", data=(t[seg] * 1000).astype(np.int64),
-                             compression="lzf")
-            m = f.create_group("measurements")
-            m.create_dataset("P_total", data=dP.astype(np.float32), compression="lzf")
-            m.create_dataset("Q_total", data=dQ.astype(np.float32), compression="lzf")
-            for i, ph in enumerate(("L1", "L2", "L3")):
-                m.create_dataset(f"P_{ph}", data=dphs[i].astype(np.float32),
-                                 compression="lzf")
-            m.create_dataset("S_total", data=S.astype(np.float32), compression="lzf")
-            m.create_dataset("PF_total", data=PF.astype(np.float32), compression="lzf")
-            md = f.create_group("metadata")
-            md.attrs["format_version"] = pr.FORMAT_VERSION
-            md.attrs["sample_rate_hz"] = float(sr)
-            md.attrs["anchor_datetime"] = datetime.fromtimestamp(
-                start_ms / 1000.0, tz=timezone.utc).isoformat()
-            md.attrs["source"] = "live_teach_delta"
-            md.attrs["appliance_label"] = label
-            md.attrs["note"] = ("baseline-subtracted residual segment captured live; "
-                                "other steady loads were removed by subtraction")
-
-        n = int(seg.sum())
-        self._log_event(now_ms, "taught", nl.parse_family(label), None,
-                        float(np.median(dP)), float(np.median(dQ)), None,
-                        detail=f"saved {n} samples to {os.path.basename(path)}"
-                               + ("; retraining" if retrain else ""))
-        with self.lock:
-            self.unknown = None
+            if self._teach_thread is not None and self._teach_thread.is_alive():
+                raise RuntimeError("a teach session is already running")
+            self._teach_cancel = False
+            self.unknown = None            # the guide takes over the prompt
             self._unknown_first = None
-            self._teach_note = f"saved {os.path.basename(path)}"
-        started = self.retrainer.start() if retrain else False
-        return {"file": path, "samples": n, "retrain_started": bool(started)}
+        th = threading.Thread(target=self._teach_worker, daemon=True,
+                              args=(label, retrain), name="teach-guided")
+        with self.lock:
+            self._teach_thread = th
+        self._log_event(int(time.time() * 1000), "teach_recording",
+                        nl.parse_family(label), None, None, None, None,
+                        detail="guided clean recording started - follow the "
+                               "instructions on the dashboard")
+        th.start()
+        return {"scheduled": True, "guided": True, "label": label,
+                "on_s": self.teach_record_s, "retrain": bool(retrain)}
+
+    def cancel_teach(self) -> bool:
+        with self.lock:
+            running = self._teach_thread is not None and self._teach_thread.is_alive()
+            self._teach_cancel = True
+        return running
+
+    def _set_guide(self, phase: str, msg: str):
+        with self.lock:
+            self.guide = {"phase": phase, "msg": msg}
+
+    def _instant_W(self):
+        arrs = self._buffer_arrays()
+        if arrs is None or not len(arrs["t_ms"]):
+            return None
+        k = max(1, int(1.5 * self.svc.sample_rate_hz))
+        return float(np.nanmedian(arrs["P"][-k:]))
+
+    def _wait_power(self, cond, hold_s, timeout_s, phase, msg_fmt) -> bool:
+        """Advance when cond(instant watts) has held for hold_s seconds."""
+        held, t0 = 0.0, time.time()
+        while time.time() - t0 < timeout_s:
+            if self._teach_cancel or not self._run_flag.is_set():
+                return False
+            w = self._instant_W()
+            held = held + 0.5 if (w is not None and cond(w)) else 0.0
+            self._set_guide(phase, msg_fmt.format(w=w if w is not None else 0.0))
+            if held >= hold_s:
+                return True
+            time.sleep(0.5)
+        return False
+
+    def _teach_worker(self, label, retrain):
+        off_W, lead_s, tail_s = 5.0, 5.0, 5.0
+        on_W = max(8.0, self.edge_min_W)
+        started = False
+        try:
+            # 1. everything off (including the new device)
+            if not self._wait_power(lambda w: abs(w) < off_W, 3.0, 300.0,
+                    "disconnect_all",
+                    f"Step 1/5 - DISCONNECT ALL devices, including '{label}'. "
+                    "Waiting for total power < 5 W (now {w:.0f} W)"):
+                raise RuntimeError("timeout/cancel while waiting for all-off")
+            # 2. clean session recording, 5 s off baseline
+            self.svc.start_session(label)
+            started = True
+            for r in range(int(lead_s), 0, -1):
+                if self._teach_cancel:
+                    raise RuntimeError("cancelled")
+                self._set_guide("off_lead", f"Step 2/5 - recording OFF baseline, "
+                                            f"{r} s. Keep everything disconnected.")
+                time.sleep(1.0)
+            # 3. connect the device
+            if not self._wait_power(lambda w: abs(w) > on_W, 1.5, 180.0,
+                    "connect_now",
+                    f"Step 3/5 - now CONNECT '{label}' (only this device). "
+                    "Waiting for power (now {w:.0f} W)"):
+                raise RuntimeError("device was not connected within 3 minutes")
+            # 4. record it running
+            t0 = time.time()
+            while time.time() - t0 < self.teach_record_s:
+                if self._teach_cancel:
+                    raise RuntimeError("cancelled")
+                left = self.teach_record_s - (time.time() - t0)
+                w = self._instant_W() or 0.0
+                self._set_guide("recording_on",
+                                f"Step 4/5 - recording '{label}' at {w:.0f} W, "
+                                f"{left:.0f} s left. Leave it running.")
+                time.sleep(1.0)
+            # 5. disconnect + off tail (if the user never disconnects, save
+            # anyway - the ON data is already captured)
+            if self._wait_power(lambda w: abs(w) < off_W, 1.5, 120.0,
+                    "disconnect_now",
+                    f"Step 5/5 - now DISCONNECT '{label}'. "
+                    "Waiting for power to drop (now {w:.0f} W)"):
+                for r in range(int(tail_s), 0, -1):
+                    if self._teach_cancel:
+                        raise RuntimeError("cancelled")
+                    self._set_guide("off_tail", f"Step 5/5 - recording OFF tail, {r} s.")
+                    time.sleep(1.0)
+            done = self.svc.stop_session() or {}
+            started = False
+            self.models._load_signatures()
+            fname = os.path.basename(str(done.get("file", "recording")))
+            self._log_event(int(time.time() * 1000), "taught",
+                            nl.parse_family(label), None, None, None, None,
+                            detail=f"guided clean recording saved ({fname}, "
+                                   f"{done.get('samples', '?')} samples)"
+                                   + ("; retraining" if retrain else ""))
+            with self.lock:
+                self._teach_note = f"saved {fname}" + ("; retraining" if retrain else "")
+            if retrain:
+                self.retrainer.start()
+        except Exception as e:            # noqa: BLE001
+            if started:                   # discard the partial recording
+                try:
+                    done = self.svc.stop_session() or {}
+                    f = done.get("file")
+                    if f and os.path.exists(f):
+                        os.remove(f)
+                except Exception:
+                    pass
+            with self.lock:
+                self._teach_note = f"teach '{label}' aborted: {e}"
+        finally:
+            with self.lock:
+                self.guide = None
 
     # ---- snapshots -----------------------------------------------------------
     def snapshot(self) -> dict:
@@ -796,6 +1088,7 @@ class LiveEngine:
                     "residual_W": self.residual_W,
                     "explained_frac": self.explained_frac,
                     "unknown": self.unknown,
+                    "teach_guide": self.guide,
                     "teach_note": self._teach_note}
 
     def chart(self) -> dict:
@@ -873,6 +1166,22 @@ def create_app(svc: pr.AcquisitionService, engine: LiveEngine,
     @app.route("/api/retrain", methods=["POST"])
     def api_retrain():
         return jsonify({"ok": retrainer.start(), "status": retrainer.status()})
+
+    @app.route("/api/teach/cancel", methods=["POST"])
+    def api_teach_cancel():
+        return jsonify({"ok": True, "was_running": engine.cancel_teach()})
+
+    @app.route("/api/model", methods=["POST"])
+    def api_model():
+        """Switch between the frozen 'original' bundle and the train-on-the-go
+        'latest' bundle. The engine rebuilds its device state from the edge
+        history automatically after the reload."""
+        data = request.get_json(silent=True) or {}
+        try:
+            info = models.set_variant(str(data.get("variant", "latest")))
+            return jsonify({"ok": True, "model": info})
+        except Exception as e:            # noqa: BLE001
+            return jsonify({"ok": False, "error": str(e)}), 400
 
     @app.route("/api/record/start", methods=["POST"])
     def api_record_start():
@@ -999,15 +1308,22 @@ LIVE_HTML = r"""<!DOCTYPE html>
 
 <main>
   <section>
+    <div id="guide-box" class="unknown" style="display:none">
+      <b>Teaching - follow the steps</b>
+      <div class="small" id="guide-msg" style="margin-top:6px"></div>
+      <div class="row"><button onclick="teachCancel()">Cancel</button></div>
+    </div>
+
     <div id="unknown-box" class="unknown" style="display:none">
       <b>Unknown device detected</b>
       <div class="small" style="margin-top:4px">
         ~<span id="unk-w">?</span> W of unexplained power since <span id="unk-since">?</span>.
-        What device is this?
+        What device is this? Name it and you will be guided through a clean
+        recording (disconnect everything, then connect only this device).
       </div>
       <div class="row">
         <input type="text" id="teach-name" placeholder="e.g. kettle">
-        <button class="primary" onclick="teach()">Teach&nbsp;+&nbsp;retrain</button>
+        <button class="primary" onclick="teach()">Teach&nbsp;(guided)</button>
       </div>
     </div>
 
@@ -1020,6 +1336,12 @@ LIVE_HTML = r"""<!DOCTYPE html>
 
     <div class="panel">
       <h2>Model</h2>
+      <select id="model-variant" onchange="setVariant(this.value)"
+              style="width:100%;margin-bottom:10px;background:var(--panel2);
+                     border:1px solid var(--line);border-radius:8px;
+                     color:var(--txt);padding:8px 10px;font-size:13px">
+        <option value="latest">train-on-the-go (latest)</option>
+      </select>
       <div class="kv" id="model-kv"></div>
       <div class="small muted" id="model-devices" style="margin-top:8px"></div>
     </div>
@@ -1087,6 +1409,16 @@ async function pollStatus(){
     if(acc.power_mae_W != null) mi += " · ±" + acc.power_mae_W.toFixed(0) + " W";
     document.getElementById("model-info").textContent = m.source === "none" ? "none - teach devices!" : mi;
 
+    const sel = document.getElementById("model-variant");
+    if(document.activeElement !== sel){
+      const vars = m.variants || ["latest"];
+      const opts = vars.map(v => '<option value="'+v+'">'+
+        (v==="latest" ? "train-on-the-go (latest)" : "original (frozen)")+
+        '</option>').join("");
+      if(sel.dataset.opts !== opts){ sel.innerHTML = opts; sel.dataset.opts = opts; }
+      sel.value = m.variant || "latest";
+    }
+
     const kv = document.getElementById("model-kv");
     kv.innerHTML = "";
     const add = (k,v)=>{ kv.innerHTML += "<div>"+k+"</div><div>"+v+"</div>"; };
@@ -1135,15 +1467,20 @@ async function pollState(){
       box.innerHTML = st.currently_on.map(d =>
         '<div class="devcard"><span class="swatch" style="background:'+col(d.device)+'"></span>'+
         '<div><div class="nm">'+d.device+'</div><div class="meta">since '+hms(d.since_iso)+
-        ' · conf '+(100*d.prob).toFixed(0)+'%</div></div>'+
+        ' · conf '+(100*d.prob).toFixed(0)+'%'+(d.src==="edge" ? ' · edge' : '')+'</div></div>'+
         '<span class="w">'+fmtW(d.power_W)+'</span></div>').join("");
     }
     if(Math.abs(st.residual_W) > 1 && st.currently_on.length){
       box.innerHTML += '<div class="devcard" style="opacity:.7"><span class="swatch" style="background:#555"></span>'+
         '<div><div class="nm muted">unassigned residual</div></div><span class="w">'+fmtW(st.residual_W)+'</span></div>';
     }
+    const gb = document.getElementById("guide-box");
+    if(st.teach_guide){
+      gb.style.display = "block";
+      document.getElementById("guide-msg").textContent = st.teach_guide.msg;
+    } else gb.style.display = "none";
     const ub = document.getElementById("unknown-box");
-    if(st.unknown){
+    if(st.unknown && !st.teach_guide){
       ub.style.display = "block";
       document.getElementById("unk-w").textContent = st.unknown.typical_W;
       document.getElementById("unk-since").textContent = hms(st.unknown.since_iso);
@@ -1238,7 +1575,13 @@ async function teach(){
   if(!r.ok) alert("teach failed: " + r.error);
   else document.getElementById("teach-name").value = "";
 }
+async function teachCancel(){ await j("/api/teach/cancel", {method:"POST"}); }
 async function retrain(){ await j("/api/retrain", {method:"POST"}); }
+async function setVariant(v){
+  const r = await j("/api/model", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({variant:v})});
+  if(!r.ok) alert("model switch failed: " + r.error);
+}
 async function simLoad(l){ await j("/api/sim/load", {method:"POST",
   headers:{"Content-Type":"application/json"}, body: JSON.stringify({level:l})}); }
 async function recStart(){
@@ -1302,6 +1645,9 @@ def main():
                    help="presence ON threshold (W) used when retraining")
     p.add_argument("--unknown-min-w", type=float, default=30.0,
                    help="unexplained power (W) that triggers the unknown-device prompt")
+    p.add_argument("--teach-record-s", type=float, default=45.0,
+                   help="teach: seconds of ON time to record (guided flow) "
+                        "before retraining")
     p.add_argument("--web-port", type=int, default=8300)
     p.add_argument("--no-browser", action="store_true")
     args = p.parse_args()
@@ -1340,7 +1686,8 @@ def main():
     retrainer = Retrainer(models, args.scenarios_dir,
                           window_s=args.retrain_window, on_w=args.on_w)
     engine = LiveEngine(svc, models, retrainer, session_dir,
-                        stride_s=args.stride, unknown_min_W=args.unknown_min_w)
+                        stride_s=args.stride, unknown_min_W=args.unknown_min_w,
+                        teach_record_s=args.teach_record_s)
 
     info = models.info()
     if info["source"] == "none":

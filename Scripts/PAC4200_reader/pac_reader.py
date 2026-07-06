@@ -178,16 +178,33 @@ EXTENDED_CHANNELS: Dict[str, int] = {
 #
 #   Voltage L-N (referred to fundamental) was identified as files 110/116/118
 #   (231.9 V fundamentals, clean odd-order dominance).
-#   Current was most likely files 101/102/103 (all-zero at idle) - YOU MUST
-#   confirm these with a real load drawing current before trusting them, and
-#   confirm which file is L1/L2/L3 against the display's phase labels.
+#   Current L1 = file 113, VERIFIED 2026-07-06 against a live load: fundamental
+#   0.078 A matched the meter's I_L1 exactly, orders consecutive (order n at
+#   register offset 2n-1), even orders ~0, odd orders decaying - a textbook
+#   motor spectrum. (File 123 holds the same spectrum compacted to odd orders
+#   only; not used. The old guess 101/102/103 returns an index table - small
+#   integers that decode as float32 denormals - which poisoned every earlier
+#   harmonic recording; _read_harmonic_block now rejects such blocks.)
+#   Current L2/L3 files could not be identified: no current flows on those
+#   phases in this setup (every appliance is on L1), so their spectrum files
+#   read all-zero and are indistinguishable from the other zero files nearby.
+#   Re-run tools/verify_harmonics.py with a load on L2/L3 if that ever changes.
 #
 # The meter gives MAGNITUDES only (current in A, voltage in % of fundamental),
 # not per-order phase, so the h_*_phase datasets stay zero on real recordings.
 # -----------------------------------------------------------------------------
-HARMONIC_I_FILE: Dict[str, int] = {"L1": 101, "L2": 102, "L3": 103}  # VERIFY w/ load
+HARMONIC_I_FILE: Dict[str, int] = {"L1": 113, "L2": 0, "L3": 0}  # L1 verified w/ load 2026-07-06
 HARMONIC_V_FILE: Dict[str, int] = {"L1": 110, "L2": 116, "L3": 118}  # U L-N, verify phase order
 HARMONIC_ORDER1_OFFSET = 1   # 1-based file offset of order 1 (the fundamental)
+
+# THD of CURRENT per phase (%), as plain FC 0x03 scalars. In the Siemens
+# PAC3200/PAC4200 measured-variable map, offsets 49/51/53 are THD-R I L1/L2/L3;
+# this repo's core map treats 49..53 as a reserved gap, so the values were never
+# read. Since "reserved" could not be ruled out for this firmware, the reader
+# PROBES the block once per connect and enables the channels only when all
+# three decode as plausible percentages -- a wrong guess degrades to the old
+# behaviour instead of recording garbage.
+THDI_REGISTERS: Dict[str, int] = {"THD_I_L1": 49, "THD_I_L2": 51, "THD_I_L3": 53}
 
 
 class SwapMode:
@@ -283,10 +300,11 @@ class ModbusReader(BaseReader):
         # address_offset lets you flip 0-based vs 1-based addressing in one place
         # if voltage etc. read as garbage (the classic Modbus off-by-one).
         self.address_offset = address_offset
-        self.extra_channels = extra_channels or {}
+        self.extra_channels = dict(extra_channels or {})
         self.read_harmonics = read_harmonics
         self.timeout = timeout
         self.client: Optional[ModbusTcpClient] = None
+        self._thdi_ok: Optional[bool] = None      # None = not probed yet
 
     def connect(self) -> None:
         self.client = ModbusTcpClient(self.host, port=self.port,
@@ -294,6 +312,36 @@ class ModbusReader(BaseReader):
         if not self.client.connect():
             raise ConnectionError(
                 f"Cannot connect to PAC4200 at {self.host}:{self.port}")
+        self._probe_thdi()
+
+    def _probe_thdi(self) -> None:
+        """One-shot check whether offsets 49..53 really are THD-R I L1..L3 on
+        this firmware (they are in the PAC3200/PAC4200 family map, but this
+        repo's verified map treated them as reserved). Enables the channels
+        only when all three decode as plausible percentages."""
+        self._thdi_ok = False
+        try:
+            block = self._read_block(min(THDI_REGISTERS.values()), 6)
+        except (ModbusException, OSError, AttributeError):
+            block = None
+        if block is None or len(block) < 6:
+            return
+        base = min(THDI_REGISTERS.values())
+        vals = {ch: self._float_at(block, base, off)
+                for ch, off in THDI_REGISTERS.items()}
+        # plausible THD %: finite, not a denormal bit-pattern, 0..1000
+        ok = all(math.isfinite(v) and (v == 0.0 or abs(v) > 1e-6) and 0.0 <= v < 1000.0
+                 for v in vals.values())
+        self._thdi_ok = ok
+        if ok:
+            for ch in THDI_REGISTERS:
+                self.extra_channels.setdefault(ch, THDI_REGISTERS[ch])
+            print(f"[pac_reader] THD-R I registers verified at offsets "
+                  f"{sorted(THDI_REGISTERS.values())}: "
+                  + ", ".join(f"{c}={vals[c]:.1f}%" for c in sorted(vals)))
+        else:
+            print("[pac_reader] offsets 49..53 do not decode as THD-R I on this "
+                  "meter (reserved after all) - THD_I channels disabled")
 
     def disconnect(self) -> None:
         if self.client is not None:
@@ -368,6 +416,13 @@ class ModbusReader(BaseReader):
             else:
                 b = data[4 * k:4 * k + 4]
                 out[k] = struct.unpack(">f", b[2:4] + b[0:2])[0]
+        # A wrong file number returns an index/counter table whose small
+        # integers decode as float32 DENORMALS (~1e-44). Recording those as
+        # magnitudes poisoned every earlier harmonic dataset, so reject any
+        # block that is not physically plausible and let the arrays stay zero.
+        nz = out[out != 0]
+        if not np.isfinite(out).all() or (nz.size and np.abs(nz).max() < 1e-30):
+            return None
         return out
 
     # --- one full sample -----------------------------------------------------
@@ -389,8 +444,10 @@ class ModbusReader(BaseReader):
                 s.scalars[ch] = self._float_at(block_b, CORE_BLOCK_B_START, off)
 
         # Optional, user-verified extended channels (read individually).
+        # (a 32-bit float spans 2 registers; count=1 here was a latent bug that
+        # silently dropped every extended channel)
         for ch, off in self.extra_channels.items():
-            vals = self.read_raw(off, 1)
+            vals = self.read_raw(off, 2)
             if vals is not None and len(vals) >= 2:
                 s.scalars[ch] = decode_float(vals[0], vals[1], self.swap)
 

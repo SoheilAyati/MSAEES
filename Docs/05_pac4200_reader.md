@@ -80,8 +80,10 @@ Configured file numbers in the source (verify per meter with `tools/probe_filere
 
 | Quantity | L1 | L2 | L3 | Notes |
 |---|---|---|---|---|
-| `HARMONIC_I_FILE` (current, A) | 101 | 102 | 103 | all-zero at idle; confirm with a real load drawing current, and confirm phase order against the display |
-| `HARMONIC_V_FILE` (voltage L-N, % of fundamental) | 110 | 116 | 118 | identified via 231.9 V fundamentals and clean odd-order dominance |
+| `HARMONIC_I_FILE` (current, A) | **113** | 0 | 0 | L1 VERIFIED 2026-07-06 against a live load: fundamental matched I_L1 (0.078 A) exactly, orders consecutive, even orders ~0, odd orders decaying; derived THD_I_L1 = 10.6 % for the table fan. L2/L3 cannot be identified while no current flows on those phases (all appliances are on L1); re-run `tools/verify_harmonics.py` with a load there if needed. The old guess 101/102/103 returns an index table (float32 denormals), which poisoned every earlier harmonic recording |
+| `HARMONIC_V_FILE` (voltage L-N, % of fundamental) | 110 | 116 | 118 | identified via 231.9 V fundamentals and clean odd-order dominance. File 123 mirrors 113 with odd orders only; 120/126/128 mirror the voltage files (not used) |
+
+`_read_harmonic_block()` now rejects blocks whose nonzero values are all denormals, so a wrong file number can no longer poison recordings. In addition, the reader probes offsets **49/51/53** (THD-R I L1..L3 in the PAC3200/PAC4200 family map, previously treated as a reserved gap) once per connect and enables `THD_I_L1..L3` scalar channels automatically when all three decode as plausible percentages -- on this meter/firmware they read NaN, so they stay disabled and live THD_I is derived from the file-113 spectrum instead.
 
 A file number of 0 disables that quantity (its arrays stay zero). Harmonic reading is **off by default**; enable with `--harmonics`.
 
@@ -188,7 +190,8 @@ python pac_reader.py --host 192.168.168.1 --headless --label fridge --duration 3
 
 ## 7. Commissioning tools (`Scripts/PAC4200_reader/tools/`)
 
-- **`probe_filerecord.py`** : the maintained commissioning tool. Locates the PAC4200 harmonic data via FC 0x14. Mode A scans candidate file numbers to find files that answer; Mode B (`--file N`) dumps a file so you can see where each quantity's spectrum (a large fundamental followed by decaying orders) sits. Key findings baked into `pac_reader.py`: Siemens file records are 1-based (record 0 always errors), voltage L-N spectra were identified as files 110/116/118, current most likely 101/102/103 (must be confirmed with a load on). Use this whenever a new meter or firmware revision is commissioned.
+- **`probe_filerecord.py`** : the maintained commissioning tool. Locates the PAC4200 harmonic data via FC 0x14. Mode A scans candidate file numbers to find files that answer; Mode B (`--file N`) dumps a file so you can see where each quantity's spectrum (a large fundamental followed by decaying orders) sits. Key findings baked into `pac_reader.py`: Siemens file records are 1-based (record 0 always errors), voltage L-N spectra were identified as files 110/116/118; the 101/102/103 guess for current was later disproven with real loads. Use this whenever a new meter or firmware revision is commissioned.
+- **`verify_harmonics.py`** : one-pass verification, run WITH A LOAD ON. Reads the core registers for ground truth, checks the THD-R I candidate registers 49/51/53, scans FC 0x14 files for one whose order-1 fundamental matches a measured phase current (that is the current-harmonic file, and the match settles the phase order), scans the reported plain-register block (~11007), and prints the exact `HARMONIC_I_FILE` line to paste into `pac_reader.py`.
 - **`find_harmonics.py`** : historical register-block scanner (FC 0x03 and 0x04) from when the harmonics were assumed to be a plain register run. Superseded by the file-record approach; kept for reference.
 - **`probe_harmonic_registers.py`** : historical probe of a plain-register location around 11007..11091 reported by another group. Also superseded; kept for reference. Its README-style docstring documents why the register hypotheses failed.
 
@@ -218,7 +221,7 @@ Recommended procedure per appliance: connect once, then for each device plug it 
 3. **Cross-check against the display.** Compare 3-5 channels (V, I, P_total) with the meter's own display; class 0.2 accuracy means they should agree closely.
 4. **Effective rate.** Watch the header pill; if the effective rate sits well below the configured `--rate`, lower the rate to what the link sustains.
 5. **Extended channels (optional).** Use the register inspector to confirm THD-I / cos-phi addresses for the installed firmware before adding them to `EXTENDED_CHANNELS`.
-6. **Harmonics (optional).** Run `tools/probe_filerecord.py`, confirm current files with a load drawing current and the phase order against the display, fill `HARMONIC_I_FILE` / `HARMONIC_V_FILE`, then record with `--harmonics`. Remember: magnitudes only.
+6. **Harmonics (optional).** Run `tools/verify_harmonics.py` with a load drawing current; it identifies the current files, the phase order, and the THD-R I registers in one pass and prints the `HARMONIC_I_FILE` line to paste into `pac_reader.py`. Then record with `--harmonics`. Remember: magnitudes only.
 
 ---
 

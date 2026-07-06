@@ -57,7 +57,7 @@ CANON = SYNTHETIC_APPLIANCES + MEASURED_APPLIANCES
 STATE_WORDS = {
     "on", "off", "run", "running", "standby", "idle", "only", "trig",
     "low", "med", "medium", "high", "min", "max",
-    "rotation", "no", "swing", "withswing", "mix", "mixed", "directoff",
+    "rotation", "rotate", "rotating", "no", "swing", "withswing", "mix", "mixed", "directoff",
     "small", "delay", "slow", "fast", "test", "again", "new",
 }
 # leading session prefixes: 'test_water_boiler_on' is the same physical device
@@ -118,9 +118,14 @@ FEATURES_FULL = FEATURES_COMMON + FEATURES_HARM
 # only ever APPENDED: a model bundle stores the feature list it was trained
 # with, and inference slices the freshly built matrix to that length, so old
 # models keep working after the set grows.
+# Pstep_max / Qstep_at_Pstep / n_steps are EVENT features: the largest settled
+# power step inside the window, the reactive step at the same instant, and how
+# many steps occurred. Steady-state sums cannot tell "boiler + lamp" from
+# "boiler drawing more", but the switch-on step identifies the joining device.
 AGG_FEATURES = ["Ptot_mean", "Ptot_std", "Ptot_min", "Ptot_max", "Qtot_mean",
                 "PL1_mean", "PL2_mean", "PL3_mean", "PF_mean", "THDI_mean", "hour",
-                "Qtot_std", "QP_ratio", "Stot_mean"]
+                "Qtot_std", "QP_ratio", "Stot_mean",
+                "Pstep_max", "Qstep_at_Pstep", "n_steps"]
 
 
 def slice_features(X, bundle_features):
@@ -350,6 +355,31 @@ def _gt_matrix(sig, Wfn, n_rows, canon):
     return Y
 
 
+def _step_features(Pw, Qw, step_min_W=10.0):
+    """Per-window event features from the windowed P/Q matrices (N, w):
+    the largest settled step (pre/post medians around the sharpest sample-to-
+    sample change), the Q step at that same instant, and the step count."""
+    N, w = Pw.shape
+    dP_max = np.zeros(N)
+    dQ_at = np.zeros(N)
+    n_steps = np.zeros(N)
+    if w < 4:
+        return dP_max, dQ_at, n_steps
+    P = np.nan_to_num(Pw)
+    Q = np.nan_to_num(Qw)
+    d = np.diff(P, axis=1)                         # (N, w-1)
+    j = np.argmax(np.abs(d), axis=1)
+    k = max(1, min(5, w // 4))
+    for i in range(N):
+        jj = int(j[i])
+        pre = slice(max(0, jj - k + 1), jj + 1)
+        post = slice(jj + 1, min(w, jj + 1 + k))
+        dP_max[i] = np.median(P[i, post]) - np.median(P[i, pre])
+        dQ_at[i] = np.median(Q[i, post]) - np.median(Q[i, pre])
+    n_steps = (np.abs(d) > step_min_W).sum(axis=1).astype(float)
+    return dP_max, dQ_at, n_steps
+
+
 def aggregate_windows(sig: Signal, window_s=30.0, canon=None):
     """Return (X, Y, appliance_names). Y is None if the file has no ground truth.
 
@@ -373,12 +403,14 @@ def aggregate_windows(sig: Signal, window_s=30.0, canon=None):
         warnings.simplefilter("ignore", category=RuntimeWarning)
         Pm = np.nanmean(W(sig.P), 1)
         Qm = np.nanmean(W(sig.Q), 1)
+        dP_max, dQ_at, n_steps = _step_features(W(sig.P), W(sig.Q))
         X = np.column_stack([
             Pm, np.nanstd(W(sig.P), 1), np.nanmin(W(sig.P), 1), np.nanmax(W(sig.P), 1),
             Qm,
             np.nanmean(W(Pph[:, 0]), 1), np.nanmean(W(Pph[:, 1]), 1), np.nanmean(W(Pph[:, 2]), 1),
             np.nanmean(W(sig.PF), 1), np.nanmean(W(sig.THD_I), 1), np.nanmean(W(hour), 1),
             np.nanstd(W(sig.Q), 1), Qm / (np.abs(Pm) + 1e-6), np.hypot(Pm, Qm),
+            dP_max, dQ_at, n_steps,
         ])
     X = np.nan_to_num(X)
     Y = None

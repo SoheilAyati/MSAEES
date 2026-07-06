@@ -113,19 +113,65 @@ Dashboard: `http://127.0.0.1:8300/` (`--web-port` to change). Options:
   transition adopts the matching edge's timestamp when one exists, so
   `device_on water_boiler` is logged at the actual switching moment, not at
   window resolution.
+- **Edge claims drive state (2026-07-06).** A matched on-edge does not just
+  timestamp events anymore: it CLAIMS the device ON with the step's own watts,
+  and a matched off-edge releases the claim (holding the device off while the
+  model window still contains pre-switch samples). Claims outrank the window
+  model because steady-state features cannot tell "boiler + lamp" from
+  "boiler drawing more" -- but the +501 W step at plug-in time identifies the
+  lamp uniquely. Watts of unclaimed model-ON devices are rescaled into
+  whatever the claims leave of the measured total, which is what splits a
+  1444 W window into boiler 943 W + lamp 501 W. A physical guard drops the
+  weakest claim whenever the claimed devices alone would exceed the measured
+  total (missed off-edge). Claimed devices show `edge` next to their
+  confidence on the dashboard.
 - **Residual** = measured window mean minus the sum of watts of devices
   predicted ON. It is shown live as *explained %*, and drives unknown
   detection: residual above `max(--unknown-min-w, 15 % of total)` for 8 s or
   more raises the unknown-device prompt.
 
+### Model variants (2026-07-06)
+
+Two mix bundles can coexist in the models dir and the dashboard's Model panel
+has a dropdown to switch between them at runtime:
+
+- **train-on-the-go (latest)** -> `model_mix.joblib`: what every retrain
+  (teach loop or Retrain button) overwrites.
+- **original (frozen)** -> `model_mix_original.joblib`: a blessed snapshot that
+  retraining never touches. Freeze one by copying:
+  `cp model_mix.joblib model_mix_original.joblib`.
+
+### State rebuild after a model reload (software "re-plug")
+
+Whenever the model reloads (retrain finished, or the variant was switched),
+the engine RE-MATCHES every edge recorded this session against the new
+signature table and rebuilds the claims in order (`state_rebuilt` event).
+This is a software version of unplugging everything and plugging it back in:
+an edge that read `unrecognized` before a device was taught resolves to that
+device afterwards, and a step that matched the wrong sibling gets re-decided -
+no need to physically power-cycle the appliances.
+
 ## 4. Teaching (training on the go)
 
 Two paths, both end in an automatic background retrain + hot reload:
 
-1. **Teach from the unknown prompt.** The engine captures the segment since the
-   unknown appeared and subtracts the pre-event baseline, so the *other* running
-   devices are removed; the delta trace is written as a normal labelled
-   recording, marked `metadata.source = live_teach_delta`.
+1. **Teach from the unknown prompt (GUIDED, 2026-07-06).** In-mix captures
+   with baseline subtraction gave visibly worse models than a clean isolated
+   recording, so naming the unknown now starts a guided walk-through of the
+   same protocol as the manual record button. The dashboard shows one step at
+   a time, and each step advances automatically from the measured power (no
+   confirm clicks):
+   1. *Disconnect ALL devices* (including the unknown one) - waits for total
+      power < 5 W;
+   2. records a 5 s OFF baseline;
+   3. *Connect only the new device* - waits for power to appear;
+   4. records it running for `--teach-record-s` (default 45) seconds;
+   5. *Disconnect it* - then records a 5 s OFF tail.
+   The result is a normal clean session recording (same writer as the manual
+   path, harmonics included) and the retrain starts automatically. A Cancel
+   button aborts and discards the partial file; if the device is never
+   disconnected in step 5, the recording is saved anyway (the ON data is
+   already captured). The unknown prompt is suppressed while a teach runs.
 2. **Record it clean** (side panel). Plug in only the new device, name it,
    record about 60 s, stop. This uses the same session writer as the PAC4200
    monitor, including harmonics: the higher-fidelity path when you can

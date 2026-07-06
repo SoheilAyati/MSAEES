@@ -1,6 +1,6 @@
 {
   "task": "identify",
-  "model": "lgbm",
+  "model": "rf",
   "features": [
     "P_mean",
     "Q_mean",
@@ -18,17 +18,17 @@
     "h_energy"
   ],
   "split": "stratified rows (one instance per class)",
-  "n_windows": 811,
+  "n_windows": 171,
   "classes": [
     "coffee_machine",
+    "laptop",
     "pv",
     "standing_fan",
     "standing_lamp",
     "table_fan",
-    "table_lamp",
     "water_boiler"
   ],
-  "trained_utc": "2026-07-05T11:08:59+00:00",
-  "holdout_macro_f1": 1.0,
-  "holdout_accuracy": 1.0
+  "trained_utc": "2026-07-06T15:59:10+00:00",
+  "holdout_macro_f1": 0.9548759942848613,
+  "holdout_accuracy": 0.9534883720930233
 }

@@ -1,6 +1,6 @@
 {
   "task": "mix",
-  "model": "lgbm",
+  "model": "rf",
   "features": [
     "Ptot_mean",
     "Ptot_std",
@@ -15,57 +15,60 @@
     "hour",
     "Qtot_std",
     "QP_ratio",
-    "Stot_mean"
+    "Stot_mean",
+    "Pstep_max",
+    "Qstep_at_Pstep",
+    "n_steps"
   ],
   "appliances": [
     "coffee_machine",
+    "laptop",
     "pv",
     "standing_fan",
     "standing_lamp",
     "table_fan",
-    "table_lamp",
     "water_boiler"
   ],
   "on_W": 5.0,
-  "trained_utc": "2026-07-05T11:08:55+00:00",
-  "n_windows": 14400,
-  "presence_macro_f1": 0.9233682976216694,
+  "trained_utc": "2026-07-06T15:59:02+00:00",
+  "n_windows": 1920,
+  "presence_macro_f1": 0.9164452280172506,
   "per_appliance_f1": {
-    "coffee_machine": 0.9885823025689819,
-    "pv": 0.6407766990291263,
-    "standing_fan": 0.9693313222724987,
-    "standing_lamp": 0.9922879177377892,
-    "table_fan": 0.877502001601281,
-    "table_lamp": 0.9975333004440059,
-    "water_boiler": 0.997564539698003
+    "coffee_machine": 0.8859060402684564,
+    "laptop": 0.9608540925266904,
+    "pv": 0.7567567567567568,
+    "standing_fan": 0.9795918367346939,
+    "standing_lamp": 0.9923076923076923,
+    "table_fan": 0.8546255506607929,
+    "water_boiler": 0.9850746268656716
   },
   "holdout_on_windows": {
-    "coffee_machine": 1046,
-    "pv": 66,
-    "standing_fan": 995,
-    "standing_lamp": 776,
-    "table_fan": 648,
-    "table_lamp": 1012,
-    "water_boiler": 1027
+    "coffee_machine": 74,
+    "laptop": 144,
+    "pv": 68,
+    "standing_fan": 148,
+    "standing_lamp": 131,
+    "table_fan": 127,
+    "water_boiler": 136
   },
-  "power_overall_mae_W": 1.861406417732481,
+  "power_overall_mae_W": 3.3307213387868657,
   "per_appliance_mae_W": {
-    "coffee_machine": 4.987039817814789,
-    "pv": 0.13344042592837335,
-    "standing_fan": 0.8598295682258584,
-    "standing_lamp": 1.8479188970223057,
-    "table_fan": 0.7711843354172595,
-    "table_lamp": 0.25388270771613064,
-    "water_boiler": 4.17654917200265
+    "coffee_machine": 8.57863324027508,
+    "laptop": 1.3150719943431404,
+    "pv": 0.7163155589171051,
+    "standing_fan": 0.6366658659662409,
+    "standing_lamp": 3.1845553734054604,
+    "table_fan": 0.7333774060448608,
+    "water_boiler": 8.15042993255617
   },
-  "gated_overall_mae_W": 1.4070526019266958,
+  "gated_overall_mae_W": 2.888929783510391,
   "per_appliance_gated_mae_W": {
-    "coffee_machine": 3.6502461117695257,
-    "pv": 0.18212820394953208,
-    "standing_fan": 0.7747822901290377,
-    "standing_lamp": 1.1113014826968302,
-    "table_fan": 0.5464766444941641,
-    "table_lamp": 0.2410766132471473,
-    "water_boiler": 3.3433568672006344
+    "coffee_machine": 7.245657539644256,
+    "laptop": 1.3438506922289815,
+    "pv": 0.7474991827045903,
+    "standing_fan": 0.5796863642201426,
+    "standing_lamp": 2.6617682581431112,
+    "table_fan": 0.8361486572772266,
+    "water_boiler": 6.8078977903544295
   }
 }
