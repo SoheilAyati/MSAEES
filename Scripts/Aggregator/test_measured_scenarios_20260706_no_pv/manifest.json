@@ -1,0 +1,68 @@
+[
+  {
+    "scenario": "measured_scenario_00.h5",
+    "appliances": [
+      "coffee_machine",
+      "standing_lamp",
+      "water_boiler",
+      "laptop",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 2767.2
+  },
+  {
+    "scenario": "measured_scenario_01.h5",
+    "appliances": [
+      "table_fan",
+      "laptop",
+      "standing_lamp",
+      "water_boiler"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1687.8
+  },
+  {
+    "scenario": "measured_scenario_02.h5",
+    "appliances": [
+      "standing_fan",
+      "standing_lamp",
+      "laptop",
+      "coffee_machine",
+      "table_fan",
+      "water_boiler"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 2799.9
+  },
+  {
+    "scenario": "measured_scenario_03.h5",
+    "appliances": [
+      "coffee_machine",
+      "standing_lamp",
+      "laptop",
+      "standing_fan",
+      "table_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1973.3
+  },
+  {
+    "scenario": "measured_scenario_04.h5",
+    "appliances": [
+      "laptop",
+      "water_boiler",
+      "standing_fan",
+      "coffee_machine",
+      "table_fan",
+      "standing_lamp"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 2861.4
+  }
+]

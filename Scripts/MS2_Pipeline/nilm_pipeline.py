@@ -44,6 +44,47 @@ SYNTHETIC_APPLIANCES = ["baseload", "ev", "fridge", "hair_dryer", "pc", "pv",
 MEASURED_APPLIANCES = ["laptop", "stand_cooler", "table_fan", "table_pv"]
 CANON = SYNTHETIC_APPLIANCES + MEASURED_APPLIANCES
 
+# --------------------------------------------------------------------------
+# Family colors: ONE canonical color per appliance family, shared by every
+# chart (the mix_measured_scenarios decomposition PNGs and the live.py
+# dashboard), so a device keeps the same color everywhere and the plots can
+# be compared side by side. Each family has two steps of the SAME hue:
+# 'light' for white-background matplotlib figures, 'dark' for the dark
+# dashboard surface (each step set validated for CVD separation and contrast
+# on its own surface).
+FAMILY_COLORS = {
+    "laptop":         {"light": "#2a78d6", "dark": "#3987e5"},   # blue
+    "table_fan":      {"light": "#1baf7a", "dark": "#199e70"},   # aqua
+    "pv":             {"light": "#eda100", "dark": "#c98500"},   # yellow
+    "standing_fan":   {"light": "#008300", "dark": "#008300"},   # green
+    "standing_lamp":  {"light": "#4a3aa7", "dark": "#9085e9"},   # violet
+    "water_boiler":   {"light": "#e34948", "dark": "#e66767"},   # red
+    "table_lamp":     {"light": "#e87ba4", "dark": "#d55181"},   # magenta
+    "coffee_machine": {"light": "#eb6834", "dark": "#d95926"},   # orange
+}
+
+
+def _djb2(s: str) -> int:
+    """32-bit djb2 string hash. live.py implements the identical function in
+    JS so an unmapped family still gets the SAME color in both charts."""
+    h = 5381
+    for ch in s:
+        h = (h * 33 + ord(ch)) & 0xFFFFFFFF
+    return h
+
+
+def family_color(name: str, mode: str = "light") -> str:
+    """Canonical chart color for an appliance family (accepts instance names
+    like 'table_fan_1' too). Families not in FAMILY_COLORS hash
+    deterministically into the same palette, so newly taught devices keep a
+    stable color across restarts and across both charts."""
+    fam = parse_family(name)
+    slot = FAMILY_COLORS.get(fam)
+    if slot is None:
+        keys = list(FAMILY_COLORS)
+        slot = FAMILY_COLORS[keys[_djb2(fam) % len(keys)]]
+    return slot["dark" if mode == "dark" else "light"]
+
 
 # --------------------------------------------------------------------------
 # Label parsing: recording label / filename  ->  device families

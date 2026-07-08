@@ -76,7 +76,7 @@ import aggregator as agg  # noqa: E402
 # truth), so 'standing_fan_high_no_rotation' and 'standing_fan_low_rotation'
 # collapse to the same family here AND at training/inference time.
 sys.path.insert(0, os.path.join(HERE, "..", "MS2_Pipeline"))
-from nilm_pipeline import parse_family as family, is_mixed_label  # noqa: E402
+from nilm_pipeline import parse_family as family, is_mixed_label, family_color  # noqa: E402
 
 N_HARMONICS = 39
 MIN_SAMPLES = 25            # skip recordings shorter than ~5 s @ 5 Hz
@@ -186,7 +186,11 @@ def write_appliance(path: str, rec: dict, N: int, sr: float,
 # Optional decomposition plot
 # ---------------------------------------------------------------------------
 def _plot_scenario(path: str, out_png: str) -> None:
-    """Save a stacked-area plot of per-appliance ground truth vs the aggregate."""
+    """Save a detailed decomposition figure: the stacked aggregate view on top,
+    then one ground-truth panel per appliance showing its own P_contribution,
+    the ON intervals as shading, and duty-cycle / typical-watts stats. Colors
+    come from nilm_pipeline.family_color so every chart in the project (incl.
+    the live dashboard) shows a given device family in the same hue."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -194,23 +198,74 @@ def _plot_scenario(path: str, out_png: str) -> None:
     except Exception as e:                       # matplotlib is optional
         print(f"  (plot skipped, matplotlib unavailable: {e})")
         return
+    INK, INK2, GRID = "#0b0b0b", "#52514e", "#e1e0d9"
     with h5py.File(path, "r") as h:
         sr = float(h["metadata"].attrs["sample_rate_hz"])
         Pt = h["measurements/P_total"][:]
-        Pc = h["ground_truth/P_contribution"][:]
+        Pc = h["ground_truth/P_contribution"][:]          # (N, n_app)
         names = [x.decode() if isinstance(x, (bytes, bytearray)) else x
                  for x in h["ground_truth/appliance_names"][:]]
+        states = h["ground_truth/state"][:]                # (N, n_app) b"on"/b"off"
+    n_app = len(names)
     t = np.arange(len(Pt)) / sr
-    fig, ax = plt.subplots(figsize=(11, 4.5))
-    ax.stackplot(t, np.clip(Pc, 0, None).T, labels=names, alpha=0.85)
+    colors = [family_color(nm, "light") for nm in names]
+
+    fig, axes = plt.subplots(
+        n_app + 1, 1, sharex=True,
+        figsize=(12, 3.4 + 1.15 * n_app),
+        gridspec_kw={"height_ratios": [2.4] + [1.0] * n_app, "hspace": 0.12})
+    axes = np.atleast_1d(axes)
+
+    # -- top: aggregate vs stacked ground truth ------------------------------
+    ax = axes[0]
+    ax.stackplot(t, np.clip(Pc, 0, None).T, labels=names, colors=colors,
+                 alpha=0.85, linewidth=0)
     neg = np.clip(Pc, None, 0)
     if (neg < 0).any():
-        ax.stackplot(t, neg.T, alpha=0.85)
-    ax.plot(t, Pt, color="black", lw=1.4, label="P_total")
-    ax.set_xlabel("time (s)"); ax.set_ylabel("P (W)")
-    ax.set_title(os.path.basename(path) + " - per-appliance ground truth vs aggregate")
-    ax.legend(loc="upper right", ncol=3, fontsize=8); ax.grid(alpha=0.3)
-    plt.tight_layout(); plt.savefig(out_png, dpi=120); plt.close()
+        ax.stackplot(t, neg.T, colors=colors, alpha=0.85, linewidth=0)
+    ax.plot(t, Pt, color=INK, lw=1.5, label="P_total (aggregate)")
+    ax.set_ylabel("P (W)", color=INK2)
+    ax.set_title(os.path.basename(path) + " - aggregate vs per-appliance ground truth",
+                 fontsize=11, color=INK)
+    top = max(float(np.abs(Pt).max()),
+              float(np.clip(Pc, 0, None).sum(axis=1).max()), 1.0)
+    ax.set_ylim(top=top * 1.45)          # headroom so the legend clears the data
+    leg = ax.legend(loc="upper right", ncol=min(4, n_app + 1), fontsize=8,
+                    frameon=True, framealpha=0.9, edgecolor=GRID)
+    leg.get_frame().set_facecolor("#ffffff")
+
+    # -- one ground-truth panel per appliance --------------------------------
+    for i, (nm, c) in enumerate(zip(names, colors)):
+        axd = axes[i + 1]
+        p = Pc[:, i]
+        on = states[:, i] == b"on"
+        # ON intervals as a background wash: the ground-truth schedule is
+        # visible even where the device draws few watts
+        if on.any():
+            axd.fill_between(t, 0, 1, where=on, transform=axd.get_xaxis_transform(),
+                             color=c, alpha=0.10, linewidth=0)
+        axd.fill_between(t, 0, p, color=c, alpha=0.45, linewidth=0)
+        axd.plot(t, p, color=c, lw=1.3)
+        duty = 100.0 * float(on.mean())
+        on_w = float(np.median(np.abs(p[on]))) if on.any() else 0.0
+        peak = float(np.abs(p).max())
+        axd.set_ylabel(nm, rotation=0, ha="right", va="center",
+                       fontsize=9, color=INK)
+        axd.text(0.995, 0.92, f"on {duty:.0f}% of the time · ~{on_w:.0f} W when on · peak {peak:.0f} W",
+                 transform=axd.transAxes, ha="right", va="top",
+                 fontsize=7.5, color=INK2)
+        ymax = max(peak, 1.0)
+        axd.set_ylim(min(0.0, float(p.min()) * 1.1), ymax * 1.35)
+
+    for ax_ in axes:
+        ax_.grid(alpha=0.6, color=GRID, linewidth=0.7)
+        ax_.tick_params(colors=INK2, labelsize=8)
+        for sp in ax_.spines.values():
+            sp.set_color(GRID)
+    axes[-1].set_xlabel("time (s)", color=INK2)
+    axes[-1].set_xlim(t[0], t[-1])
+    fig.savefig(out_png, dpi=120, bbox_inches="tight")
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------

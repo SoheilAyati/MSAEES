@@ -175,6 +175,8 @@ class ReplayReader(pr.BaseReader):
         self._n = len(self._P)
         if self._n < 2:
             raise ValueError(f"{self.path}: too few samples to replay")
+        self.last_index = 0              # most recently emitted sample index
+        self.gt = self._load_ground_truth()
 
     def _thd_from_harmonics(self, sig) -> np.ndarray:
         """THD_I_L1 from the per-order spectrum, same formula as ThdReader /
@@ -198,6 +200,54 @@ class ReplayReader(pr.BaseReader):
         energy = np.sqrt(np.nansum(harm ** 2, axis=1))
         return np.where(i_fund > 1e-3, 100.0 * energy / np.maximum(i_fund, 1e-9),
                         np.nan)
+
+    def _load_ground_truth(self):
+        """Ground truth carried by the replayed file, if any.
+
+        * scenario .h5 (aggregator / mix_measured_scenarios output): the file's
+          /ground_truth gives per-family ON state and watts for EVERY sample
+          -> mode 'full' (chart overlay + presence/power scoring)
+        * PAC4200 recording .h5: metadata.appliance_label names which device
+          families were physically connected (mixed 'a__b' labels included)
+          -> mode 'label' (expected-set comparison only)
+        * anything else (csv, no metadata): None - plain live view.
+        """
+        if not self.path.lower().endswith(".h5"):
+            return None
+        try:
+            with h5py.File(self.path, "r") as f:
+                if ("ground_truth/P_contribution" in f
+                        and "ground_truth/appliance_names" in f):
+                    names = [x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+                             for x in f["ground_truth/appliance_names"][:]]
+                    Pc = np.nan_to_num(np.asarray(
+                        f["ground_truth/P_contribution"][:], dtype=np.float64))
+                    st = (f["ground_truth/state"][:]
+                          if "ground_truth/state" in f else None)
+                    if Pc.shape == (self._n, len(names)):
+                        # collapse '<family>_<instance>' columns to families
+                        fams: dict = {}
+                        for k, nm in enumerate(names):
+                            fam = nl.parse_family(nm)
+                            d = fams.setdefault(fam, {
+                                "W": np.zeros(self._n),
+                                "on": np.zeros(self._n, dtype=bool)})
+                            d["W"] = d["W"] + Pc[:, k]
+                            d["on"] = d["on"] | (
+                                (st[:, k] == b"on") if st is not None
+                                else (np.abs(Pc[:, k]) > 3.0))
+                        return {"mode": "full", "families": fams}
+                lab = ""
+                if "metadata" in f:
+                    lab = f["metadata"].attrs.get("appliance_label", "")
+                    lab = lab.decode() if isinstance(lab, (bytes, bytearray)) else str(lab)
+                if lab:
+                    fams = nl.parse_families(lab)
+                    if fams:
+                        return {"mode": "label", "label": lab, "expected": fams}
+        except (OSError, KeyError):
+            pass
+        return None
 
     # -- reader interface ------------------------------------------------------
     def connect(self):
@@ -235,6 +285,7 @@ class ReplayReader(pr.BaseReader):
                 self.finished = True           # live.py freezes the dashboard
                 i = self._n - 1                # hold the final state meanwhile
         self._i = i + 1
+        self.last_index = i                    # aligns ground truth to "now"
         s = pr.Sample(timestamp_us=int(time.time() * 1e6))
         s.scalars = {
             "P_total": float(self._P[i]), "Q_total": float(self._Q[i]),
@@ -542,6 +593,15 @@ class LiveEngine:
         self._unknown_first: float | None = None
         self._last_edge_ms = 0
         self._teach_note = ""
+        # replay ground-truth comparison: available only when the reader
+        # replays a file that carries ground truth (scenario /ground_truth or
+        # a labelled recording); None on real/simulated meters
+        inner = getattr(svc.reader, "inner", svc.reader)
+        self._gt = getattr(inner, "gt", None)
+        self._gt_reader = inner
+        self.gt_stats: dict = {}         # family -> confusion counts + power err
+        self._gt_set_stats = {"tp": 0, "fp": 0, "fn": 0, "n": 0}
+        self._gt_now: dict | None = None
 
         os.makedirs(out_dir, exist_ok=True)
         self.out_dir = out_dir
@@ -739,6 +799,86 @@ class LiveEngine:
                         detail=f"re-matched {len(hist)} recorded edges against "
                                "the reloaded model's signatures")
 
+    # ---- replay ground-truth comparison --------------------------------------
+    def _gt_window(self, w_samples: int):
+        """Ground-truth per-family ON state and mean watts over the model's
+        trailing window, aligned to the replay position (mode 'full' only)."""
+        idx = int(getattr(self._gt_reader, "last_index", 0))
+        lo = max(0, idx - w_samples + 1)
+        on, W = {}, {}
+        for fam, d in self._gt["families"].items():
+            seg = slice(lo, idx + 1)
+            on[fam] = bool(d["on"][seg].mean() >= 0.5)
+            W[fam] = float(np.mean(d["W"][seg]))
+        return on, W
+
+    def _update_gt(self, on_map, power_map, w_samples, instant_W, on_W):
+        """Compare this stride's prediction with the replay ground truth,
+        update the running score, and return the per-family ground-truth watts
+        for the chart overlay (None when there is nothing to overlay)."""
+        if self._gt is None:
+            return None
+        if self._gt["mode"] == "full":
+            gt_on, gt_W = self._gt_window(w_samples)
+            rows = []
+            for fam in sorted(set(gt_on) | set(on_map)):
+                t_on = bool(gt_on.get(fam, False))
+                p_on = bool(on_map.get(fam, False))
+                t_w = gt_W.get(fam, 0.0)
+                p_wv = power_map.get(fam)
+                p_w = float(p_wv) if (p_on and p_wv is not None
+                                      and math.isfinite(p_wv)) else 0.0
+                s = self.gt_stats.setdefault(
+                    fam, {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "err": 0.0, "n": 0})
+                key = "tp" if (t_on and p_on) else \
+                      "fp" if p_on else "fn" if t_on else "tn"
+                s[key] += 1
+                s["err"] += abs(p_w - t_w)
+                s["n"] += 1
+                rows.append({"device": fam, "gt_on": t_on, "pred_on": p_on,
+                             "gt_W": round(t_w, 1), "pred_W": round(p_w, 1)})
+            n_all = sum(s["n"] for s in self.gt_stats.values())
+            correct = sum(s["tp"] + s["tn"] for s in self.gt_stats.values())
+            err_sum = sum(s["err"] for s in self.gt_stats.values())
+            per_dev = {f: {"presence_acc": round((s["tp"] + s["tn"]) / max(1, s["n"]), 3),
+                           "mae_W": round(s["err"] / max(1, s["n"]), 1)}
+                       for f, s in self.gt_stats.items()}
+            with self.lock:
+                self._gt_now = {
+                    "mode": "full", "devices": rows,
+                    "metrics": {"presence_accuracy": round(correct / max(1, n_all), 3),
+                                "power_mae_W": round(err_sum / max(1, n_all), 1),
+                                "per_device": per_dev}}
+            return gt_W
+        # mode 'label': the recording says which families were CONNECTED; only
+        # the predicted device SET can be scored, and only while something
+        # actually draws power (an idle connected device is not a model error)
+        expected = set(self._gt["expected"])
+        pred_set = {f for f, v in on_map.items() if v}
+        active = abs(instant_W) > max(10.0, float(on_W))
+        st = self._gt_set_stats
+        if active:
+            st["tp"] += len(pred_set & expected)
+            st["fp"] += len(pred_set - expected)
+            st["fn"] += len(expected - pred_set)
+            st["n"] += 1
+        f1 = 2 * st["tp"] / max(1, 2 * st["tp"] + st["fp"] + st["fn"])
+        rows = []
+        for fam in sorted(expected | pred_set):
+            p_wv = power_map.get(fam)
+            rows.append({"device": fam, "gt_on": fam in expected,
+                         "pred_on": fam in pred_set, "gt_W": None,
+                         "pred_W": (round(float(p_wv), 1)
+                                    if p_wv is not None and math.isfinite(p_wv)
+                                    else None)})
+        with self.lock:
+            self._gt_now = {"mode": "label", "label": self._gt.get("label", ""),
+                            "devices": rows,
+                            "metrics": {"set_f1": round(f1, 3),
+                                        "scored_strides": st["n"],
+                                        "active": active}}
+        return None
+
     # ---- main loop ----------------------------------------------------------
     def _loop(self):
         while self._run_flag.is_set():
@@ -849,6 +989,9 @@ class LiveEngine:
             for nm in model_on:
                 power_map[nm] = power_map[nm] * scale
 
+        # replay only: score this stride against the file's ground truth
+        gt_chart = self._update_gt(on_map, power_map, w_samples, instant_W, on_W)
+
         explained = sum(w for nm, w in power_map.items()
                         if on_map.get(nm) and math.isfinite(w))
         residual = total_W - explained
@@ -891,11 +1034,14 @@ class LiveEngine:
             self.residual_W = round(residual, 1)
             self.explained_frac = round(1.0 - min(1.0, abs(residual) / max(abs(total_W), 1e-9)), 3) \
                 if abs(total_W) > 1 else 1.0
-            self.history.append({
+            entry = {
                 "t_ms": now_ms, "P_total": round(total_W, 1),
                 "residual": round(residual, 1),
                 "devices": {nm: (new_state[nm]["power_W"] if new_state[nm]["on"] else 0.0)
-                            for nm in track}})
+                            for nm in track}}
+            if gt_chart is not None:
+                entry["gt"] = {f: round(w, 1) for f, w in gt_chart.items()}
+            self.history.append(entry)
 
         # -- unknown-device monitor -------------------------------------------
         # While a fresh claim or a forced-off is still flushing through the
@@ -1089,17 +1235,22 @@ class LiveEngine:
                     "explained_frac": self.explained_frac,
                     "unknown": self.unknown,
                     "teach_guide": self.guide,
-                    "teach_note": self._teach_note}
+                    "teach_note": self._teach_note,
+                    "replay_gt": self._gt_now}
 
     def chart(self) -> dict:
         with self.lock:
             hist = list(self.history)
         names = self.models.appliances
-        return {"t": [h["t_ms"] for h in hist],
-                "P_total": [h["P_total"] for h in hist],
-                "residual": [h["residual"] for h in hist],
-                "devices": {nm: [h["devices"].get(nm, 0.0) or 0.0 for h in hist]
-                            for nm in names}}
+        out = {"t": [h["t_ms"] for h in hist],
+               "P_total": [h["P_total"] for h in hist],
+               "residual": [h["residual"] for h in hist],
+               "devices": {nm: [h["devices"].get(nm, 0.0) or 0.0 for h in hist]
+                           for nm in names}}
+        if self._gt is not None and self._gt.get("mode") == "full":
+            out["gt"] = {fam: [(h.get("gt") or {}).get(fam, 0.0) for h in hist]
+                         for fam in self._gt["families"]}
+        return out
 
 
 # =============================================================================
@@ -1130,7 +1281,12 @@ def create_app(svc: pr.AcquisitionService, engine: LiveEngine,
 
     @app.route("/")
     def index():
-        return Response(LIVE_HTML, mimetype="text/html")
+        # inject the canonical family -> color map (dark-surface steps) so the
+        # dashboard chart uses the exact same device colors as the
+        # measured_scenario_##_decomposition.png figures
+        fam_colors = {f: c["dark"] for f, c in nl.FAMILY_COLORS.items()}
+        html = LIVE_HTML.replace("__FAMILY_COLORS__", json.dumps(fam_colors))
+        return Response(html, mimetype="text/html")
 
     @app.route("/api/status")
     def api_status():
@@ -1367,6 +1523,15 @@ LIVE_HTML = r"""<!DOCTYPE html>
       <canvas id="chart" width="1200" height="280"></canvas>
       <div id="legend" class="small muted" style="margin-top:6px"></div>
     </div>
+    <div class="panel" id="gt-panel" style="display:none">
+      <h2>Replay: prediction vs ground truth</h2>
+      <div id="gt-summary" class="small muted" style="margin-bottom:8px"></div>
+      <table>
+        <thead><tr><th></th><th>device</th><th>truth</th><th>predicted</th>
+          <th>match</th><th>truth W</th><th>predicted W</th><th>&Delta;W</th></tr></thead>
+        <tbody id="gt-body"></tbody>
+      </table>
+    </div>
     <div class="panel">
       <h2>Event log: what switched, exactly when</h2>
       <div style="max-height:340px;overflow:auto">
@@ -1380,13 +1545,25 @@ LIVE_HTML = r"""<!DOCTYPE html>
 </main>
 
 <script>
-const COLORS = ["#4aa8ff","#3ecf8e","#f0b429","#c084fc","#ff8e5c","#5cd6ff",
-                "#ff5c8a","#a3e635","#e07b39","#94a3b8"];
-let deviceColor = {}, lastEvent = 0, recActive = false;
+// family -> color, injected by live.py from nilm_pipeline.FAMILY_COLORS:
+// the SAME map (dark-surface steps of the same hues) that colors the
+// measured_scenario_##_decomposition.png figures, so live chart and
+// decomposition plots are directly comparable per device.
+const FAMILY_COLORS = __FAMILY_COLORS__;
+const FALLBACK_FAMS = Object.keys(FAMILY_COLORS);
+let lastEvent = 0, recActive = false;
 
+function djb2(s){                       // same 32-bit hash as nilm_pipeline._djb2
+  let h = 5381;
+  for(const ch of s) h = (h * 33 + ch.codePointAt(0)) >>> 0;
+  return h;
+}
 function col(nm){
-  if(!(nm in deviceColor)) deviceColor[nm] = COLORS[Object.keys(deviceColor).length % COLORS.length];
-  return deviceColor[nm];
+  const fam = String(nm).replace(/_\d+$/, "");   // 'table_fan_1' -> 'table_fan'
+  if(fam in FAMILY_COLORS) return FAMILY_COLORS[fam];
+  // unmapped (newly taught) family: deterministic hash into the same palette,
+  // matching nilm_pipeline.family_color, so both charts still agree
+  return FAMILY_COLORS[FALLBACK_FAMS[djb2(fam) % FALLBACK_FAMS.length]];
 }
 async function j(url, opts){ const r = await fetch(url, opts); return r.json(); }
 function fmtW(v){ return v==null ? "-" : (Math.abs(v)>=1000 ? (v/1000).toFixed(2)+" kW" : v.toFixed(0)+" W"); }
@@ -1486,7 +1663,41 @@ async function pollState(){
       document.getElementById("unk-since").textContent = hms(st.unknown.since_iso);
     } else ub.style.display = "none";
     if(st.teach_note) document.getElementById("teach-note").textContent = st.teach_note;
+    renderGt(st.replay_gt);
   }catch(e){}
+}
+
+function renderGt(g){
+  const gp = document.getElementById("gt-panel");
+  if(!g){ gp.style.display = "none"; return; }
+  gp.style.display = "block";
+  const m = g.metrics || {};
+  let sum;
+  if(g.mode === "full"){
+    sum = "scenario ground truth · since replay start: presence accuracy " +
+      (m.presence_accuracy!=null ? (100*m.presence_accuracy).toFixed(0)+"%" : "-") +
+      " · power MAE " + (m.power_mae_W!=null ? m.power_mae_W.toFixed(0)+" W" : "-") +
+      " · dashed lines on the chart = ground truth";
+  } else {
+    sum = "recording '"+(g.label||"")+"' · expected-device-set F1 " +
+      (m.set_f1!=null ? m.set_f1.toFixed(2) : "-") +
+      " over " + (m.scored_strides||0) + " scored strides" +
+      (m.active===false ? " · paused: nothing drawing power" : "");
+  }
+  document.getElementById("gt-summary").textContent = sum;
+  document.getElementById("gt-body").innerHTML = (g.devices||[]).map(d => {
+    const ok = d.gt_on === d.pred_on;
+    const dw = (d.gt_W!=null && d.pred_W!=null) ? d.pred_W - d.gt_W : null;
+    return '<tr><td><span class="swatch" style="background:'+col(d.device)+
+      ';display:inline-block"></span></td>'+
+      '<td><b>'+d.device+'</b></td>'+
+      '<td>'+(d.gt_on ? 'ON' : 'off')+'</td>'+
+      '<td>'+(d.pred_on ? 'ON' : 'off')+'</td>'+
+      '<td class="'+(ok ? 'kind-on' : 'kind-unknown')+'">'+(ok ? '✓' : '✗')+'</td>'+
+      '<td>'+(d.gt_W==null ? '-' : fmtW(d.gt_W))+'</td>'+
+      '<td>'+(d.pred_W==null ? '-' : fmtW(d.pred_W))+'</td>'+
+      '<td>'+(dw==null ? '-' : (dw>=0?'+':'')+fmtW(dw))+'</td></tr>';
+  }).join("");
 }
 
 async function pollChart(){
@@ -1509,7 +1720,14 @@ function drawChart(c){
     const s = c.devices[nm].map((v,i)=> stacked[i] += Math.max(0, v||0));
     return {nm, top: s.slice()};
   });
-  let ymax = Math.max(...c.P_total.map(Math.abs), ...stacked, 10) * 1.15;
+  // replay ground truth (same stacking order as the prediction for shared names)
+  const gtNames = c.gt ? [...names.filter(nm => nm in c.gt),
+                          ...Object.keys(c.gt).filter(nm => !names.includes(nm))] : [];
+  let gtTop = new Array(n).fill(0);
+  gtNames.forEach(nm => { const a = c.gt[nm]||[];
+    for(let i=0;i<n;i++) gtTop[i] += Math.max(0, a[i]||0); });
+  let ymax = Math.max(...c.P_total.map(Math.abs), ...stacked,
+                      ...(gtNames.length ? gtTop : [0]), 10) * 1.15;
   let ymin = Math.min(0, ...c.P_total) * 1.15;
   const X = i => 40 + (W-50) * i/(n-1);
   const Y = v => H - 22 - (H-34) * (v - ymin) / (ymax - ymin);
@@ -1531,6 +1749,19 @@ function drawChart(c){
     ctx.fill();
     prev = s.top;
   });
+  // replay ground truth: dashed cumulative stack in the same device colors,
+  // so each dashed line should hug the top of its device's filled area
+  if(gtNames.length){
+    let acc = new Array(n).fill(0);
+    ctx.setLineDash([6,4]);
+    gtNames.forEach(nm => {
+      const a = c.gt[nm]||[];
+      ctx.beginPath(); ctx.strokeStyle = col(nm); ctx.lineWidth = 1.4;
+      for(let i=0;i<n;i++){ acc[i] += Math.max(0, a[i]||0); ctx.lineTo(X(i), Y(acc[i])); }
+      ctx.stroke();
+    });
+    ctx.setLineDash([]);
+  }
   // measured total
   ctx.beginPath(); ctx.strokeStyle = "#e6edf3"; ctx.lineWidth = 1.6;
   for(let i=0;i<n;i++) ctx.lineTo(X(i), Y(c.P_total[i]));
@@ -1541,7 +1772,8 @@ function drawChart(c){
   ctx.fillText(t1.toTimeString().substring(0,8), W-70, H-8);
   document.getElementById("legend").innerHTML =
     '<span style="color:#e6edf3">━ measured total</span> · ' +
-    names.map(nm=>'<span style="color:'+col(nm)+'">■ '+nm+'</span>').join(" · ");
+    names.map(nm=>'<span style="color:'+col(nm)+'">■ '+nm+'</span>').join(" · ") +
+    (gtNames.length ? ' · <span class="muted">╌╌ ground truth (replay)</span>' : '');
 }
 
 async function pollEvents(){
@@ -1667,6 +1899,13 @@ def main():
               f"('{inner.label}': {inner.n_samples} samples, {dur:.0f} s @ "
               f"{inner.sample_rate_hz:g} Hz, speed x{args.replay_speed:g}"
               f"{', looping' if args.replay_loop else ''})")
+        if inner.gt is not None:
+            what = ("full per-device ground truth (scenario file)"
+                    if inner.gt["mode"] == "full" else
+                    "expected devices from the label: "
+                    + ", ".join(inner.gt["expected"]))
+            print(f"  ground truth found - {what}; the dashboard compares "
+                  "predictions against it live")
     elif args.simulate:
         inner = pr.SimulatedReader(extra_channels=pr.EXTENDED_CHANNELS,
                                    read_harmonics=harmonics)
