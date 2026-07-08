@@ -223,3 +223,4 @@ Loesung:
 Fuer eure aktuelle Situation ist Overleaf wahrscheinlich der beste gemeinsame Schreibort. Der Aufwand ist gering, weil das Paper keine komplexe lokale Build-Umgebung braucht. Fuer lokale Mitarbeit reicht die VS-Code-Anleitung oben.
 
 Wenn ihr Overleaf nutzt, sollte eine Person regelmaessig den sauberen Overleaf-Stand zurueck ins Repository uebernehmen, damit GitHub und Overleaf nicht auseinanderlaufen.
++döngsidengsi+
