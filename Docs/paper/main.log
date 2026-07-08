@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.29 (MiKTeX 26.5) (preloaded format=pdflatex 2026.7.8)  8 JUL 2026 22:16
+This is pdfTeX, Version 3.141592653-2.6-1.40.29 (MiKTeX 26.5) (preloaded format=pdflatex 2026.7.8)  8 JUL 2026 22:56
 entering extended mode
  restricted \write18 enabled.
  file:line:error style messages enabled.
@@ -360,7 +360,7 @@ Package pdftex.def Info: figures/ms1_image1.png  used on input line 53.
 ohei/AppData/Local/Programs/MiKTeX/fonts/enc/dvips/base/8r.enc}
 
 
-]
+ <./figures/ms1_image1.png>]
 <figures/ms1_image4.png, id=14, 240.7905pt x 160.6365pt>
 File: figures/ms1_image4.png Graphic file (type png)
 <use figures/ms1_image4.png>
@@ -377,9 +377,8 @@ LaTeX Font Info:    Trying to load font information for OT1+pcr on input line 8
 (C:\Users\sohei\AppData\Local\Programs\MiKTeX\tex/latex/psnfss\ot1pcr.fd
 File: ot1pcr.fd 2001/06/04 font definitions for OT1/pcr.
 )
-[2 <./figures/ms1_image1.png> <./figures/ms1_image4.png> <./figures/ms1_image5.
-png>]
-<figures/ms2_image2.png, id=24, 794.97pt x 325.215pt>
+[2 <./figures/ms1_image4.png> <./figures/ms1_image5.png>]
+<figures/ms2_image2.png, id=26, 794.97pt x 325.215pt>
 File: figures/ms2_image2.png Graphic file (type png)
 <use figures/ms2_image2.png>
 Package pdftex.def Info: figures/ms2_image2.png  used on input line 107.
@@ -389,30 +388,35 @@ Overfull \hbox (7.00012pt too wide) in paragraph at lines 107--107
  [][] 
  []
 
-<figures/ms2_image3.png, id=25, 867.24pt x 953.964pt>
+<figures/ms2_image3.png, id=27, 867.24pt x 953.964pt>
 File: figures/ms2_image3.png Graphic file (type png)
 <use figures/ms2_image3.png>
 Package pdftex.def Info: figures/ms2_image3.png  used on input line 110.
 (pdftex.def)             Requested size: 176.39923pt x 194.03548pt.
-[3 <./figures/ms2_image2.png> <./figures/ms2_image3.png>]
-<figures/live_test1.jpeg, id=33, 1606.0pt x 935.495pt>
+<figures/live_test1.jpeg, id=28, 1606.0pt x 935.495pt>
 File: figures/live_test1.jpeg Graphic file (type jpg)
 <use figures/live_test1.jpeg>
 Package pdftex.def Info: figures/live_test1.jpeg  used on input line 153.
 (pdftex.def)             Requested size: 206.64185pt x 120.36246pt.
-<figures/live_test2.jpeg, id=34, 1606.0pt x 1079.03125pt>
+<figures/live_test2.jpeg, id=29, 1606.0pt x 1079.03125pt>
 File: figures/live_test2.jpeg Graphic file (type jpg)
 <use figures/live_test2.jpeg>
 Package pdftex.def Info: figures/live_test2.jpeg  used on input line 156.
 (pdftex.def)             Requested size: 206.64185pt x 138.8301pt.
-<figures/live_test3.jpeg, id=35, 1606.0pt x 1090.0725pt>
+<figures/live_test3.jpeg, id=30, 1606.0pt x 1090.0725pt>
 File: figures/live_test3.jpeg Graphic file (type jpg)
 <use figures/live_test3.jpeg>
 Package pdftex.def Info: figures/live_test3.jpeg  used on input line 159.
 (pdftex.def)             Requested size: 206.64185pt x 140.25067pt.
- [4 <./figures/live_test1.jpeg> <./figures/live_test2.jpeg> <./figures/live_tes
-t3.jpeg>] (main.bbl)
-[5] (main.aux)
+[3 <./figures/ms2_image2.png> <./figures/ms2_image3.png>]
+Underfull \hbox (badness 10000) in paragraph at lines 184--185
+
+ []
+
+(main.bbl [4 <./figures/live_test1.jpeg> <./figures/live_test2.jpeg> <./figures
+/live_test3.jpeg>]) [5
+
+] (main.aux)
  ***********
 LaTeX2e <2026-06-01>
 L3 programming layer <2026-06-18>
@@ -421,7 +425,7 @@ L3 programming layer <2026-06-18>
 Here is how much of TeX's memory you used:
  4419 strings out of 467510
  77624 string characters out of 5408795
- 498610 words of memory out of 5000000
+ 499610 words of memory out of 5000000
  33618 multiletter control sequences out of 15000+600000
  666923 words of font info for 110 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
@@ -440,7 +444,7 @@ ohei/AppData/Local/Programs/MiKTeX/fonts/type1/urw/courier/ucrr8a.pfb><C:/Users
 /sohei/AppData/Local/Programs/MiKTeX/fonts/type1/urw/times/utmbi8a.pfb><C:/User
 s/sohei/AppData/Local/Programs/MiKTeX/fonts/type1/urw/times/utmr8a.pfb><C:/User
 s/sohei/AppData/Local/Programs/MiKTeX/fonts/type1/urw/times/utmri8a.pfb>
-Output written on main.pdf (5 pages, 1161362 bytes).
+Output written on main.pdf (5 pages, 1161255 bytes).
 PDF statistics:
  97 PDF objects out of 1000 (max. 8388607)
  0 named destinations out of 1000 (max. 500000)
