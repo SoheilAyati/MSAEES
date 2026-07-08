@@ -1,46 +1,46 @@
 \relax 
 \citation{hart1992nilm}
-\citation{wu2025dualnilm}
-\citation{sahoo2020featurefusion,tsironi2022odd}
+\citation{wang2025dualnilm}
+\citation{reddy2020featurefusion,papageorgiou2022odd}
 \@writefile{toc}{\contentsline {section}{\numberline {I}Introduction}{1}{}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {II}Concept and System Design}{1}{}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-A}}Why Synthetic and Measured Data Are Both Needed}{1}{}\protected@file@percent }
-\citation{siemens2023pac4200}
-\citation{zhang2018seq2point,kelly2015neural}
 \@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Milestone-1 architecture decision: synthetic appliance generation and real PAC4200 acquisition are different front ends that converge into the same scenario format. This made later ML and live processing source-agnostic instead of requiring separate code paths.}}{2}{}\protected@file@percent }
 \newlabel{fig:architecture}{{1}{2}{}{figure.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-A}}Why Synthetic and Measured Data Are Both Needed}{2}{}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Milestone-1 findings that carried into the final system: signed PV generation, aggregate-only observation at the PCC, and per-appliance ground truth for supervised learning.}}{2}{}\protected@file@percent }
+\@writefile{lof}{\contentsline {subfigure}{\numberline{(a)}{\ignorespaces {PV: signed generation.}}}{2}{}\protected@file@percent }
+\@writefile{lof}{\contentsline {subfigure}{\numberline{(b)}{\ignorespaces {24 h PCC aggregate and hidden ground truth.}}}{2}{}\protected@file@percent }
+\newlabel{fig:ms1_signals}{{2}{2}{}{figure.2}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-B}}Why Harmonics Matter}{2}{}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {III}Implementation}{2}{}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-A}}Storage, Aggregation, and Preprocessing}{2}{}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-B}}PAC4200 Reader and Live Acquisition}{2}{}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-C}}Models and Features}{2}{}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-D}}Live NILM and Training on the Go}{2}{}\protected@file@percent }
-\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Milestone-1 findings that carried into the final system: signed PV generation, aggregate-only observation at the PCC, and per-appliance ground truth for supervised learning.}}{3}{}\protected@file@percent }
-\@writefile{lof}{\contentsline {subfigure}{\numberline{(a)}{\ignorespaces {PV: signed generation.}}}{3}{}\protected@file@percent }
-\@writefile{lof}{\contentsline {subfigure}{\numberline{(b)}{\ignorespaces {24 h PCC aggregate and hidden ground truth.}}}{3}{}\protected@file@percent }
-\newlabel{fig:ms1_signals}{{2}{3}{}{figure.2}{}}
+\citation{siemens2023pac4200}
+\citation{zhang2018seq2point,kelly2015neural}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-B}}PAC4200 Reader and Live Acquisition}{3}{}\protected@file@percent }
 \@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Milestone-2 bridge from infrastructure to supervised NILM on measured laboratory signatures. Small or near-zero devices reveal threshold limits that later motivated residual handling.}}{3}{}\protected@file@percent }
 \@writefile{lof}{\contentsline {subfigure}{\numberline{(a)}{\ignorespaces {Measured mix with exact ground truth.}}}{3}{}\protected@file@percent }
 \@writefile{lof}{\contentsline {subfigure}{\numberline{(b)}{\ignorespaces {Presence prediction and ground truth.}}}{3}{}\protected@file@percent }
 \newlabel{fig:ms2_measured}{{3}{3}{}{figure.3}{}}
-\@writefile{lot}{\contentsline {table}{\numberline {I}{\ignorespaces Feature groups used by the NILM pipeline.}}{3}{}\protected@file@percent }
-\newlabel{tab:features}{{I}{3}{}{table.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-C}}Models and Features}{3}{}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {I}{\ignorespaces Feature groups used by the NILM pipeline.}}{4}{}\protected@file@percent }
+\newlabel{tab:features}{{I}{4}{}{table.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-D}}Live NILM and Training on the Go}{4}{}\protected@file@percent }
 \@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Milestone-3 live dashboard snapshots. The interface combines current device states, stacked per-device estimates, measured aggregate power, model metrics, residual power, and an event log with matched switching edges.}}{4}{}\protected@file@percent }
 \@writefile{lof}{\contentsline {subfigure}{\numberline{(a)}{\ignorespaces {Low-power split with residual.}}}{4}{}\protected@file@percent }
-\@writefile{lof}{\contentsline {subfigure}{\numberline{(b)}{\ignorespaces {Expanded vocabulary and unrecognized edge.}}}{4}{}\protected@file@percent }
+\@writefile{lof}{\contentsline {subfigure}{\numberline{(b)}{\ignorespaces {Expanded vocabulary and unrecognised edge.}}}{4}{}\protected@file@percent }
 \@writefile{lof}{\contentsline {subfigure}{\numberline{(c)}{\ignorespaces {High-load multi-device split.}}}{4}{}\protected@file@percent }
 \newlabel{fig:live_screens}{{4}{4}{}{figure.4}{}}
 \@writefile{toc}{\contentsline {section}{\numberline {IV}Results}{4}{}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {V}Discussion}{4}{}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {VI}Conclusion}{4}{}\protected@file@percent }
 \bibstyle{IEEEtran}
 \bibdata{references}
 \bibcite{hart1992nilm}{1}
-\bibcite{wu2025dualnilm}{2}
-\bibcite{sahoo2020featurefusion}{3}
-\bibcite{tsironi2022odd}{4}
+\bibcite{wang2025dualnilm}{2}
+\bibcite{reddy2020featurefusion}{3}
+\bibcite{papageorgiou2022odd}{4}
 \bibcite{siemens2023pac4200}{5}
 \bibcite{zhang2018seq2point}{6}
 \bibcite{kelly2015neural}{7}
+\@writefile{toc}{\contentsline {section}{\numberline {V}Discussion}{5}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {VI}Conclusion}{5}{}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{References}{5}{}\protected@file@percent }
 \gdef \@abspage@last{5}

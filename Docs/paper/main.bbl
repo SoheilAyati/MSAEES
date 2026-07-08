@@ -25,23 +25,24 @@
 G.~W. Hart, ``Nonintrusive appliance load monitoring,'' \emph{Proceedings of
   the IEEE}, vol.~80, no.~12, pp. 1870--1891, 1992.
 
-\bibitem{wu2025dualnilm}
+\bibitem{wang2025dualnilm}
 \BIBentryALTinterwordspacing
-Y.~Wu, J.~Yu, J.~Chen, X.~Yang, H.~Shao, and X.~Wang, ``Dualnilm: Energy
+X.~Wang, G.~Tang, J.~Xue, S.~Keshav, T.~Li, and C.~Ding, ``{DualNILM}: Energy
   injection identification enabled disaggregation with deep multi-task
   learning,'' arXiv preprint arXiv:2508.14600, 2025. [Online]. Available:
   \url{https://arxiv.org/abs/2508.14600}
 \BIBentrySTDinterwordspacing
 
-\bibitem{sahoo2020featurefusion}
-S.~R. Sahoo, F.~Khalaj, B.~Karki, and M.~Khalaj, ``A feature fusion technique
-  for improved non-intrusive load monitoring,'' \emph{Energy Informatics},
-  vol.~3, no.~1, p.~13, 2020.
+\bibitem{reddy2020featurefusion}
+R.~Reddy, V.~Garg, and V.~Pudi, ``A feature fusion technique for improved
+  non-intrusive load monitoring,'' \emph{Energy Informatics}, vol.~3, no.~9,
+  2020.
 
-\bibitem{tsironi2022odd}
-N.~Tsironi, A.~P.~S. Meliopoulos \emph{et~al.}, ``Odd harmonic distortion
-  contribution on a support vector machine nilm approach,'' in \emph{2022 IEEE
-  International Conference on Synergy for Energy and Smart Grids}, 2022.
+\bibitem{papageorgiou2022odd}
+P.~G. Papageorgiou, G.~C. Christoforidis, and A.~S. Bouhouras, ``Odd harmonic
+  distortion contribution on a support vector machine {NILM} approach,'' in
+  \emph{2022 2nd International Conference on Energy Transition in the
+  Mediterranean Area (SyNERGY MED)}, 2022.
 
 \bibitem{siemens2023pac4200}
 {Siemens AG}, \emph{SENTRON PAC4200 Power Monitoring Device Manual}, Siemens
@@ -56,7 +57,7 @@ C.~Zhang, M.~Zhong, Z.~Wang, N.~Goddard, and C.~Sutton, ``Sequence-to-point
 \BIBentrySTDinterwordspacing
 
 \bibitem{kelly2015neural}
-J.~Kelly and W.~Knottenbelt, ``Neural nilm: Deep neural networks applied to
+J.~Kelly and W.~Knottenbelt, ``Neural {NILM}: Deep neural networks applied to
   energy disaggregation,'' in \emph{Proceedings of the 2nd ACM International
   Conference on Embedded Systems for Energy-Efficient Built Environments},
   2015, pp. 55--64.

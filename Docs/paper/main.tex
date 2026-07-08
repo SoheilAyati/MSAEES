@@ -8,6 +8,8 @@
 \usepackage{array}
 \usepackage[caption=false,font=footnotesize]{subfig}
 \usepackage{placeins}
+\usepackage{float}
+\raggedbottom
 
 \newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
 
@@ -16,7 +18,7 @@
 \title{PV-Aware Non-Intrusive Load Monitoring with Harmonic Feature Fusion and Live On-the-Go Learning}
 
 \author{Soheil Ayati and Marc Steffgen%
-\thanks{Soheil Ayati and Marc Steffgen are with TH Koln (University of Applied Sciences), Faculty of Computer Science and Engineering Science, Campus Gummersbach, Germany.}%
+\thanks{Soheil Ayati and Marc Steffgen are with TH K\"oln (University of Applied Sciences), Faculty of Computer Science and Engineering Science, Campus Gummersbach, Germany.}%
 \thanks{Modeling, Simulation and Automation of Electrical Energy Systems, Project Paper, submitted: July 2026.}%
 }
 
@@ -34,19 +36,19 @@ Non-intrusive load monitoring, NILM, energy disaggregation, harmonic features, p
 
 Detailed knowledge of appliance-level electricity use is valuable for energy feedback, laboratory monitoring, demand-side flexibility, and fault detection. Installing one meter per appliance provides this information directly, but it is intrusive, expensive, and difficult to maintain. NILM instead tries to recover appliance states and power contributions from a single aggregate measurement at the point of common coupling (PCC), an idea introduced by Hart through event-based load signatures in the active-reactive power plane \cite{hart1992nilm}.
 
-This project addresses NILM in a small but realistic laboratory setting. The goal is not only to classify isolated appliance recordings, but to build an end-to-end system that can acquire data from a real power meter, train on reproducible labelled scenarios, infer which devices are active, estimate their wattage, and expose the result in a live interface. Two challenges motivate the design. First, behind-the-meter PV generation can create a signal eclipse: consumption and generation cancel in the aggregate signal, or net active power becomes negative \cite{wu2025dualnilm}. Second, many devices are not separable by active power alone. Low-power electronics, motors, lamps, and chargers may overlap in wattage while differing strongly in reactive power, power factor, current distortion, and switching dynamics. Prior NILM work has shown that feature fusion and harmonic content improve separability \cite{sahoo2020featurefusion,tsironi2022odd}.
+This project addresses NILM in a small but realistic laboratory setting. The goal is not only to classify isolated appliance recordings, but to build an end-to-end system that can acquire data from a real power meter, train on reproducible labelled scenarios, infer which devices are active, estimate their wattage, and expose the result in a live interface. Two challenges motivate the design. First, behind-the-meter PV generation can create a signal eclipse: consumption and generation cancel in the aggregate signal, or net active power becomes negative \cite{wang2025dualnilm}. Second, many devices are not separable by active power alone. Low-power electronics, motors, lamps, and chargers may overlap in wattage while differing strongly in reactive power, power factor, current distortion, and switching dynamics. Prior NILM work has shown that feature fusion and harmonic content improve separability \cite{reddy2020featurefusion,papageorgiou2022odd}.
 
 The contribution of this work is a complete NILM workflow tailored to the available hardware and project constraints: a synthetic-first data pipeline with exact per-sample ground truth, a real PAC4200 acquisition path, common HDF5 storage, physics-based aggregation including harmonic vector summation, compact physically interpretable features, tabular machine-learning models, and a live monitor with residual-based unknown-device teaching. The emphasis is practical transfer from a controlled project model to a running laboratory interface.
 
 \section{Concept and System Design}
 
-The central concept is source-agnostic processing. Synthetic scenarios and real meter recordings differ only in acquisition; after data are stored, preprocessing, feature extraction, training, inference, and live monitoring use the same code path. Let $y(t)$ denote the aggregate meter signal and $p_i(t)$ the active power contribution of appliance $i$. NILM estimates
+The central concept is source-agnostic processing. Synthetic scenarios and real meter recordings differ only in acquisition; after data are stored, preprocessing, feature extraction, training, inference, and live monitoring use the same code path, as shown in Fig.~\ref{fig:architecture}. Let $y(t)$ denote the aggregate meter signal and $p_i(t)$ the active power contribution of appliance $i$. NILM estimates
 \begin{equation}
     \hat{\mathbf{p}}_{1:N}(w) = f_{\theta}(y_{t:t+w})
 \end{equation}
 over a fixed window $w$, together with binary presence labels. PV is treated as a normal signed contributor, with $p_i(t)<0$ during generation, so export and cancellation remain representable throughout the pipeline.
 
-\begin{figure}[t]
+\begin{figure}[H]
 \centering
 \includegraphics[width=\columnwidth]{figures/ms1_image1.png}
 \caption{Milestone-1 architecture decision: synthetic appliance generation and real PAC4200 acquisition are different front ends that converge into the same scenario format. This made later ML and live processing source-agnostic instead of requiring separate code paths.}
@@ -61,18 +63,17 @@ Real data are still necessary because a purely synthetic model may learn idealis
 
 Fig.~\ref{fig:ms1_signals} shows how the early synthetic work later shaped the ML design. The PV trace forced signed active power and negative aggregate values into the data model from the beginning. The 24 h aggregate scenario then made the actual NILM task explicit: the model only observes the PCC-level signal, while the per-appliance breakdown is available only as training ground truth.
 
-\begin{figure*}[t]
+\begin{figure}[H]
 \centering
 \subfloat[PV: signed generation.]{
-    \includegraphics[width=0.43\textwidth]{figures/ms1_image4.png}
-}
-\hfil
+    \includegraphics[width=0.95\columnwidth]{figures/ms1_image4.png}
+}\\
 \subfloat[24 h PCC aggregate and hidden ground truth.]{
-    \includegraphics[width=0.52\textwidth]{figures/ms1_image5.png}
+    \includegraphics[width=0.95\columnwidth]{figures/ms1_image5.png}
 }
 \caption{Milestone-1 findings that carried into the final system: signed PV generation, aggregate-only observation at the PCC, and per-appliance ground truth for supervised learning.}
 \label{fig:ms1_signals}
-\end{figure*}
+\end{figure}
 
 \subsection{Why Harmonics Matter}
 
@@ -99,26 +100,25 @@ The real acquisition tool maintains one persistent Modbus TCP connection to the 
 
 The second milestone converted real single-device recordings into labelled measured scenarios. This was the decisive bridge from clean synthetic supervision to laboratory data: real appliance signatures were preserved, but the aggregate still carried exact per-device ground truth. Fig.~\ref{fig:ms2_measured} shows such a measured scenario and the corresponding presence evaluation.
 
-\begin{figure*}[t]
+\begin{figure}[H]
 \centering
 \subfloat[Measured mix with exact ground truth.]{
-    \includegraphics[height=1.35in,width=0.48\textwidth,keepaspectratio]{figures/ms2_image2.png}
-}
-\hfil
+    \includegraphics[width=\columnwidth]{figures/ms2_image2.png}
+}\\
 \subfloat[Presence prediction and ground truth.]{
-    \includegraphics[height=1.35in,width=0.48\textwidth,keepaspectratio]{figures/ms2_image3.png}
+    \includegraphics[width=0.7\columnwidth]{figures/ms2_image3.png}
 }
 \caption{Milestone-2 bridge from infrastructure to supervised NILM on measured laboratory signatures. Small or near-zero devices reveal threshold limits that later motivated residual handling.}
 \label{fig:ms2_measured}
-\end{figure*}
+\end{figure}
 
 \subsection{Models and Features}
 
 The implemented ML pipeline supports four tasks: \emph{identify} maps an isolated-device window to one label; \emph{disaggregate} estimates watts per appliance; \emph{presence} predicts multi-label on/off states; and \emph{mix} combines presence and gated power estimation in one deployable bundle. Random Forest is the default model because the data regime is small, features are tabular and interpretable, and retraining must finish quickly enough for live use. LightGBM provides a second tree-based baseline, while a scikit-learn MLP serves as a simple neural path. More specialised sequence models such as seq2point or neural NILM remain natural follow-up work \cite{zhang2018seq2point,kelly2015neural}.
 
-Table~\ref{tab:features} summarizes the load-bearing feature groups. The current mix model uses 17 aggregate features over 10 s windows. The last three event features were added for the live system: the largest settled active-power step, the reactive step at the same instant, and the number of steps in the window. These inject Hart-style transient information into a window model.
+Table~\ref{tab:features} summarises the main feature groups. The current mix model uses 17 aggregate features over 10 s windows. The last three event features were added for the live system: the largest settled active-power step, the reactive step at the same instant, and the number of steps in the window. These inject Hart-style transient information into a window model.
 
-\begin{table}[t]
+\begin{table}[H]
 \caption{Feature groups used by the NILM pipeline.}
 \label{tab:features}
 \centering
@@ -136,38 +136,36 @@ Context & Hour of day for synthetic daily scenarios. \\
 \end{tabular}
 \end{table}
 
+\FloatBarrier
+
 \subsection{Live NILM and Training on the Go}
 
 The live monitor evaluates the trailing model window every few seconds and publishes device state, watts, confidence, model provenance, and explained-power fraction. Presence probabilities are median-smoothed and passed through hysteresis to avoid flicker. In parallel, an edge detector compares settled medians before and after a change in $P$ and $Q$. Matched edges claim or release device states directly, which improves timing and prevents a steady-state model from explaining a new lamp as a drift of an already active boiler.
 
-Unexplained residual power is a first-class output. If the measured aggregate is not sufficiently explained for at least eight seconds, the dashboard prompts the user to teach the unknown device. The final protocol records a clean isolated device signature: all devices off, short baseline, only the new device on, and off tail. The system then rebuilds measured scenarios, retrains the mix and identify bundles, and hot-reloads them without restarting the session.
+Unexplained residual power is an explicit output of the system. If the measured aggregate is not sufficiently explained for at least eight seconds, the dashboard prompts the user to teach the unknown device. The final protocol records a clean isolated device signature: all devices off, short baseline, only the new device on, and off tail. The system then rebuilds measured scenarios, retrains the mix and identify bundles, and hot-reloads them without restarting the session.
 
-The three final live tests in Fig.~\ref{fig:live_screens} illustrate the implementation from the operator's perspective. The first screen is a low-power case: the standing fan is edge-confirmed, a small table fan is detected with lower wattage, and the residual remains visible instead of being hidden. The second screen shows an expanded vocabulary after adding devices such as a laptop; it also logs an unrecognized edge when no known device signature matches. The third screen is the high-load case: the system decomposes about 1.44 kW into water boiler, standing lamp, and table fan while showing 99 percent explained power.
+The three final live tests in Fig.~\ref{fig:live_screens} illustrate the implementation from the operator's perspective. The first screen is a low-power case: the standing fan is edge-confirmed, a small table fan is detected with lower wattage, and the residual remains visible instead of being hidden. The second screen shows an expanded vocabulary after adding devices such as a laptop; it also logs an unrecognised edge when no known device signature matches. The third screen is the high-load case: several devices are separated simultaneously while the dashboard reports the explained-power fraction.
 
-\begin{figure*}[t]
+\begin{figure}[H]
 \centering
 \subfloat[Low-power split with residual.]{
-    \includegraphics[width=0.32\textwidth]{figures/live_test1.jpeg}
-}
-\hfil
-\subfloat[Expanded vocabulary and unrecognized edge.]{
-    \includegraphics[width=0.32\textwidth]{figures/live_test2.jpeg}
-}
-\hfil
+    \includegraphics[width=0.82\columnwidth]{figures/live_test1.jpeg}
+}\\
+\subfloat[Expanded vocabulary and unrecognised edge.]{
+    \includegraphics[width=0.82\columnwidth]{figures/live_test2.jpeg}
+}\\
 \subfloat[High-load multi-device split.]{
-    \includegraphics[width=0.32\textwidth]{figures/live_test3.jpeg}
+    \includegraphics[width=0.82\columnwidth]{figures/live_test3.jpeg}
 }
 \caption{Milestone-3 live dashboard snapshots. The interface combines current device states, stacked per-device estimates, measured aggregate power, model metrics, residual power, and an event log with matched switching edges.}
 \label{fig:live_screens}
-\end{figure*}
-
-\FloatBarrier
+\end{figure}
 
 \section{Results}
 
-The current measured-data mix model is trained on 1920 windows from measured scenarios with a 10 s window and a 5 W on-threshold. Its vocabulary contains coffee machine, laptop, PV, standing fan, standing lamp, table fan, and water boiler. Held-out presence macro-F1 is 0.916 and gated power MAE is 2.9 W. The identify bundle, trained on 171 active real-device windows with common plus harmonic features, reaches hold-out macro-F1 0.955 and accuracy 0.953; this result uses a stratified row split because there is currently only one recording session per family, so it should be interpreted as an optimistic within-session estimate.
+The current measured-data mix model is trained on 1920 windows from measured scenarios with a 10 s window and a 5 W on-threshold. Its vocabulary contains coffee machine, laptop, PV, standing fan, standing lamp, table fan, and water boiler. Held-out presence macro-F1 is 0.916 and gated power MAE is 2.9 W. The identify bundle, trained on 171 active real-device windows with common plus harmonic features, reaches held-out macro-F1 0.955 and accuracy 0.953; this result uses a stratified row split because there is currently only one recording session per family, so it should be interpreted as an optimistic within-session estimate.
 
-The live validation demonstrates the system-level behaviour. The teach loop detects an unknown load after 8 s, retrains in 26 s, and subsequently recognises the taught device with 0.95 confidence while explaining 97.9 percent of power. In the high-load dashboard snapshot in Fig.~\ref{fig:live_screens}(c), about 1.44 kW is split into water boiler, standing lamp, and table fan with 99 percent explained power.
+The live validation demonstrates the system-level behaviour. The teach loop detects an unknown load after 8 s, retrains in 26 s, and subsequently recognises the taught device with 0.95 confidence while explaining 97.9\% of the measured power. In the high-load dashboard snapshot in Fig.~\ref{fig:live_screens}(c), about 1.44 kW is split into water boiler, standing lamp, and table fan with 99\% explained power.
 
 The key qualitative result is that the system does not force every watt into a known appliance. Small unexplained loads remain visible as residuals; unmatched switching steps are logged as unrecognised events; and the user can turn such residuals into training data. This is important for NILM deployment, where a wrong confident answer is often less useful than an explicit ``unknown'' state.
 
