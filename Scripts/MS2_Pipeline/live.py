@@ -730,7 +730,10 @@ class LiveEngine:
         # afterwards, without touching the hardware.
         self.edge_history: deque = deque(maxlen=600)   # {t_ms, dP, dQ}
         self._model_seq = models.reload_seq
-        self.smooth: deque = deque(maxlen=3)     # recent proba vectors
+        # 5 strides (~10 s) of probability smoothing: with 3, a device whose
+        # probability hovers near the threshold (coffee machine in the ~500 W
+        # regime reads lamp-like) flapped in and out of "currently on"
+        self.smooth: deque = deque(maxlen=5)     # recent proba vectors
         self.residual_W = 0.0
         self.total_W = 0.0
         self.explained_frac = 1.0
@@ -739,6 +742,7 @@ class LiveEngine:
         self.unknown: dict | None = None
         self._unknown_first: float | None = None
         self._unknown_clear_ms: float | None = None
+        self._unknown_stale_ms: float | None = None
         self._last_edge_ms = 0
         self._last_edge_dP = 0.0
         self._teach_note = ""
@@ -1244,7 +1248,10 @@ class LiveEngine:
             for i, nm in enumerate(names):
                 was_on = self.state.get(nm, {}).get("on", False)
                 # hysteresis so a 0.5-ish probability doesn't flap on/off
-                on = bool(proba_s[i] >= (0.45 if was_on else 0.55))
+                # wide hysteresis band: flapping (coffee near ~0.5 in mixes)
+                # costs more than a few seconds of extra latency -- fast
+                # events are the edge claims' job, not the window model's
+                on = bool(proba_s[i] >= (0.40 if was_on else 0.60))
                 w = float(watts[i]) if on else 0.0
                 if on and abs(w) < 0.5 and power is None:
                     w = float("nan")
@@ -1365,6 +1372,41 @@ class LiveEngine:
         settling = bool(forced_off) or any(
             now_ms - c["t_ms"] < (ws + 4) * 1000 for c in claims.values())
         teaching = self._teach_thread is not None and self._teach_thread.is_alive()
+
+        # -- stale unknown-load eviction ---------------------------------------
+        # An unknown claim whose watts the measurement no longer supports must
+        # not sit in "currently on" forever (its off-edge was missed, or was
+        # matched to a named claim instead). The residual cannot expose this:
+        # the rescale squeezes model watts into what the claims leave, which
+        # MANUFACTURES residual equal to the claimed unknown power. Staleness
+        # is therefore judged against the model's RAW estimate: the watts left
+        # after named claims and unscaled model predictions must still make
+        # room for the unknown load. Sustained lack of support (15 s) evicts
+        # the smallest claim first; if a genuine unknown is ever evicted, its
+        # unexplained watts re-raise the prompt through the residual monitor.
+        if unk_claims and not settling:
+            deficit = total_W - claimed_W - pred_sum
+            mature_unknowns = (now_ms - min(u["t_ms"] for u in unk_claims)
+                               > (ws + 6) * 1000)
+            if deficit < 0.5 * unknown_W and mature_unknowns:
+                if self._unknown_stale_ms is None:
+                    self._unknown_stale_ms = now_ms
+                elif now_ms - self._unknown_stale_ms >= 15000:
+                    with self.lock:
+                        if self.unknown_claims:
+                            i = min(range(len(self.unknown_claims)),
+                                    key=lambda k: self.unknown_claims[k]["W"])
+                            u = self.unknown_claims.pop(i)
+                            self._log_event(now_ms, "claim_dropped", "unknown",
+                                            None, -u["W"], None, total_W,
+                                            detail="measured power no longer "
+                                                   "supports this unknown load "
+                                                   "(stale claim)")
+                    self._unknown_stale_ms = None
+            else:
+                self._unknown_stale_ms = None
+        else:
+            self._unknown_stale_ms = None
         # The tolerance must scale with how the ON power was EXPLAINED, not
         # with the raw total: model-estimated watts carry ~15 % error, but an
         # edge claim's watts were measured off the step itself, so claimed
