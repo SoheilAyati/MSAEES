@@ -10,15 +10,10 @@
     "THD_I_mean",
     "P_std",
     "P_min",
-    "P_max",
-    "h3",
-    "h5",
-    "h7",
-    "h_centroid",
-    "h_energy"
+    "P_max"
   ],
   "split": "stratified rows (one instance per class)",
-  "n_windows": 171,
+  "n_windows": 219,
   "classes": [
     "coffee_machine",
     "laptop",
@@ -26,9 +21,10 @@
     "standing_fan",
     "standing_lamp",
     "table_fan",
+    "toaster",
     "water_boiler"
   ],
-  "trained_utc": "2026-07-06T15:59:10+00:00",
-  "holdout_macro_f1": 0.9548759942848613,
-  "holdout_accuracy": 0.9534883720930233
+  "trained_utc": "2026-07-09T16:51:18+00:00",
+  "holdout_macro_f1": 0.969047619047619,
+  "holdout_accuracy": 0.9818181818181818
 }
