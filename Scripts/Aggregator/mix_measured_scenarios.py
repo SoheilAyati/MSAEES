@@ -34,9 +34,10 @@ byte-compatible with the MS2 pipeline (load as h5_scenario, with /ground_truth).
 Notes for these specific recordings
 ------------------------------------
   * All appliances were recorded on L1 (kept on L1 here, as requested).
-  * The per-order current harmonics in the recordings are all zero (the harmonic
-    FC-0x14 file numbers were never verified), so mixed THD_I will be ~0. P/Q and
-    per-phase power are real.
+  * The L1 per-order current harmonics are REAL (file number verified
+    2026-07-06) and are summed by the aggregator, so mixed scenarios carry a
+    genuine spectrum + THD_I. Recordings made before that date, and in-mix
+    taught devices (no isolatable spectrum), contribute zeros.
   * The PV recordings are ~0 W (no generation captured); a scenario containing PV
     just gets a near-zero PV contribution.
 

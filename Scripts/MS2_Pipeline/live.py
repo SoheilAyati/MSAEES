@@ -143,6 +143,16 @@ class ThdReader(pr.BaseReader):
                         if i_fund > 1e-3:
                             thd = 100.0 * float(np.sqrt(np.nansum(mag ** 2))) / i_fund
                 s.scalars[f"THD_I_{ph}"] = thd
+            # collapse the L1 spectrum into the five per-sample harmonic
+            # features the mix model uses (nl.harm_series = the exact math
+            # training applies to scenario spectra); the raw 39-order array
+            # never enters the acquisition ring buffer, these scalars do
+            mag = s.h_I_mag.get("L1")
+            if mag is not None and mag.size:
+                h3, h5, h7, hc, he = nl.harm_series(mag)[0]
+                s.scalars.update(H3_I_L1=float(h3), H5_I_L1=float(h5),
+                                 H7_I_L1=float(h7), HC_I_L1=float(hc),
+                                 HE_I_L1=float(he))
         return s
 
 
@@ -181,6 +191,11 @@ class ReplayReader(pr.BaseReader):
             thd = self._thd_from_harmonics(sig)
         self._thd = thd
         self._n = len(self._P)
+        # per-sample harmonic features (as ThdReader emits live), so the mix
+        # model sees the same channels during a replay as on the real meter
+        self._hf = (nl.harm_series(sig.harm_I)
+                    if sig.harm_I is not None and len(sig.harm_I) == self._n
+                    else None)
         if self._n < 2:
             raise ValueError(f"{self.path}: too few samples to replay")
         self.last_index = 0              # most recently emitted sample index
@@ -302,6 +317,10 @@ class ReplayReader(pr.BaseReader):
             "P_L3": float(self._Pph[i, 2]),
             "THD_I_L1": float(self._thd[i]),
         }
+        if self._hf is not None:
+            s.scalars.update(zip(("H3_I_L1", "H5_I_L1", "H7_I_L1",
+                                  "HC_I_L1", "HE_I_L1"),
+                                 map(float, self._hf[i])))
         return s
 
 
@@ -792,7 +811,9 @@ class LiveEngine:
         return {"t_ms": t_ms, "P": ch("P_total"), "Q": ch("Q_total"),
                 "S": ch("S_total"), "PF": ch("PF_total"),
                 "P1": ch("P_L1"), "P2": ch("P_L2"), "P3": ch("P_L3"),
-                "THD": thd}
+                "THD": thd,
+                "H3": ch("H3_I_L1"), "H5": ch("H5_I_L1"), "H7": ch("H7_I_L1"),
+                "HC": ch("HC_I_L1"), "HE": ch("HE_I_L1")}
 
     def _window_signal(self, arrs, w_samples):
         """nl.Signal over the trailing window (exact model feature path)."""
@@ -806,8 +827,10 @@ class LiveEngine:
         S = np.where(np.isfinite(S), S, np.hypot(P, Q))
         PF = arrs["PF"][sl]
         Pph = np.column_stack([arrs["P1"][sl], arrs["P2"][sl], arrs["P3"][sl]])
+        harm_ts = np.column_stack([arrs[k][sl] for k in ("H3", "H5", "H7", "HC", "HE")])
         return nl.Signal(source="live", name="live", sample_rate_hz=self.svc.sample_rate_hz,
-                         t=t, P=P, Q=Q, S=S, PF=PF, THD_I=arrs["THD"][sl], P_phase=Pph)
+                         t=t, P=P, Q=Q, S=S, PF=PF, THD_I=arrs["THD"][sl], P_phase=Pph,
+                         harm_ts=harm_ts)
 
     def _log_event(self, t_ms, kind, device, conf, dP, dQ, p_total, detail=""):
         ev = {"time_iso": datetime.fromtimestamp(t_ms / 1000.0).astimezone().isoformat(timespec="milliseconds"),

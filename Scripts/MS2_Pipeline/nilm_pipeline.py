@@ -166,7 +166,11 @@ FEATURES_FULL = FEATURES_COMMON + FEATURES_HARM
 AGG_FEATURES = ["Ptot_mean", "Ptot_std", "Ptot_min", "Ptot_max", "Qtot_mean",
                 "PL1_mean", "PL2_mean", "PL3_mean", "PF_mean", "THDI_mean", "hour",
                 "Qtot_std", "QP_ratio", "Stot_mean",
-                "Pstep_max", "Qstep_at_Pstep", "n_steps"]
+                "Pstep_max", "Qstep_at_Pstep", "n_steps",
+                # per-order harmonic content of the aggregate current (window
+                # means of the per-sample series from harm_series; zero when
+                # the source carries no spectrum). Appended per the rule above.
+                "h3_mean", "h5_mean", "h7_mean", "h_centroid_mean", "h_energy_mean"]
 
 
 def slice_features(X, bundle_features):
@@ -187,6 +191,8 @@ class Signal:
         self.PF = kw["PF"]; self.THD_I = kw["THD_I"]
         self.P_phase = kw.get("P_phase")       # (T,3) or None
         self.harm_I = kw.get("harm_I")         # (T,39) or None
+        self.harm_ts = kw.get("harm_ts")       # (T,5) precomputed harm_series
+                                               # (live buffer: no raw spectrum)
         self.gt_names = kw.get("gt_names")     # list or None
         self.gt_P = kw.get("gt_P")             # (T,N) or None
 
@@ -340,6 +346,22 @@ def _harm_feats(block):
                 h_centroid=centroid, h_energy=energy)
 
 
+def harm_series(harm_I):
+    """Per-sample harmonic feature series (T,5): [h3, h5, h7, h_centroid,
+    h_energy] from a per-order current spectrum (T,39; orders 2..40).
+
+    Same quantities as _harm_feats, but evaluated per sample instead of per
+    window: aggregate_windows averages the series over each window, and the
+    live monitor computes the identical five scalars on every meter poll
+    (before the raw spectrum is dropped from its ring buffer), so training
+    and live inference stay numerically equal."""
+    harm = np.atleast_2d(np.asarray(harm_I, float))
+    orders = np.arange(2, 2 + harm.shape[1])
+    energy = np.sqrt(np.nansum(harm ** 2, axis=1))
+    centroid = np.nansum(orders * harm, axis=1) / (np.nansum(harm, axis=1) + 1e-9)
+    return np.column_stack([harm[:, 1], harm[:, 3], harm[:, 5], centroid, energy])
+
+
 def window_features(sig: Signal, window_s=30.0, stride_s=30.0, on_threshold_W=5.0):
     """One feature row per window across the whole signal (active flag included)."""
     sr = sig.sample_rate_hz
@@ -437,6 +459,14 @@ def aggregate_windows(sig: Signal, window_s=30.0, canon=None):
         return np.asarray(a[:n], float).reshape(-1, w)
     hour = ((sig.t - sig.t[0]) / 3600.0) % 24
     Pph = sig.P_phase if sig.P_phase is not None else np.zeros((sig.n, 3))
+    # harmonic feature series: precomputed (live buffer) > raw spectrum (h5)
+    # > NaN (no spectrum; the columns become 0 via nan_to_num below)
+    if sig.harm_ts is not None and len(sig.harm_ts) == sig.n:
+        H = np.asarray(sig.harm_ts, float)
+    elif sig.harm_I is not None and len(sig.harm_I) == sig.n:
+        H = harm_series(sig.harm_I)
+    else:
+        H = np.full((sig.n, 5), np.nan)
     import warnings
     with warnings.catch_warnings():
         # all-NaN windows (e.g. PF or THD_I of an idle phase) are legitimate
@@ -452,6 +482,9 @@ def aggregate_windows(sig: Signal, window_s=30.0, canon=None):
             np.nanmean(W(sig.PF), 1), np.nanmean(W(sig.THD_I), 1), np.nanmean(W(hour), 1),
             np.nanstd(W(sig.Q), 1), Qm / (np.abs(Pm) + 1e-6), np.hypot(Pm, Qm),
             dP_max, dQ_at, n_steps,
+            np.nanmean(W(H[:, 0]), 1), np.nanmean(W(H[:, 1]), 1),
+            np.nanmean(W(H[:, 2]), 1), np.nanmean(W(H[:, 3]), 1),
+            np.nanmean(W(H[:, 4]), 1),
         ])
     X = np.nan_to_num(X)
     Y = None
