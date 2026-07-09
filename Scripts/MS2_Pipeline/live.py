@@ -891,7 +891,8 @@ class LiveEngine:
                 self.edge_history.append({"t_ms": int(edge["t_ms"]),
                                           "dP": float(edge["dP"]),
                                           "dQ": float(edge["dQ"]),
-                                          "ih": edge.get("ih")})
+                                          "ih": edge.get("ih"),
+                                          "P_after": edge.get("P_after")})
             if direction == "on":
                 if dev != "unrecognized" and conf is not None and conf >= self.edge_claim_conf:
                     self.claims[dev] = {"W": abs(float(edge["dP"])),
@@ -899,11 +900,30 @@ class LiveEngine:
                                         "conf": float(conf),
                                         "t_ms": int(edge["t_ms"])}
                     self.forced_off.pop(dev, None)
-                elif abs(edge["dP"]) >= self.unknown_claim_min_W:
-                    # unmatched switch-on: claim the watts as an UNKNOWN load
-                    # so the window model cannot pin them on a known family
-                    self.unknown_claims.append({"W": abs(float(edge["dP"])),
-                                                "t_ms": int(edge["t_ms"])})
+                    return
+                # unmatched switch-on: claim the watts as an UNKNOWN load so
+                # the window model cannot pin them on a known family. A
+                # soft-start device RAMPS (laptop charger: settled steps of
+                # 10, 38, 63 W within seconds) and every re-detection is the
+                # SAME device still climbing, not another unknown -- fold it
+                # into the fresh claim; the claim's watts become the
+                # cumulative rise over its own pre-switch level.
+                W = abs(float(edge["dP"]))
+                p_after = edge.get("P_after")
+                for u in self.unknown_claims:
+                    if int(edge["t_ms"]) - u.get("last_ms", u["t_ms"]) < 12000:
+                        if p_after is not None and u.get("pre_W") is not None:
+                            W = max(W, float(p_after) - u["pre_W"])
+                        u["W"] = max(u["W"], W)
+                        u["last_ms"] = int(edge["t_ms"])
+                        break
+                else:
+                    if W >= self.unknown_claim_min_W:
+                        pre = (float(p_after) - float(edge["dP"])
+                               if p_after is not None else None)
+                        self.unknown_claims.append(
+                            {"W": W, "t_ms": int(edge["t_ms"]),
+                             "last_ms": int(edge["t_ms"]), "pre_W": pre})
                 return
             # off-edge: release the claim it belongs to
             drop = dev if (dev != "unrecognized" and dev in self.claims) else None
@@ -1191,7 +1211,7 @@ class LiveEngine:
             forced_off = dict(self.forced_off)
             unk_claims = [dict(u) for u in self.unknown_claims]
             unk_veto = bool(unk_claims) or now_ms < self._unknown_flush_until
-            prev_on = {nm: v.get("on", False) for nm, v in self.state.items()}
+            prev_on_map = {nm: v.get("on", False) for nm, v in self.state.items()}
 
         on_map, power_map, prob_map, src_map = {}, {}, {}, {}
         if presence is not None and names:
@@ -1208,9 +1228,9 @@ class LiveEngine:
                 proba_s = np.median(np.vstack(list(self.smooth)), axis=0)
             watts = power.predict(X)[0] if power is not None else np.zeros(len(names))
             for i, nm in enumerate(names):
-                prev_on = self.state.get(nm, {}).get("on", False)
+                was_on = self.state.get(nm, {}).get("on", False)
                 # hysteresis so a 0.5-ish probability doesn't flap on/off
-                on = bool(proba_s[i] >= (0.45 if prev_on else 0.55))
+                on = bool(proba_s[i] >= (0.45 if was_on else 0.55))
                 w = float(watts[i]) if on else 0.0
                 if on and abs(w) < 0.5 and power is None:
                     w = float("nan")
@@ -1232,7 +1252,7 @@ class LiveEngine:
                                 and now_ms - ev["unix_ms"] < (ws + 6) * 1000}
             for nm in list(on_map):
                 if (on_map[nm] and nm not in claims
-                        and not prev_on.get(nm, False)
+                        and not prev_on_map.get(nm, False)
                         and nm not in recent_named):
                     on_map[nm] = False
                     power_map[nm] = 0.0
