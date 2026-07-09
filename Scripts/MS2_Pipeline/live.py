@@ -485,7 +485,13 @@ class ModelManager:
                 if (ih is not None and math.isfinite(ih)
                         and s.get("IH") is not None):
                     terms.append((ih - s["IH"]) / max(0.05, 0.35 * s["IH"]))
-                d = math.sqrt(sum(t * t for t in terms) / len(terms))
+                # CONJUNCTIVE distance: every dimension must independently
+                # agree. Averaging (RMS) let an uninformative dimension dilute
+                # a real disagreement -- two resistive loads both sit at Q~0,
+                # so the Q term said nothing yet still halved the distance,
+                # and a 716 W toaster matched the 932 W boiler at 0.34 conf
+                # instead of raising the unknown prompt.
+                d = max(abs(t) for t in terms)
                 if d < 1.0:
                     cands.append((d, s))
             if not cands:
