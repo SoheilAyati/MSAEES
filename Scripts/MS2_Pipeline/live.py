@@ -458,7 +458,7 @@ class ModelManager:
                          "IH": ih})
         self.signatures = sigs
 
-    def match_edge(self, dP: float, dQ: float, ih=None):
+    def match_edge(self, dP: float, dQ: float, ih=None, q_tol_scale: float = 1.0):
         """Nearest device signature for a power step; None when nothing is
         close. Elliptical distance with SEPARATE P / Q (and, when both sides
         have it, harmonic-current) tolerances: the old single 35 %-of-magnitude
@@ -478,7 +478,9 @@ class ModelManager:
                 # Q to a couple of var at these levels. A 20-var floor let a
                 # 10 W laptop charger match table_fan_low (Q 14.4) at 0.43
                 # conf. Q noise on LARGE loads is covered by the 5 %-of-P term.
-                tol_Q = max(8.0, 0.25 * abs(s["Q"]) + 0.05 * abs(s["P"]))
+                # q_tol_scale > 1 for probes whose Q is an ESTIMATE rather
+                # than a measured step (residual matching)
+                tol_Q = max(8.0, 0.25 * abs(s["Q"]) + 0.05 * abs(s["P"])) * q_tol_scale
                 terms = [(dP - s["P"]) / tol_P, (dQ - s["Q"]) / tol_Q]
                 if (ih is not None and math.isfinite(ih)
                         and s.get("IH") is not None):
@@ -730,6 +732,7 @@ class LiveEngine:
         self.events: list = []           # full session event log
         self.unknown: dict | None = None
         self._unknown_first: float | None = None
+        self._unknown_clear_ms: float | None = None
         self._last_edge_ms = 0
         self._last_edge_dP = 0.0
         self._teach_note = ""
@@ -886,6 +889,7 @@ class LiveEngine:
             if direction == "on":
                 if dev != "unrecognized" and conf is not None and conf >= self.edge_claim_conf:
                     self.claims[dev] = {"W": abs(float(edge["dP"])),
+                                        "Q": float(edge["dQ"]),
                                         "conf": float(conf),
                                         "t_ms": int(edge["t_ms"])}
                     self.forced_off.pop(dev, None)
@@ -960,6 +964,48 @@ class LiveEngine:
                                 None, instant_W,
                                 detail="edge claim exceeds measured power "
                                        "(missed off-edge?)")
+
+    def _claim_residual(self, residual, now_ms, arrs, on_map, src_map):
+        """NAME a persistent residual before calling it unknown: probe the
+        signature table with the residual's own (P, estimated Q). Soft-start
+        devices (a laptop charger plugs in at ~10 W and ramps to its 60+ W
+        steady draw) never produce a switch-on edge that resembles their
+        steady-state signature, and the window model drowns at mix scale --
+        the residual is the only place their identity shows, so a TAUGHT
+        device could stay 'unknown' forever without this path. The Q probe is
+        an estimate (measured Q minus the ON devices' known vars), hence the
+        relaxed Q tolerance and the higher confidence bar; an ambiguous match
+        still collapses to None and the unknown prompt takes over."""
+        k = max(1, int(2.5 * self.svc.sample_rate_hz))
+        q_now = float(np.nanmedian(arrs["Q"][-k:]))
+        if not math.isfinite(q_now):
+            return None
+        with self.models.lock:
+            fam_q: dict = {}
+            for s in self.models.signatures:
+                fam_q.setdefault(s["family"], []).append(s["Q"])
+        with self.lock:
+            q_on = sum(c.get("Q", 0.0) for f, c in self.claims.items()
+                       if on_map.get(f))
+        for nm, on in on_map.items():
+            if on and src_map.get(nm) == "model" and nm in fam_q:
+                q_on += float(np.median(fam_q[nm]))
+        q_res = q_now - q_on
+        m = self.models.match_edge(residual, q_res, q_tol_scale=3.0)
+        if not m or m["confidence"] < 0.45 or on_map.get(m["family"]):
+            return None
+        fam = m["family"]
+        with self.lock:
+            t0 = int(self._unknown_first or now_ms)
+            self.claims[fam] = {"W": abs(float(residual)), "Q": float(q_res),
+                                "conf": float(m["confidence"]), "t_ms": t0}
+            self.forced_off.pop(fam, None)
+        self._log_event(now_ms, "residual_matched", fam, m["confidence"],
+                        residual, q_res, None,
+                        detail="persistent residual matches this device's "
+                               "steady signature - claimed (soft-start/ramp "
+                               "device has no matching switch-on edge)")
+        return fam
 
     def _rebuild_state_from_history(self, now_ms):
         """Software 'unplug everything and plug it back in': after a model
@@ -1290,11 +1336,28 @@ class LiveEngine:
         big_unknown = any(u["W"] >= self.unknown_min_W
                           and now_ms - u["t_ms"] >= self.unknown_persist_s * 1000
                           for u in unk_claims)
+        retraining = self.retrainer.status()["state"] == "running"
         over = ((abs(residual) > threshold or big_unknown)
-                and not settling and not teaching
-                and self.retrainer.status()["state"] != "running")
+                and not settling and not teaching and not retraining)
+
+        # try to NAME the persistent residual before (or while) prompting:
+        # a taught soft-start device is recognized here, not by its edge
+        with self.lock:
+            persisted = (self.unknown is not None
+                         or (self._unknown_first is not None
+                             and now_ms - self._unknown_first
+                             >= self.unknown_persist_s * 1000))
+        if (over and persisted and abs(residual) >= self.unknown_min_W
+                and self._claim_residual(residual, now_ms, arrs,
+                                         on_map, src_map)):
+            with self.lock:
+                self._unknown_first = None
+                self.unknown = None
+            over = False
+
         with self.lock:
             if over:
+                self._unknown_clear_ms = None
                 if self._unknown_first is None:
                     # an unmatched on-edge pinpoints the actual switch-on
                     self._unknown_first = min(
@@ -1310,12 +1373,24 @@ class LiveEngine:
                                     None, residual, None, total_W,
                                     detail="sustained unexplained power - "
                                            "please name this device (Teach)")
+            elif self.unknown is not None and (settling or teaching or retraining):
+                # transient suppression (a device switching, teach, retrain):
+                # FREEZE the prompt instead of flapping cleared/detected
+                self._unknown_clear_ms = None
             else:
                 self._unknown_first = None
                 if self.unknown is not None:
-                    self._log_event(now_ms, "unknown_cleared", "unknown", None,
-                                    residual, None, total_W)
-                self.unknown = None
+                    # residual genuinely low: clear only after it stays low,
+                    # so one settled stride cannot dismiss a real unknown
+                    if self._unknown_clear_ms is None:
+                        self._unknown_clear_ms = now_ms
+                    elif now_ms - self._unknown_clear_ms >= 6000:
+                        self._log_event(now_ms, "unknown_cleared", "unknown",
+                                        None, residual, None, total_W)
+                        self.unknown = None
+                        self._unknown_clear_ms = None
+                else:
+                    self._unknown_clear_ms = None
             if self.unknown is not None:
                 self.unknown["typical_W"] = round(residual, 1)
 
@@ -1486,6 +1561,9 @@ class LiveEngine:
                     pass
             with self.lock:
                 self._teach_note = f"teach '{label}' aborted: {e}"
+            self._log_event(int(time.time() * 1000), "teach_failed",
+                            nl.parse_family(label), None, None, None, None,
+                            detail=f"guided recording aborted: {e}")
         finally:
             with self.lock:
                 self.guide = None
@@ -1551,8 +1629,11 @@ class LiveEngine:
             base_a = self._inmix_baseline(cap, base_s, "inmix_baseline_a",
                     "Step 2/5 - measuring the background baseline, "
                     "{left:.0f} s. Do not switch anything.")
-            # 2. switch it back ON
-            rise_min = max(on_W_min, 0.5 * max(0.0, ref - base_a["P"]))
+            # 2. switch it back ON. The gate is the minimum DETECTABLE rise,
+            # not a fraction of the earlier drop: a soft-start device (laptop
+            # charger) comes back at ~10 W and ramps, and would time out
+            # against a half-of-previous-draw threshold.
+            rise_min = on_W_min
             if self._inmix_wait(cap, lambda w: w >= base_a["P"] + rise_min,
                     2.0, 300.0, "inmix_on",
                     f"Step 3/5 - now switch '{label}' back ON (leave the others "
@@ -1623,6 +1704,9 @@ class LiveEngine:
         except Exception as e:            # noqa: BLE001
             with self.lock:
                 self._teach_note = f"teach '{label}' (in-mix) aborted: {e}"
+            self._log_event(int(time.time() * 1000), "teach_failed",
+                            nl.parse_family(label), None, None, None, None,
+                            detail=f"in-mix capture aborted: {e}")
         finally:
             with self.lock:
                 self.guide = None
@@ -2322,7 +2406,8 @@ async function pollEvents(){
       if(e.kind.includes("on") && !e.kind.includes("unknown")) cls = "kind-on";
       if(e.kind.includes("off")) cls = "kind-off";
       if(e.kind.includes("unknown")) cls = "kind-unknown";
-      if(e.kind === "taught") cls = "kind-taught";
+      if(e.kind.includes("fail")) cls = "kind-unknown";
+      if(e.kind === "taught" || e.kind === "residual_matched") cls = "kind-taught";
       tr.innerHTML = '<td class="time">'+hmsMs(e.time_iso)+'</td><td class="'+cls+'">'+e.kind+
         '</td><td><b>'+e.device+'</b></td><td>'+(e.dP_W==null?"":e.dP_W)+
         '</td><td>'+(e.dQ_var==null?"":e.dQ_var)+'</td><td>'+(e.confidence==null?"":e.confidence)+
