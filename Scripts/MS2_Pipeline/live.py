@@ -472,7 +472,13 @@ class ModelManager:
             cands = []
             for s in self.signatures:
                 tol_P = max(15.0, 0.25 * abs(s["P"]))
-                tol_Q = max(20.0, 0.25 * abs(s["Q"]) + 0.05 * abs(s["P"]))
+                # Q floor stays TIGHT (8 var): reactive power is the only
+                # feature separating a small fan (14-52 var) from a small
+                # SMPS charger (~0 var) at equal watts, and the meter resolves
+                # Q to a couple of var at these levels. A 20-var floor let a
+                # 10 W laptop charger match table_fan_low (Q 14.4) at 0.43
+                # conf. Q noise on LARGE loads is covered by the 5 %-of-P term.
+                tol_Q = max(8.0, 0.25 * abs(s["Q"]) + 0.05 * abs(s["P"]))
                 terms = [(dP - s["P"]) / tol_P, (dQ - s["Q"]) / tol_Q]
                 if (ih is not None and math.isfinite(ih)
                         and s.get("IH") is not None):
@@ -725,6 +731,7 @@ class LiveEngine:
         self.unknown: dict | None = None
         self._unknown_first: float | None = None
         self._last_edge_ms = 0
+        self._last_edge_dP = 0.0
         self._teach_note = ""
         # replay ground-truth comparison: available only when the reader
         # replays a file that carries ground truth (scenario /ground_truth or
@@ -833,7 +840,19 @@ class LiveEngine:
         t_edge = int(t8[k + j])
         if t_edge - self._last_edge_ms < 3000:      # debounce
             return None
+        # the same physical step stays visible while it transits the 8 s
+        # window (pre/post medians keep disagreeing) and can re-trigger with a
+        # shifted timestamp: a near-identical dP of the same sign within the
+        # transit time is the SAME event, not a new one (the lamp was logged
+        # twice, 3 s apart, at 502.6 W and 501.9 W). A genuinely new step of
+        # clearly different watts (boiler after lamp) still passes.
+        if (t_edge - self._last_edge_ms < 9000
+                and dP * self._last_edge_dP > 0
+                and abs(dP - self._last_edge_dP)
+                < max(10.0, 0.12 * abs(self._last_edge_dP))):
+            return None
         self._last_edge_ms = t_edge
+        self._last_edge_dP = float(dP)
         # harmonic-current estimate of the switching device (RSS delta of the
         # settled THD-derived harmonic currents), for the signature matcher;
         # None when THD is unavailable on either side of the step
@@ -1255,8 +1274,24 @@ class LiveEngine:
         settling = bool(forced_off) or any(
             now_ms - c["t_ms"] < (ws + 4) * 1000 for c in claims.values())
         teaching = self._teach_thread is not None and self._teach_thread.is_alive()
-        threshold = max(self.unknown_min_W, self.unknown_frac * abs(total_W))
-        over = (abs(residual) > threshold and not settling and not teaching
+        # The tolerance must scale with how the ON power was EXPLAINED, not
+        # with the raw total: model-estimated watts carry ~15 % error, but an
+        # edge claim's watts were measured off the step itself, so claimed
+        # power only needs a small drift budget. With boiler + lamp claimed
+        # (1430 W), a flat 15 %-of-total threshold (~215 W) would hide a 60 W
+        # laptop charger forever; 4 % drift budget (~57 W) does not.
+        model_W = sum(power_map[nm] for nm in on_map
+                      if on_map[nm] and src_map.get(nm) == "model"
+                      and math.isfinite(power_map.get(nm, 0.0)))
+        threshold = max(self.unknown_min_W,
+                        self.unknown_frac * abs(model_W) + 0.04 * claimed_W)
+        # a persisting unmatched on-edge is direct evidence, no need to wait
+        # for the window residual to agree
+        big_unknown = any(u["W"] >= self.unknown_min_W
+                          and now_ms - u["t_ms"] >= self.unknown_persist_s * 1000
+                          for u in unk_claims)
+        over = ((abs(residual) > threshold or big_unknown)
+                and not settling and not teaching
                 and self.retrainer.status()["state"] != "running")
         with self.lock:
             if over:
