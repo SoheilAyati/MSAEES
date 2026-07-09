@@ -894,36 +894,43 @@ class LiveEngine:
                                           "ih": edge.get("ih"),
                                           "P_after": edge.get("P_after")})
             if direction == "on":
+                p_after = edge.get("P_after")
                 if dev != "unrecognized" and conf is not None and conf >= self.edge_claim_conf:
                     self.claims[dev] = {"W": abs(float(edge["dP"])),
                                         "Q": float(edge["dQ"]),
                                         "conf": float(conf),
-                                        "t_ms": int(edge["t_ms"])}
+                                        "t_ms": int(edge["t_ms"]),
+                                        "last_ms": int(edge["t_ms"]),
+                                        "pre_W": (float(p_after) - float(edge["dP"])
+                                                  if p_after is not None else None)}
                     self.forced_off.pop(dev, None)
                     return
                 # unmatched switch-on: claim the watts as an UNKNOWN load so
                 # the window model cannot pin them on a known family. A
                 # soft-start device RAMPS (laptop charger: settled steps of
-                # 10, 38, 63 W within seconds) and every re-detection is the
-                # SAME device still climbing, not another unknown -- fold it
-                # into the fresh claim; the claim's watts become the
-                # cumulative rise over its own pre-switch level.
+                # 10, 38, 63 W and a +28 W tail after the matched edge) and
+                # every re-detection is the SAME device still climbing, not
+                # another unknown -- fold it into the most recent still-
+                # growing claim, NAMED or anonymous; the claim's watts become
+                # the cumulative rise over its own pre-switch level.
                 W = abs(float(edge["dP"]))
-                p_after = edge.get("P_after")
-                for u in self.unknown_claims:
-                    if int(edge["t_ms"]) - u.get("last_ms", u["t_ms"]) < 12000:
-                        if p_after is not None and u.get("pre_W") is not None:
-                            W = max(W, float(p_after) - u["pre_W"])
-                        u["W"] = max(u["W"], W)
-                        u["last_ms"] = int(edge["t_ms"])
-                        break
-                else:
-                    if W >= self.unknown_claim_min_W:
-                        pre = (float(p_after) - float(edge["dP"])
-                               if p_after is not None else None)
-                        self.unknown_claims.append(
-                            {"W": W, "t_ms": int(edge["t_ms"]),
-                             "last_ms": int(edge["t_ms"]), "pre_W": pre})
+                grow, grow_last = None, None
+                for c in list(self.claims.values()) + self.unknown_claims:
+                    lm = c.get("last_ms", c.get("t_ms", 0))
+                    if (int(edge["t_ms"]) - lm < 12000
+                            and (grow_last is None or lm > grow_last)):
+                        grow, grow_last = c, lm
+                if grow is not None:
+                    if p_after is not None and grow.get("pre_W") is not None:
+                        W = max(W, float(p_after) - grow["pre_W"])
+                    grow["W"] = max(grow["W"], W)
+                    grow["last_ms"] = int(edge["t_ms"])
+                elif W >= self.unknown_claim_min_W:
+                    self.unknown_claims.append(
+                        {"W": W, "t_ms": int(edge["t_ms"]),
+                         "last_ms": int(edge["t_ms"]),
+                         "pre_W": (float(p_after) - float(edge["dP"])
+                                   if p_after is not None else None)})
                 return
             # off-edge: release the claim it belongs to
             drop = dev if (dev != "unrecognized" and dev in self.claims) else None
@@ -965,6 +972,13 @@ class LiveEngine:
         with self.lock:
             for fam in [f for f, until in self.forced_off.items() if now_ms >= until]:
                 self.forced_off.pop(fam, None)
+            if self.forced_off:
+                # an off-edge is still flushing through the window: the
+                # measured level is mid-transition, so a claims-vs-measured
+                # comparison would kill healthy claims (that dropped the
+                # standing lamp's 514 W claim 4 s after the laptop was
+                # unplugged). Resume the guard once the flush is over.
+                return
             while self.claims or self.unknown_claims:
                 mature = {f: c for f, c in self.claims.items()
                           if now_ms - c["t_ms"] >= 6000}
@@ -1237,15 +1251,20 @@ class LiveEngine:
                 on_map[nm], power_map[nm], prob_map[nm] = on, w, float(proba_s[i])
                 src_map[nm] = "model"
 
-        # -- veto model-only switch-ons while an UNKNOWN load runs -------------
-        # Every real switch-on produces its own edge. While an unmatched edge's
-        # watts are on the mains (or still flushing out of the window), a model
-        # device newly flipping ON with no edge of its own is almost certainly
-        # the model pinning the unknown's watts on the nearest known family --
-        # exactly the "hair dryer detected as standing lamp" failure. Devices
-        # already ON, edge-claimed devices, and devices a recent on-edge named
-        # are untouched.
-        if unk_veto:
+        # -- veto model-only switch-ons that have nothing real to explain ------
+        # Every real switch-on produces its own edge. A model device newly
+        # flipping ON with no edge of its own is suspect in two situations:
+        # (a) an UNKNOWN load is on the mains (or still flushing out of the
+        #     window) -- the model is pinning the unknown's watts on the
+        #     nearest known family ("hair dryer detected as standing lamp");
+        # (b) the claims already account for the measured total -- there are
+        #     no unexplained watts left, so the new ON is the model
+        #     re-labeling claimed power (lamp + laptop read as "coffee").
+        # Devices already ON, edge-claimed devices, and devices a recent
+        # on-edge named are untouched.
+        headroom = (total_W - sum(c["W"] for c in claims.values())
+                    - sum(u["W"] for u in unk_claims))
+        if unk_veto or headroom < max(10.0, 2 * on_W):
             with self.lock:
                 recent_named = {ev["device"] for ev in self.events[-12:]
                                 if ev["kind"] == "edge_on"
