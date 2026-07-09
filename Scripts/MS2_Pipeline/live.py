@@ -397,7 +397,10 @@ class ModelManager:
                     self.source = "model_presence.joblib + model_disaggregate.joblib"
 
     def _load_signatures(self):
-        """Steady-state (P, Q) per single-device recording, for edge matching."""
+        """Steady-state (P, Q, harmonic current) per single-device recording,
+        for edge matching. IH is the device's harmonic current in amps
+        (THD_I/100 * I_fundamental at nominal 230 V); None when the recording
+        carries no usable THD channel."""
         sigs = []
         for p in sorted(glob.glob(os.path.join(self.recordings_dir, "*.h5"))):
             try:
@@ -408,28 +411,59 @@ class ModelManager:
                         continue
                     P = np.nan_to_num(f["measurements/P_total"][:])
                     Q = np.nan_to_num(f["measurements/Q_total"][:])
+                    T = (np.asarray(f["measurements/THD_I_L1"][:], float)
+                         if "measurements/THD_I_L1" in f else None)
             except (OSError, KeyError):
                 continue
             on = np.abs(P) > 3.0
             if len(P) < 25 or not on.any():
                 continue
+            ih = None
+            if T is not None and len(T) == len(P):
+                fin = on & np.isfinite(T)
+                if fin.sum() >= max(10, 0.3 * on.sum()):
+                    ih = float(np.median(
+                        T[fin] / 100.0 * np.hypot(P[fin], Q[fin]) / 230.0))
             sigs.append({"family": nl.parse_family(lab), "label": lab,
-                         "P": float(np.median(P[on])), "Q": float(np.median(Q[on]))})
+                         "P": float(np.median(P[on])), "Q": float(np.median(Q[on])),
+                         "IH": ih})
         self.signatures = sigs
 
-    def match_edge(self, dP: float, dQ: float):
-        """Nearest device signature for a power step; None when nothing is close."""
+    def match_edge(self, dP: float, dQ: float, ih=None):
+        """Nearest device signature for a power step; None when nothing is
+        close. Elliptical distance with SEPARATE P / Q (and, when both sides
+        have it, harmonic-current) tolerances: the old single 35 %-of-magnitude
+        tolerance let any device near a known device's watts steal its name
+        (a hair dryer at ~500 W matched the 501 W standing lamp) -- reactive
+        power and harmonic content now have to agree too. And when two
+        signatures of DIFFERENT families are nearly equally close, the
+        confidence collapses so the caller reports 'unrecognized' instead of
+        guessing a sibling: a wrong name is worse than an unknown."""
         with self.lock:
-            best, best_d = None, 1.0
+            cands = []
             for s in self.signatures:
-                tol = max(20.0, 0.35 * math.hypot(s["P"], s["Q"]))
-                d = math.hypot(dP - s["P"], dQ - s["Q"]) / tol
-                if d < best_d:
-                    best, best_d = s, d
-            if best is None:
+                tol_P = max(15.0, 0.25 * abs(s["P"]))
+                tol_Q = max(20.0, 0.25 * abs(s["Q"]) + 0.05 * abs(s["P"]))
+                terms = [(dP - s["P"]) / tol_P, (dQ - s["Q"]) / tol_Q]
+                if (ih is not None and math.isfinite(ih)
+                        and s.get("IH") is not None):
+                    terms.append((ih - s["IH"]) / max(0.05, 0.35 * s["IH"]))
+                d = math.sqrt(sum(t * t for t in terms) / len(terms))
+                if d < 1.0:
+                    cands.append((d, s))
+            if not cands:
                 return None
+            cands.sort(key=lambda x: x[0])
+            best_d, best = cands[0]
+            conf = 1.0 - best_d
+            # ambiguity penalty against the nearest OTHER family (several
+            # recordings of the same device must not penalize each other)
+            for d2, s2 in cands[1:]:
+                if s2["family"] != best["family"]:
+                    conf *= min(1.0, (d2 - best_d) / 0.35)
+                    break
             return {"family": best["family"], "label": best["label"],
-                    "confidence": round(max(0.0, 1.0 - best_d), 2)}
+                    "confidence": round(max(0.0, conf), 2)}
 
     def info(self) -> dict:
         with self.lock:
@@ -635,6 +669,16 @@ class LiveEngine:
         # uniquely.
         self.claims: dict = {}           # family -> {W, conf, t_ms}
         self.forced_off: dict = {}       # family -> hold-off-until unix_ms
+        # anonymous UNKNOWN-LOAD claims: an on-edge that matches no signature
+        # used to leave its watts to the window model, which then pinned them
+        # on whatever known family was closest (hair dryer -> "standing lamp").
+        # Now the unmatched step itself claims the watts as an unknown load:
+        # model-only switch-ons are vetoed while one is active (every real
+        # switch-on produces its own edge), the residual stays unexplained,
+        # and the unknown-device prompt fires instead of a wrong name.
+        self.unknown_claims: list = []   # [{W, t_ms}]
+        self.unknown_claim_min_W = max(15.0, edge_min_W)
+        self._unknown_flush_until = 0    # model-veto after an unknown off-edge
         # every settled edge this session, matched or not. After a model
         # reload (retrain / variant switch) the history is re-matched against
         # the NEW signatures and the claims rebuilt -- a software version of
@@ -761,8 +805,20 @@ class LiveEngine:
         if t_edge - self._last_edge_ms < 3000:      # debounce
             return None
         self._last_edge_ms = t_edge
+        # harmonic-current estimate of the switching device (RSS delta of the
+        # settled THD-derived harmonic currents), for the signature matcher;
+        # None when THD is unavailable on either side of the step
+        ih = None
+        T8 = arrs["THD"][-need:]
+        if (np.isfinite(T8[:k]).sum() >= max(2, k // 2)
+                and np.isfinite(T8[-k:]).sum() >= max(2, k // 2)):
+            ih_pre = np.nanmedian(T8[:k]) / 100.0 * math.hypot(pre_P, pre_Q) / 230.0
+            ih_post = np.nanmedian(T8[-k:]) / 100.0 * math.hypot(post_P, post_Q) / 230.0
+            d2 = (ih_post ** 2 - ih_pre ** 2) if dP > 0 else (ih_pre ** 2 - ih_post ** 2)
+            if math.isfinite(d2):
+                ih = math.sqrt(max(0.0, d2))
         return {"t_ms": t_edge, "dP": float(dP), "dQ": float(dQ),
-                "P_after": float(post_P)}
+                "P_after": float(post_P), "ih": ih}
 
     # ---- edge -> device state (claims) --------------------------------------
     def _apply_edge(self, edge, direction, dev, conf, record=True):
@@ -777,28 +833,44 @@ class LiveEngine:
             if record:
                 self.edge_history.append({"t_ms": int(edge["t_ms"]),
                                           "dP": float(edge["dP"]),
-                                          "dQ": float(edge["dQ"])})
+                                          "dQ": float(edge["dQ"]),
+                                          "ih": edge.get("ih")})
             if direction == "on":
                 if dev != "unrecognized" and conf is not None and conf >= self.edge_claim_conf:
                     self.claims[dev] = {"W": abs(float(edge["dP"])),
                                         "conf": float(conf),
                                         "t_ms": int(edge["t_ms"])}
                     self.forced_off.pop(dev, None)
+                elif abs(edge["dP"]) >= self.unknown_claim_min_W:
+                    # unmatched switch-on: claim the watts as an UNKNOWN load
+                    # so the window model cannot pin them on a known family
+                    self.unknown_claims.append({"W": abs(float(edge["dP"])),
+                                                "t_ms": int(edge["t_ms"])})
                 return
             # off-edge: release the claim it belongs to
             drop = dev if (dev != "unrecognized" and dev in self.claims) else None
-            if drop is None and self.claims:
+            drop_unk = None
+            if drop is None:
                 # signature match failed (or named an unclaimed device): release
-                # the active claim whose watts best explain the drop instead
-                best_fam, best_err = None, 0.35
+                # the active claim -- named or unknown -- whose watts best
+                # explain the drop instead
+                best_err = 0.35
                 for fam, c in self.claims.items():
                     err = abs(abs(edge["dP"]) - c["W"]) / max(c["W"], 20.0)
                     if err < best_err:
-                        best_fam, best_err = fam, err
-                drop = best_fam
+                        drop, drop_unk, best_err = fam, None, err
+                for i, u in enumerate(self.unknown_claims):
+                    err = abs(abs(edge["dP"]) - u["W"]) / max(u["W"], 20.0)
+                    if err < best_err:
+                        drop, drop_unk, best_err = None, i, err
             if drop is not None:
                 self.claims.pop(drop, None)
                 self.forced_off[drop] = int(edge["t_ms"]) + flush_ms
+            elif drop_unk is not None:
+                self.unknown_claims.pop(drop_unk)
+                # the window still holds pre-drop samples that could tempt the
+                # model into naming the leftover watts: keep the veto up
+                self._unknown_flush_until = int(edge["t_ms"]) + flush_ms
             elif dev != "unrecognized":
                 # no claim existed (device was on before the engine started),
                 # but the step names it: hold it off while the window flushes
@@ -815,14 +887,25 @@ class LiveEngine:
         with self.lock:
             for fam in [f for f, until in self.forced_off.items() if now_ms >= until]:
                 self.forced_off.pop(fam, None)
-            while self.claims:
+            while self.claims or self.unknown_claims:
                 mature = {f: c for f, c in self.claims.items()
                           if now_ms - c["t_ms"] >= 6000}
-                if not mature:
+                mature_unk = [i for i, u in enumerate(self.unknown_claims)
+                              if now_ms - u["t_ms"] >= 6000]
+                if not mature and not mature_unk:
                     break
-                claimed = sum(c["W"] for c in self.claims.values())
+                claimed = (sum(c["W"] for c in self.claims.values())
+                           + sum(u["W"] for u in self.unknown_claims))
                 if claimed <= instant_W + max(30.0, 0.10 * claimed):
                     break
+                if mature_unk:           # anonymous loads go before named ones
+                    i = max(mature_unk, key=lambda k: self.unknown_claims[k]["W"])
+                    u = self.unknown_claims.pop(i)
+                    self._log_event(now_ms, "claim_dropped", "unknown", None,
+                                    -u["W"], None, instant_W,
+                                    detail="unknown load exceeds measured power "
+                                           "(missed off-edge?)")
+                    continue
                 fam = min(mature, key=lambda f: mature[f]["conf"])
                 c = self.claims.pop(fam)
                 self._log_event(now_ms, "claim_dropped", fam, c["conf"], -c["W"],
@@ -842,11 +925,14 @@ class LiveEngine:
             hist = list(self.edge_history)
             self.claims = {}
             self.forced_off = {}
+            self.unknown_claims = []
+            self._unknown_flush_until = 0
             self.smooth.clear()
         for e in hist:
             direction = "on" if e["dP"] > 0 else "off"
             probe = (e["dP"], e["dQ"]) if direction == "on" else (-e["dP"], -e["dQ"])
-            match = m.match_edge(*probe) if abs(e["dP"]) >= self.edge_min_W else None
+            match = (m.match_edge(*probe, ih=e.get("ih"))
+                     if abs(e["dP"]) >= self.edge_min_W else None)
             if match and match["confidence"] >= 0.25:
                 dev, conf = match["family"], match["confidence"]
             else:
@@ -973,15 +1059,21 @@ class LiveEngine:
             # an on-edge is the device's own (P, Q); an off-edge is its negative
             probe = (edge["dP"], edge["dQ"]) if direction == "on" \
                 else (-edge["dP"], -edge["dQ"])
-            match = m.match_edge(*probe) if abs(edge["dP"]) >= self.edge_min_W else None
+            match = (m.match_edge(*probe, ih=edge.get("ih"))
+                     if abs(edge["dP"]) >= self.edge_min_W else None)
             if match and match["confidence"] >= 0.25:
                 dev, conf = match["family"], match["confidence"]
             else:
                 dev, conf = "unrecognized", None
+            if dev != "unrecognized":
+                det = "step matched to device signature"
+            elif direction == "on" and abs(edge["dP"]) >= self.unknown_claim_min_W:
+                det = ("step matches no known device signature - "
+                       "tracking as unknown load")
+            else:
+                det = "step matches no known device signature"
             self._log_event(edge["t_ms"], f"edge_{direction}", dev, conf,
-                            edge["dP"], edge["dQ"], edge["P_after"],
-                            detail="step matched to device signature" if dev != "unrecognized"
-                                   else "step matches no known device signature")
+                            edge["dP"], edge["dQ"], edge["P_after"], detail=det)
             self._apply_edge(edge, direction, dev, conf)
 
         sr = self.svc.sample_rate_hz
@@ -997,6 +1089,9 @@ class LiveEngine:
         with self.lock:
             claims = {f: dict(c) for f, c in self.claims.items()}
             forced_off = dict(self.forced_off)
+            unk_claims = [dict(u) for u in self.unknown_claims]
+            unk_veto = bool(unk_claims) or now_ms < self._unknown_flush_until
+            prev_on = {nm: v.get("on", False) for nm, v in self.state.items()}
 
         on_map, power_map, prob_map, src_map = {}, {}, {}, {}
         if presence is not None and names:
@@ -1022,13 +1117,33 @@ class LiveEngine:
                 on_map[nm], power_map[nm], prob_map[nm] = on, w, float(proba_s[i])
                 src_map[nm] = "model"
 
+        # -- veto model-only switch-ons while an UNKNOWN load runs -------------
+        # Every real switch-on produces its own edge. While an unmatched edge's
+        # watts are on the mains (or still flushing out of the window), a model
+        # device newly flipping ON with no edge of its own is almost certainly
+        # the model pinning the unknown's watts on the nearest known family --
+        # exactly the "hair dryer detected as standing lamp" failure. Devices
+        # already ON, edge-claimed devices, and devices a recent on-edge named
+        # are untouched.
+        if unk_veto:
+            with self.lock:
+                recent_named = {ev["device"] for ev in self.events[-12:]
+                                if ev["kind"] == "edge_on"
+                                and now_ms - ev["unix_ms"] < (ws + 6) * 1000}
+            for nm in list(on_map):
+                if (on_map[nm] and nm not in claims
+                        and not prev_on.get(nm, False)
+                        and nm not in recent_named):
+                    on_map[nm] = False
+                    power_map[nm] = 0.0
+
         # -- merge edge claims over the model ----------------------------------
         # A claim forces the device ON with the watts its own switch-on step
         # measured; a fresh off-edge forces it OFF while the model window still
         # contains pre-switch samples. The model keeps authority over everything
-        # unclaimed, but its watts are rescaled into what the claims leave of
-        # the measured total (this is what splits "boiler at 1444 W" into
-        # boiler 943 W + lamp 501 W).
+        # unclaimed, but its watts are rescaled into what the claims (named and
+        # unknown) leave of the measured total (this is what splits "boiler at
+        # 1444 W" into boiler 943 W + lamp 501 W).
         for nm, c in claims.items():
             on_map[nm] = True
             power_map[nm] = c["W"]
@@ -1040,10 +1155,11 @@ class LiveEngine:
                 power_map[nm] = 0.0
                 src_map[nm] = "edge"
         claimed_W = sum(c["W"] for f, c in claims.items() if on_map.get(f))
+        unknown_W = sum(u["W"] for u in unk_claims)
         model_on = [nm for nm in on_map
                     if on_map[nm] and nm not in claims and math.isfinite(power_map.get(nm, 0.0))]
         pred_sum = sum(power_map[nm] for nm in model_on)
-        remaining = max(0.0, total_W - claimed_W)
+        remaining = max(0.0, total_W - claimed_W - unknown_W)
         if pred_sum > 1.0 and pred_sum > remaining:
             scale = remaining / pred_sum
             for nm in model_on:
@@ -1116,7 +1232,9 @@ class LiveEngine:
         with self.lock:
             if over:
                 if self._unknown_first is None:
-                    self._unknown_first = now_ms
+                    # an unmatched on-edge pinpoints the actual switch-on
+                    self._unknown_first = min(
+                        [now_ms] + [u["t_ms"] for u in unk_claims])
                 elif (self.unknown is None
                       and now_ms - self._unknown_first >= self.unknown_persist_s * 1000):
                     self.unknown = {"since_ms": int(self._unknown_first),
@@ -1544,6 +1662,11 @@ class LiveEngine:
                     "residual_W": self.residual_W,
                     "explained_frac": self.explained_frac,
                     "unknown": self.unknown,
+                    "unknown_loads": [
+                        {"W": round(u["W"], 1), "since_ms": u["t_ms"],
+                         "since_iso": datetime.fromtimestamp(u["t_ms"] / 1000.0)
+                         .astimezone().isoformat(timespec="seconds")}
+                        for u in self.unknown_claims],
                     "teach_guide": self.guide,
                     "teach_note": self._teach_note,
                     "replay_gt": self._gt_now}
@@ -1955,14 +2078,20 @@ async function pollState(){
       st.explained_frac!=null ? (100*st.explained_frac).toFixed(0)+"%" : "-";
 
     const box = document.getElementById("on-list");
-    if(!st.currently_on.length){
+    let cards = st.currently_on.map(d =>
+      '<div class="devcard"><span class="swatch" style="background:'+col(d.device)+'"></span>'+
+      '<div><div class="nm">'+d.device+'</div><div class="meta">since '+hms(d.since_iso)+
+      ' · conf '+(100*d.prob).toFixed(0)+'%'+(d.src==="edge" ? ' · edge' : '')+'</div></div>'+
+      '<span class="w">'+fmtW(d.power_W)+'</span></div>').join("");
+    cards += (st.unknown_loads||[]).map(u =>
+      '<div class="devcard" style="border-color:#6b5716"><span class="swatch" style="background:var(--warn)"></span>'+
+      '<div><div class="nm" style="color:var(--warn)">unknown device</div>'+
+      '<div class="meta">since '+hms(u.since_iso)+' · switch-on matched no signature</div></div>'+
+      '<span class="w">'+fmtW(u.W)+'</span></div>').join("");
+    if(!cards){
       box.textContent = "nothing recognized as ON";
     } else {
-      box.innerHTML = st.currently_on.map(d =>
-        '<div class="devcard"><span class="swatch" style="background:'+col(d.device)+'"></span>'+
-        '<div><div class="nm">'+d.device+'</div><div class="meta">since '+hms(d.since_iso)+
-        ' · conf '+(100*d.prob).toFixed(0)+'%'+(d.src==="edge" ? ' · edge' : '')+'</div></div>'+
-        '<span class="w">'+fmtW(d.power_W)+'</span></div>').join("");
+      box.innerHTML = cards;
     }
     if(Math.abs(st.residual_W) > 1 && st.currently_on.length){
       box.innerHTML += '<div class="devcard" style="opacity:.7"><span class="swatch" style="background:#555"></span>'+
