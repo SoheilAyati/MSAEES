@@ -14,10 +14,17 @@ live signal, and serves a dashboard that answers, continuously:
 and closes the loop when it does NOT know the answer:
 
     *  sustained unexplained power  ->  "Unknown device (~180 W) since 14:32:05
-       -- what is this?"  ->  you type a name  ->  the captured signature is
-       saved as a labelled recording  ->  scenarios are rebuilt and the model
-       is RETRAINED in the background  ->  hot-reloaded. Training on the go:
-       the next time that device runs, the system knows it.
+       -- what is this?"  ->  you type a name and pick ONE of two teach flows:
+         - guided/ISOLATED: disconnect everything, record only the new device
+           (cleanest data), or
+         - IN-MIX ("teach on the go"): every other device keeps running; only
+           the unknown device is toggled off -> baseline -> on -> recorded ->
+           off -> closing baseline, and its own signal is isolated by
+           baseline subtraction before being saved.
+       Either way the captured signature is saved as a labelled recording ->
+       scenarios are rebuilt and the model is RETRAINED in the background ->
+       hot-reloaded. Training on the go: the next time that device runs, the
+       system knows it.
 
 Usage
 -----
@@ -535,6 +542,59 @@ class Retrainer:
                     "elapsed_s": round(time.time() - self.started, 1) if self.started and not self.finished else None,
                     "took_s": round(self.finished - self.started, 1) if self.started and self.finished else None,
                     "log_tail": self.log_tail}
+
+
+# =============================================================================
+# In-mix teach capture buffer
+# =============================================================================
+class MixCapture:
+    """Accumulates live-buffer samples across an in-mix teach session.
+
+    The acquisition ring buffer only holds ~5 minutes; a slow user could
+    overrun it, so every wait/record loop of the in-mix flow calls collect()
+    to drain new samples into this unbounded store as they arrive."""
+
+    KEYS = ("t_ms", "P", "Q", "S", "PF", "P1", "P2", "P3", "THD")
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.chunks = {k: [] for k in self.KEYS}
+        self.last_t = 0
+
+    def collect(self):
+        arrs = self.engine._buffer_arrays()
+        if arrs is None:
+            return
+        sel = arrs["t_ms"] > self.last_t
+        if not sel.any():
+            return
+        for k in self.KEYS:
+            self.chunks[k].append(np.asarray(arrs[k])[sel])
+        self.last_t = int(arrs["t_ms"][sel][-1])
+
+    def arrays(self) -> dict:
+        return {k: (np.concatenate(self.chunks[k]) if self.chunks[k]
+                    else np.array([], dtype=float))
+                for k in self.KEYS}
+
+    def median(self, key: str, t0_ms: int, t1_ms: int) -> float:
+        a = self.arrays()
+        sel = (a["t_ms"] >= t0_ms) & (a["t_ms"] <= t1_ms)
+        return float(np.nanmedian(a[key][sel])) if sel.any() else float("nan")
+
+    def stats(self, t0_ms: int, t1_ms: int):
+        """Channel medians (plus P noise and time centre) over [t0, t1]."""
+        a = self.arrays()
+        if not a["t_ms"].size:
+            return None
+        sel = (a["t_ms"] >= t0_ms) & (a["t_ms"] <= t1_ms)
+        if int(sel.sum()) < 3:
+            return None
+        med = lambda k: float(np.nanmedian(a[k][sel]))   # noqa: E731
+        return {"P": med("P"), "Q": med("Q"), "P1": med("P1"),
+                "P2": med("P2"), "P3": med("P3"), "THD": med("THD"),
+                "P_std": float(np.nanstd(a["P"][sel])),
+                "t_ms": float(np.mean(a["t_ms"][sel])), "n": int(sel.sum())}
 
 
 # =============================================================================
@@ -1077,18 +1137,33 @@ class LiveEngine:
             if self.unknown is not None:
                 self.unknown["typical_W"] = round(residual, 1)
 
-    # ---- teach: GUIDED clean recording of exactly one device ----------------
-    # In-mix captures (baseline subtraction while other devices run) gave
-    # visibly worse models than a clean isolated recording, so teach now walks
-    # the user through the same protocol as the manual record button:
+    # ---- teach: two guided flows to capture exactly one device --------------
+    # mode='isolated' (default): clean recording, same protocol as the manual
+    # record button. Naive in-mix captures gave visibly worse models than a
+    # clean isolated recording, so this stays the recommended flow:
     #   disconnect everything -> 5 s off baseline -> connect the device ->
     #   teach_record_s ON -> disconnect -> 5 s off tail -> save -> retrain.
+    # mode='inmix' ("teach on the go"): when emptying the mains is impractical
+    # (fridge, router, a running experiment) the other devices KEEP RUNNING and
+    # only the unknown device is toggled:
+    #   device off -> settled background baseline A -> device on ->
+    #   teach_record_s of the mix -> device off -> closing baseline B.
+    # The device's own signal is isolated by subtracting the baseline,
+    # linearly interpolated A->B so slow background drift is removed too; if
+    # A and B disagree beyond a drift budget some OTHER device toggled
+    # mid-capture and the capture is DISCARDED instead of teaching the model a
+    # polluted signature (that validation is what the naive approach lacked).
     # Phase changes are driven by the measured power itself (no confirm
     # clicks); progress/instructions are shown via snapshot()["teach_guide"].
-    def teach(self, label: str, retrain: bool = True) -> dict:
+    def teach(self, label: str, retrain: bool = True,
+              mode: str = "isolated") -> dict:
         label = (label or "").strip()
         if not label:
             raise ValueError("empty device name")
+        mode = (mode or "isolated").strip().lower()
+        if mode not in ("isolated", "inmix"):
+            raise ValueError(f"unknown teach mode '{mode}' "
+                             "(use 'isolated' or 'inmix')")
         if self.svc.state != "connected":
             raise RuntimeError("meter not connected")
         with self.svc._lock:
@@ -1099,18 +1174,31 @@ class LiveEngine:
             if self._teach_thread is not None and self._teach_thread.is_alive():
                 raise RuntimeError("a teach session is already running")
             self._teach_cancel = False
+            # the unknown residual sizes the in-mix off/on thresholds
+            expected_W = None
+            if self.unknown is not None:
+                w = abs(float(self.unknown.get("typical_W") or 0.0))
+                expected_W = w if w > 0 else None
             self.unknown = None            # the guide takes over the prompt
             self._unknown_first = None
-        th = threading.Thread(target=self._teach_worker, daemon=True,
-                              args=(label, retrain), name="teach-guided")
+        if mode == "inmix":
+            th = threading.Thread(target=self._teach_inmix_worker, daemon=True,
+                                  args=(label, retrain, expected_W),
+                                  name="teach-inmix")
+            detail = ("in-mix capture started - other devices keep running; "
+                      "follow the instructions on the dashboard")
+        else:
+            th = threading.Thread(target=self._teach_worker, daemon=True,
+                                  args=(label, retrain), name="teach-guided")
+            detail = ("guided clean recording started - follow the "
+                      "instructions on the dashboard")
         with self.lock:
             self._teach_thread = th
         self._log_event(int(time.time() * 1000), "teach_recording",
                         nl.parse_family(label), None, None, None, None,
-                        detail="guided clean recording started - follow the "
-                               "instructions on the dashboard")
+                        detail=detail)
         th.start()
-        return {"scheduled": True, "guided": True, "label": label,
+        return {"scheduled": True, "guided": True, "label": label, "mode": mode,
                 "on_s": self.teach_record_s, "retrain": bool(retrain)}
 
     def cancel_teach(self) -> bool:
@@ -1220,6 +1308,228 @@ class LiveEngine:
             with self.lock:
                 self.guide = None
 
+    # ---- teach variant: IN-MIX capture ("teach on the go") ------------------
+    def _inmix_wait(self, cap: MixCapture, cond, hold_s, timeout_s,
+                    phase, msg_fmt):
+        """Like _wait_power but drains samples into the capture store on every
+        tick. Returns the last instantaneous watts, or None on timeout/cancel."""
+        held, t0, w = 0.0, time.time(), None
+        while time.time() - t0 < timeout_s:
+            if self._teach_cancel or not self._run_flag.is_set():
+                return None
+            cap.collect()
+            w = self._instant_W()
+            held = held + 0.5 if (w is not None and cond(w)) else 0.0
+            self._set_guide(phase, msg_fmt.format(w=w if w is not None else 0.0))
+            if held >= hold_s:
+                return w
+            time.sleep(0.5)
+        return None
+
+    def _inmix_baseline(self, cap: MixCapture, dur_s, phase, msg_fmt) -> dict:
+        """Capture a settled background baseline (channel medians over dur_s).
+        A noisy baseline (some background device still ramping) gets one more
+        attempt before it is accepted as-is -- the drift check between the two
+        baselines is the hard guard."""
+        st = None
+        for _ in range(2):
+            t0_ms, t0 = int(time.time() * 1000), time.time()
+            while time.time() - t0 < dur_s:
+                if self._teach_cancel or not self._run_flag.is_set():
+                    raise RuntimeError("cancelled")
+                cap.collect()
+                self._set_guide(phase, msg_fmt.format(
+                    left=max(0.0, dur_s - (time.time() - t0))))
+                time.sleep(0.5)
+            cap.collect()
+            st = cap.stats(t0_ms, int(time.time() * 1000))
+            if st is None:
+                raise RuntimeError("no samples captured for the baseline")
+            if st["P_std"] <= max(6.0, 0.05 * abs(st["P"])):
+                break
+        return st
+
+    def _teach_inmix_worker(self, label, retrain, expected_W=None):
+        cap = MixCapture(self)
+        base_s = 6.0
+        on_W_min = max(8.0, self.edge_min_W)
+        try:
+            ref = self._instant_W()
+            if ref is None:
+                raise RuntimeError("no live samples in the buffer yet")
+            drop_min = max(on_W_min, 0.3 * expected_W if expected_W else 0.0)
+            # 1. switch OFF only the unknown device; the background keeps running
+            if self._inmix_wait(cap, lambda w: w <= ref - drop_min, 3.0, 300.0,
+                    "inmix_off",
+                    f"Step 1/5 - keep every OTHER device running exactly as it "
+                    f"is; switch OFF only '{label}'. Waiting for a settled drop "
+                    f"of >= {drop_min:.0f} W (total now {{w:.0f}} W)") is None:
+                raise RuntimeError("timeout/cancel while waiting for the device "
+                                   "to switch off")
+            base_a = self._inmix_baseline(cap, base_s, "inmix_baseline_a",
+                    "Step 2/5 - measuring the background baseline, "
+                    "{left:.0f} s. Do not switch anything.")
+            # 2. switch it back ON
+            rise_min = max(on_W_min, 0.5 * max(0.0, ref - base_a["P"]))
+            if self._inmix_wait(cap, lambda w: w >= base_a["P"] + rise_min,
+                    2.0, 300.0, "inmix_on",
+                    f"Step 3/5 - now switch '{label}' back ON (leave the others "
+                    f"alone). Waiting for +{rise_min:.0f} W over the "
+                    f"{base_a['P']:.0f} W baseline (total now {{w:.0f}} W)") is None:
+                raise RuntimeError("timeout/cancel while waiting for the device "
+                                   "to switch on")
+            t_on_ms = int(time.time() * 1000)
+            # 3. record the mix with the device running
+            t0 = time.time()
+            while time.time() - t0 < self.teach_record_s:
+                if self._teach_cancel:
+                    raise RuntimeError("cancelled")
+                cap.collect()
+                left = self.teach_record_s - (time.time() - t0)
+                w = self._instant_W() or 0.0
+                self._set_guide("inmix_recording",
+                                f"Step 4/5 - recording '{label}' inside the mix "
+                                f"at {w:.0f} W total, {left:.0f} s left. Keep "
+                                "every device exactly as it is.")
+                time.sleep(0.5)
+            cap.collect()
+            t_off_req_ms = int(time.time() * 1000)
+            est_W = cap.median("P", t_on_ms, t_off_req_ms) - base_a["P"]
+            # 4. switch it OFF again -> closing baseline
+            cur = self._instant_W()
+            cur = cur if cur is not None else base_a["P"] + max(est_W, 0.0)
+            drop2 = max(on_W_min, 0.5 * max(est_W, 0.0))
+            if self._inmix_wait(cap, lambda w: w <= cur - drop2, 3.0, 300.0,
+                    "inmix_off2",
+                    f"Step 5/5 - switch '{label}' OFF again. Waiting for a "
+                    f"settled drop of >= {drop2:.0f} W (total now {{w:.0f}} W)") is None:
+                raise RuntimeError("timeout/cancel while waiting for the final "
+                                   "switch-off")
+            base_b = self._inmix_baseline(cap, base_s, "inmix_baseline_b",
+                    "Step 5/5 - measuring the closing baseline, "
+                    "{left:.0f} s. Do not switch anything.")
+            # 5. validate: if the background changed between the two baselines,
+            # another device toggled mid-capture -> the subtraction is invalid
+            drift = abs(base_b["P"] - base_a["P"])
+            drift_tol = max(15.0, 0.25 * max(est_W, on_W_min))
+            if drift > drift_tol:
+                raise RuntimeError(
+                    f"background changed by {drift:.0f} W during the capture "
+                    f"(budget {drift_tol:.0f} W) - another device must have "
+                    "switched. Keep the other devices steady and teach again")
+            iso = self._isolate_inmix(cap, base_a, base_b, t_on_ms, t_off_req_ms)
+            if iso["device_W"] < on_W_min:
+                raise RuntimeError(
+                    f"isolated signal is only {iso['device_W']:.0f} W - no "
+                    "measurable device found on top of the background")
+            path = self._save_inmix_recording(label, iso, base_a, base_b, drift)
+            self.models._load_signatures()
+            fname = os.path.basename(path)
+            self._log_event(int(time.time() * 1000), "taught",
+                            nl.parse_family(label), None, None, None, None,
+                            detail=f"in-mix capture isolated and saved ({fname}, "
+                                   f"{iso['n']} samples, ~{iso['device_W']:.0f} W "
+                                   f"on a {base_a['P']:.0f} W background, "
+                                   f"drift {drift:.0f} W)"
+                                   + ("; retraining" if retrain else ""))
+            with self.lock:
+                self._teach_note = (f"saved {fname} (in-mix, "
+                                    f"~{iso['device_W']:.0f} W isolated)"
+                                    + ("; retraining" if retrain else ""))
+            if retrain:
+                self.retrainer.start()
+        except Exception as e:            # noqa: BLE001
+            with self.lock:
+                self._teach_note = f"teach '{label}' (in-mix) aborted: {e}"
+        finally:
+            with self.lock:
+                self.guide = None
+
+    def _isolate_inmix(self, cap: MixCapture, base_a, base_b,
+                       t_on_ms, t_off_ms) -> dict:
+        """Isolated device channels = captured mix minus the background
+        baseline, interpolated linearly from baseline A to baseline B so slow
+        background drift (fridge duty cycle, PV) is subtracted as well."""
+        a = cap.arrays()
+        t = a["t_ms"].astype(np.int64)
+        span = max(1.0, base_b["t_ms"] - base_a["t_ms"])
+        frac = np.clip((t - base_a["t_ms"]) / span, 0.0, 1.0)
+
+        def base(k):
+            return base_a[k] + frac * (base_b[k] - base_a[k])
+
+        P = a["P"] - base("P")
+        Q = a["Q"] - base("Q")
+        P1 = a["P1"] - base("P1")
+        P2 = a["P2"] - base("P2")
+        P3 = a["P3"] - base("P3")
+        S = np.hypot(P, Q)
+        PF = np.divide(P, S, out=np.ones_like(P), where=S > 1e-6)
+        # THD_I: percentages do not subtract, harmonic CURRENTS of independent
+        # loads add ~orthogonally -> estimate the device's harmonic current by
+        # RSS subtraction and re-normalize to its own fundamental (nominal
+        # 230 V cancels out of mix vs baseline, it only scales both).
+        V = 230.0
+        i_f_mix = np.hypot(np.nan_to_num(a["P"]), np.nan_to_num(a["Q"])) / V
+        i_h_mix = a["THD"] / 100.0 * i_f_mix
+        i_f_base = np.hypot(base("P"), base("Q")) / V
+        i_h_base = (base_a["THD"] + frac * (base_b["THD"] - base_a["THD"])) \
+            / 100.0 * i_f_base
+        i_f_dev = np.hypot(P, Q) / V
+        with np.errstate(invalid="ignore"):
+            i_h_dev = np.sqrt(np.clip(i_h_mix ** 2 - i_h_base ** 2, 0.0, None))
+            THD = np.where(np.isfinite(i_h_dev) & (i_f_dev > 1e-3),
+                           100.0 * i_h_dev / np.maximum(i_f_dev, 1e-9), np.nan)
+        on_sel = (t >= t_on_ms) & (t <= t_off_ms)
+        device_W = float(np.nanmedian(P[on_sel])) if on_sel.any() else 0.0
+        return {"t_ms": t, "P_total": P, "Q_total": Q, "S_total": S,
+                "PF_total": PF, "P_L1": P1, "P_L2": P2, "P_L3": P3,
+                "THD_I_L1": THD, "device_W": device_W, "n": int(len(t))}
+
+    def _save_inmix_recording(self, label, iso, base_a, base_b, drift) -> str:
+        """Write the isolated signal as a standard recorder .h5 (same layout as
+        pac_reader's IncrementalHDF5Writer) so signatures, the scenario mixer,
+        and identify training consume it like any clean recording."""
+        channels = ["P_total", "Q_total", "S_total", "PF_total",
+                    "P_L1", "P_L2", "P_L3", "THD_I_L1"]
+        safe = pr._safe_label(label)
+        fname = f"{safe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.h5"
+        os.makedirs(self.models.recordings_dir, exist_ok=True)
+        path = os.path.join(self.models.recordings_dir, fname)
+        t_us = iso["t_ms"].astype(np.int64) * 1000
+        sr = float(self.svc.sample_rate_hz)
+        with h5py.File(path, "w") as f:
+            f.create_dataset("timestamp", data=t_us, compression="lzf")
+            m = f.create_group("measurements")
+            for ch in channels:
+                m.create_dataset(ch, data=np.asarray(iso[ch], dtype=np.float32),
+                                 compression="lzf")
+            md = f.create_group("metadata")
+            md.attrs["format_version"] = pr.FORMAT_VERSION
+            md.attrs["app_version"] = pr.APP_VERSION
+            md.attrs["sample_rate_hz"] = sr
+            md.attrs["anchor_datetime"] = datetime.fromtimestamp(
+                t_us[0] / 1e6, tz=timezone.utc).isoformat()
+            md.attrs["source"] = "live_teach_inmix"
+            md.attrs["appliance_label"] = label
+            md.attrs["channels"] = json.dumps(channels)
+            md.attrs["harmonics_enabled"] = False
+            md.attrs["teach_mode"] = "in_mix"
+            md.attrs["baseline_P_W"] = round(float(base_a["P"]), 1)
+            md.attrs["baseline_drift_W"] = round(float(drift), 1)
+            md.attrs["recording_summary"] = json.dumps({
+                "appliance_label": label,
+                "teach_mode": "in_mix",
+                "n_samples": int(iso["n"]),
+                "duration_s": round(iso["n"] / sr, 2) if sr > 0 else None,
+                "device_W_median": round(float(iso["device_W"]), 1),
+                "baseline_P_W": round(float(base_a["P"]), 1),
+                "baseline_drift_W": round(float(drift), 1),
+                "configured_sample_rate_hz": sr,
+                "harmonics_enabled": False,
+                "completed_utc": datetime.now(timezone.utc).isoformat()})
+        return path
+
     # ---- snapshots -----------------------------------------------------------
     def snapshot(self) -> dict:
         with self.lock:
@@ -1314,7 +1624,9 @@ def create_app(svc: pr.AcquisitionService, engine: LiveEngine,
     def api_teach():
         data = request.get_json(silent=True) or {}
         try:
-            res = engine.teach(data.get("label", ""), bool(data.get("retrain", True)))
+            res = engine.teach(data.get("label", ""),
+                               bool(data.get("retrain", True)),
+                               str(data.get("mode", "isolated")))
             return jsonify({"ok": True, **res})
         except Exception as e:            # noqa: BLE001
             return jsonify({"ok": False, "error": str(e)}), 400
@@ -1474,12 +1786,17 @@ LIVE_HTML = r"""<!DOCTYPE html>
       <b>Unknown device detected</b>
       <div class="small" style="margin-top:4px">
         ~<span id="unk-w">?</span> W of unexplained power since <span id="unk-since">?</span>.
-        What device is this? Name it and you will be guided through a clean
-        recording (disconnect everything, then connect only this device).
+        What device is this? Name it, then either record it in ISOLATION
+        (disconnect everything first - cleanest data) or teach it ON THE GO:
+        the other devices keep running and you only toggle this one device off
+        and on; its signal is isolated from the mix by baseline subtraction.
       </div>
       <div class="row">
         <input type="text" id="teach-name" placeholder="e.g. kettle">
-        <button class="primary" onclick="teach()">Teach&nbsp;(guided)</button>
+      </div>
+      <div class="row">
+        <button class="primary" onclick="teach('isolated')">Teach&nbsp;(isolated)</button>
+        <button class="warn" onclick="teach('inmix')">Teach&nbsp;on&nbsp;the&nbsp;go</button>
       </div>
     </div>
 
@@ -1799,11 +2116,11 @@ async function pollEvents(){
   }catch(e){}
 }
 
-async function teach(){
+async function teach(mode){
   const name = document.getElementById("teach-name").value.trim();
   if(!name) return alert("give the device a name first");
   const r = await j("/api/teach", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({label:name, retrain:true})});
+    body: JSON.stringify({label:name, retrain:true, mode:mode||"isolated"})});
   if(!r.ok) alert("teach failed: " + r.error);
   else document.getElementById("teach-name").value = "";
 }
