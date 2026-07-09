@@ -52,6 +52,7 @@ import glob
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -360,6 +361,34 @@ class ModelManager:
         with self.lock:
             self.variant = variant
         return self.reload()
+
+    # every frozen snapshot and the live (retraining-overwritten) file it
+    # shields; reset_to_original copies right over left
+    ORIGINAL_PAIRS = [
+        ("model_mix_original.joblib", "model_mix.joblib"),
+        ("model_identify_original.joblib", "model_identify.joblib"),
+        ("train_mix_metrics_original.json", "train_mix_metrics.json"),
+    ]
+
+    def reset_to_original(self) -> dict:
+        """Erase every non-original (train-on-the-go) model: the frozen
+        *_original snapshots are copied back over the live bundle names, so
+        the system starts clean as if no retraining had ever happened. The
+        snapshots themselves are never modified; recordings and scenarios are
+        untouched (taught devices keep their signatures and re-enter the
+        model on the next retrain)."""
+        if "original" not in self.variants():
+            raise RuntimeError("model_mix_original.joblib not found - there "
+                               "is no frozen original snapshot to reset to")
+        restored = []
+        with self.lock:
+            for src, dst in self.ORIGINAL_PAIRS:
+                s = os.path.join(self.models_dir, src)
+                if os.path.exists(s):
+                    shutil.copyfile(s, os.path.join(self.models_dir, dst))
+                    restored.append(dst)
+            self.variant = "latest"      # latest now IS the original
+        return {"restored": restored, "model": self.reload()}
 
     def _load_models(self):
         self.presence = self.power = None
@@ -1774,6 +1803,25 @@ def create_app(svc: pr.AcquisitionService, engine: LiveEngine,
         except Exception as e:            # noqa: BLE001
             return jsonify({"ok": False, "error": str(e)}), 400
 
+    @app.route("/api/model/reset", methods=["POST"])
+    def api_model_reset():
+        """Erase all non-original (train-on-the-go) models: the frozen
+        *_original snapshots are copied back over the live bundles and
+        hot-reloaded; the engine then re-matches its edge history against the
+        restored signatures automatically."""
+        if retrainer.status()["state"] == "running":
+            return jsonify({"ok": False, "error": "retraining is running - "
+                            "wait for it to finish first"}), 409
+        try:
+            res = models.reset_to_original()
+            engine._log_event(int(time.time() * 1000), "model_reset", "-",
+                              None, None, None, None,
+                              detail="non-original models erased; restored "
+                                     + ", ".join(res["restored"]))
+            return jsonify({"ok": True, **res})
+        except Exception as e:            # noqa: BLE001
+            return jsonify({"ok": False, "error": str(e)}), 400
+
     @app.route("/api/record/start", methods=["POST"])
     def api_record_start():
         data = request.get_json(silent=True) or {}
@@ -1940,6 +1988,9 @@ LIVE_HTML = r"""<!DOCTYPE html>
       </select>
       <div class="kv" id="model-kv"></div>
       <div class="small muted" id="model-devices" style="margin-top:8px"></div>
+      <button class="warn" id="model-reset-btn" onclick="modelReset()"
+              style="width:100%;margin-top:10px;display:none">
+        Erase retrained models (start clean from original)</button>
     </div>
 
     <div class="panel">
@@ -2035,6 +2086,8 @@ async function pollStatus(){
       if(sel.dataset.opts !== opts){ sel.innerHTML = opts; sel.dataset.opts = opts; }
       sel.value = m.variant || "latest";
     }
+    document.getElementById("model-reset-btn").style.display =
+      (m.variants||[]).includes("original") ? "" : "none";
 
     const kv = document.getElementById("model-kv");
     kv.innerHTML = "";
@@ -2259,6 +2312,13 @@ async function setVariant(v){
   const r = await j("/api/model", {method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify({variant:v})});
   if(!r.ok) alert("model switch failed: " + r.error);
+}
+async function modelReset(){
+  if(!confirm("Erase all retrained (non-original) models and restore the "+
+              "frozen original snapshot?\n\nRecordings are kept - taught "+
+              "devices re-enter the model on the next retrain.")) return;
+  const r = await j("/api/model/reset", {method:"POST"});
+  if(!r.ok) alert("reset failed: " + r.error);
 }
 async function simLoad(l){ await j("/api/sim/load", {method:"POST",
   headers:{"Content-Type":"application/json"}, body: JSON.stringify({level:l})}); }
