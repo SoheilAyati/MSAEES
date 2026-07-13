@@ -22,53 +22,43 @@
   ],
   "appliances": [
     "coffee_machine",
-    "laptop",
-    "pv",
     "standing_fan",
     "standing_lamp",
     "table_fan",
     "water_boiler"
   ],
   "on_W": 5.0,
-  "trained_utc": "2026-07-13T09:44:01+00:00",
+  "trained_utc": "2026-07-13T12:34:09+00:00",
   "n_windows": 2880,
-  "presence_macro_f1": 0.926250978251729,
+  "presence_macro_f1": 0.9808281375433218,
   "per_appliance_f1": {
-    "coffee_machine": 0.9451476793248945,
-    "laptop": 0.9648562300319489,
-    "pv": 0.8275862068965517,
-    "standing_fan": 0.9723756906077348,
-    "standing_lamp": 0.972027972027972,
-    "table_fan": 0.8298755186721992,
-    "water_boiler": 0.9718875502008032
+    "coffee_machine": 0.9879032258064516,
+    "standing_fan": 0.9976133651551312,
+    "standing_lamp": 0.9943074003795066,
+    "table_fan": 0.9281045751633987,
+    "water_boiler": 0.9962121212121212
   },
   "holdout_on_windows": {
-    "coffee_machine": 244,
-    "laptop": 161,
-    "pv": 67,
-    "standing_fan": 185,
-    "standing_lamp": 143,
-    "table_fan": 133,
-    "water_boiler": 251
+    "coffee_machine": 247,
+    "standing_fan": 210,
+    "standing_lamp": 264,
+    "table_fan": 162,
+    "water_boiler": 265
   },
-  "power_overall_mae_W": 6.2979840852323274,
+  "power_overall_mae_W": 4.1869196093401,
   "per_appliance_mae_W": {
-    "coffee_machine": 17.26243194753147,
-    "laptop": 1.0131330377117211,
-    "pv": 0.3271171566090976,
-    "standing_fan": 0.6512959600632754,
-    "standing_lamp": 5.421647763724501,
-    "table_fan": 0.8317437048196109,
-    "water_boiler": 18.578519026166607
+    "coffee_machine": 8.446862790686518,
+    "standing_fan": 0.38335568432511935,
+    "standing_lamp": 3.922945978688274,
+    "table_fan": 0.4577869049856761,
+    "water_boiler": 7.723646688014913
   },
-  "gated_overall_mae_W": 5.659396391383025,
+  "gated_overall_mae_W": 3.880629834971257,
   "per_appliance_gated_mae_W": {
-    "coffee_machine": 15.702910957044448,
-    "laptop": 0.835852230535351,
-    "pv": 0.38859840548705576,
-    "standing_fan": 0.6196127171609581,
-    "standing_lamp": 4.642318639894692,
-    "table_fan": 0.7895078204774721,
-    "water_boiler": 16.636973969081197
+    "coffee_machine": 7.960500152628816,
+    "standing_fan": 0.4238034961862123,
+    "standing_lamp": 3.6142893512910663,
+    "table_fan": 0.4127766761575366,
+    "water_boiler": 6.991779498592655
   }
 }
