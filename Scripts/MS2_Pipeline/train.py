@@ -31,6 +31,7 @@ Files are streamed one at a time, so memory stays small even for large corpora.
 from __future__ import annotations
 import argparse, datetime, glob, json, os, sys
 
+import h5py
 import numpy as np
 import pandas as pd
 import matplotlib; matplotlib.use("Agg")
@@ -138,23 +139,58 @@ def train_identify(files, args, out):
     print(f"  saved -> {out}/model_identify.joblib")
 
 
+def _scenario_harm_ok(sig, path) -> bool:
+    """Does this scenario carry a REAL aggregate current spectrum for the
+    loads it contains? The mixer stamps metadata.harmonics_complete when every
+    member recording had one (authoritative); without the stamp, fall back to
+    content: substantial power with a ~zero spectrum means some member was
+    recorded without harmonics and zero-filled."""
+    try:
+        with h5py.File(path, "r") as h:
+            if "metadata" in h and "harmonics_complete" in h["metadata"].attrs:
+                return bool(h["metadata"].attrs["harmonics_complete"])
+    except OSError:
+        pass
+    if sig.harm_I is None:
+        return False
+    energy = np.sqrt(np.nansum(np.asarray(sig.harm_I, float) ** 2, axis=1))
+    act = np.abs(np.nan_to_num(sig.P)) > 20.0
+    if not act.any():
+        return True
+    return float((energy[act] < 1e-4).mean()) <= 0.05
+
+
+def _agg_features_for(args, harm_ok: bool) -> list:
+    """Aggregate feature list for this training run. 'auto' keeps the five
+    harmonic columns only when EVERY scenario has a trustworthy spectrum --
+    a model must never learn 'family X = zero harmonics' from a recording
+    gap the live meter does not have."""
+    mode = getattr(args, "agg_features", "auto") or "auto"
+    if mode == "harm" or (mode == "auto" and harm_ok):
+        return list(nl.AGG_FEATURES)
+    return list(nl.AGG_FEATURES_BASE)
+
+
 def _collect_agg(files, args, what):
     """Stack aggregate windows + power/presence targets across scenario files,
-    with the appliance vocabulary derived from the data itself."""
+    with the appliance vocabulary derived from the data itself. Also reports
+    whether every file carried real harmonic content (drives the feature
+    choice in _agg_features_for)."""
     canon = nl.scan_canon(files)
     if not canon:
         sys.exit(f"{what} needs scenario .h5 files with /ground_truth")
-    Xs, Ys, gs, k = [], [], [], 0
+    Xs, Ys, gs, k, harm_ok = [], [], [], 0, True
     for f in files:                                   # stream one scenario at a time
         s = nl.load_signal(f)
         if s.gt_P is None:
             del s; continue
+        harm_ok = harm_ok and _scenario_harm_ok(s, f)
         X, Y, _ = nl.aggregate_windows(s, args.window, canon=canon)
         Xs.append(X); Ys.append(Y); gs.append(np.full(len(X), k)); k += 1
         del s
     if not Xs:
         sys.exit(f"{what} needs scenario .h5 files with /ground_truth")
-    return np.vstack(Xs), np.vstack(Ys), np.concatenate(gs), k, canon
+    return np.vstack(Xs), np.vstack(Ys), np.concatenate(gs), k, canon, harm_ok
 
 
 def _agg_split(X, Y, g, k):
@@ -164,22 +200,25 @@ def _agg_split(X, Y, g, k):
 
 
 def train_disaggregate(files, args, out):
-    X, Y, g, k, names = _collect_agg(files, args, "disaggregate")
+    X, Y, g, k, names, harm_ok = _collect_agg(files, args, "disaggregate")
+    feats = _agg_features_for(args, harm_ok)
+    X = X[:, :len(feats)]
     print(f"disaggregation: {X.shape[0]} windows from {k} scenarios, "
-          f"{len(names)} appliances: {', '.join(names)}")
+          f"{len(names)} appliances: {', '.join(names)} | {len(feats)} features"
+          + ("" if harm_ok else " (harmonic columns dropped: corpus incomplete)"))
     tr, te = _agg_split(X, Y, g, k)
     base = (_lgbm_reg() if args.model == "lgbm"
             else RandomForestRegressor(n_estimators=200, random_state=0, n_jobs=-1))
     model = MultiOutputRegressor(base).fit(X[tr], Y[tr])
     P = model.predict(X[te])
     per = {names[i]: float(mean_absolute_error(Y[te][:, i], P[:, i])) for i in range(len(names))}
-    metrics = {"task": "disaggregate", "model": args.model, "features": nl.AGG_FEATURES,
+    metrics = {"task": "disaggregate", "model": args.model, "features": feats,
                "appliances": names, "trained_utc": _now_utc(), "n_windows": int(X.shape[0]),
                "overall_mae_W": float(np.mean(list(per.values()))),
                "per_appliance_mae_W": per}
     print(f"  held-out overall MAE={metrics['overall_mae_W']:.1f} W")
     print("  per-appliance MAE(W): " + ", ".join(f"{a}={v:.0f}" for a, v in per.items()))
-    joblib.dump({"task": "disaggregate", "model": model, "features": nl.AGG_FEATURES,
+    joblib.dump({"task": "disaggregate", "model": model, "features": feats,
                  "appliances": names, "window_s": args.window, "metrics": metrics},
                 os.path.join(out, "model_disaggregate.joblib"))
     json.dump(metrics, open(os.path.join(out, "train_disaggregate_metrics.json"), "w"), indent=2)
@@ -201,17 +240,20 @@ def _base_clf(kind):
 
 def train_presence(files, args, out):
     """Multi-label: for each aggregate window predict which appliances are ON."""
-    X, Yp, g, k, names = _collect_agg(files, args, "presence")
+    X, Yp, g, k, names, harm_ok = _collect_agg(files, args, "presence")
+    feats = _agg_features_for(args, harm_ok)
+    X = X[:, :len(feats)]
     Y = (np.abs(Yp) > args.on_w).astype(int)
     print(f"presence: {X.shape[0]} windows from {k} scenarios, {Y.shape[1]} appliances "
-          f"(on > {args.on_w:g} W)")
+          f"(on > {args.on_w:g} W) | {len(feats)} features"
+          + ("" if harm_ok else " (harmonic columns dropped: corpus incomplete)"))
     tr, te = _agg_split(X, Y, g, k)
     # presence uses RandomForest: robust to always-on appliances (single-class
     # columns like baseload) that would break a per-output LightGBM.
     model = MultiOutputClassifier(_base_clf("rf")).fit(X[tr], Y[tr])
     Pp = np.asarray(model.predict(X[te]))
     per, macro, support = nl.presence_f1(Y[te], Pp, names)
-    metrics = {"task": "presence", "model": "rf", "features": nl.AGG_FEATURES,
+    metrics = {"task": "presence", "model": "rf", "features": feats,
                "appliances": names, "on_W": args.on_w, "trained_utc": _now_utc(),
                "n_windows": int(X.shape[0]),
                "macro_f1": macro, "per_appliance_f1": per,
@@ -220,7 +262,7 @@ def train_presence(files, args, out):
           f"(over appliances present in the held-out set)")
     print("  per-appliance F1: " + ", ".join(
         f"{a}={v:.2f}" if v is not None else f"{a}=n/a" for a, v in per.items()))
-    joblib.dump({"task": "presence", "model": model, "features": nl.AGG_FEATURES,
+    joblib.dump({"task": "presence", "model": model, "features": feats,
                  "appliances": names, "window_s": args.window, "on_W": args.on_w,
                  "metrics": metrics},
                 os.path.join(out, "model_presence.joblib"))
@@ -232,10 +274,13 @@ def train_mix(files, args, out):
     """Presence + disaggregation together: ONE bundle that answers both
     'which appliances are ON' and 'how much power does each draw' per window.
     This is the model the live monitor uses."""
-    X, Ypow, g, k, names = _collect_agg(files, args, "mix")
+    X, Ypow, g, k, names, harm_ok = _collect_agg(files, args, "mix")
+    feats = _agg_features_for(args, harm_ok)
+    X = X[:, :len(feats)]
     Yon = (np.abs(Ypow) > args.on_w).astype(int)
     print(f"mix (presence+disaggregate): {X.shape[0]} windows from {k} scenarios, "
-          f"{len(names)} appliances: {', '.join(names)}")
+          f"{len(names)} appliances: {', '.join(names)} | {len(feats)} features"
+          + ("" if harm_ok else " (harmonic columns dropped: corpus incomplete)"))
     tr, te = _agg_split(X, Ypow, g, k)
 
     presence = MultiOutputClassifier(_base_clf("rf")).fit(X[tr], Yon[tr])
@@ -252,7 +297,7 @@ def train_mix(files, args, out):
     # honest end-to-end error of what the live monitor actually displays
     per_mae_gated = {names[i]: float(mean_absolute_error(Ypow[te][:, i], Pw[:, i] * Pon[:, i]))
                      for i in range(len(names))}
-    metrics = {"task": "mix", "model": args.model, "features": nl.AGG_FEATURES,
+    metrics = {"task": "mix", "model": args.model, "features": feats,
                "appliances": names, "on_W": args.on_w, "trained_utc": _now_utc(),
                "n_windows": int(X.shape[0]),
                "presence_macro_f1": macro_f1,
@@ -270,7 +315,7 @@ def train_mix(files, args, out):
         f"{a}={v:.2f}" if v is not None else f"{a}=n/a" for a, v in per_f1.items()))
     print("  per-appliance MAE(W): " + ", ".join(f"{a}={v:.0f}" for a, v in per_mae.items()))
     joblib.dump({"task": "mix", "presence": presence, "power": power,
-                 "features": nl.AGG_FEATURES, "appliances": names,
+                 "features": feats, "appliances": names,
                  "window_s": args.window, "on_W": args.on_w, "metrics": metrics},
                 os.path.join(out, "model_mix.joblib"))
     json.dump(metrics, open(os.path.join(out, "train_mix_metrics.json"), "w"), indent=2)
@@ -303,6 +348,15 @@ def main():
                     help="mlp = neural network on the raw waveform (disaggregate/presence)")
     ap.add_argument("--features", choices=["auto", "common", "full"], default="auto",
                     help="identify only; 'common' = real-PAC4200 compatible")
+    ap.add_argument("--agg-features", choices=["auto", "base", "harm"], default="base",
+                    help="mix/presence/disaggregate feature set. 'base' (default) "
+                         "= the 17 P/Q/PF/step features; measured on the real "
+                         "mixed recordings it beats the harmonic set (set-F1 "
+                         "0.767 vs 0.674, which also hallucinated big devices). "
+                         "'harm' appends the 5 aggregate-spectrum columns; "
+                         "'auto' = harm only when every scenario carries a real "
+                         "spectrum. Revisit after the per-order features are "
+                         "re-validated on a fully re-recorded corpus.")
     ap.add_argument("--out", default=os.path.join(HERE, "output"))
     ap.add_argument("--window", type=float, default=30.0)
     ap.add_argument("--stride", type=float, default=30.0)

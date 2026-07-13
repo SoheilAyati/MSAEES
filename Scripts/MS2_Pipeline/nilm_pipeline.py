@@ -163,14 +163,21 @@ FEATURES_FULL = FEATURES_COMMON + FEATURES_HARM
 # power step inside the window, the reactive step at the same instant, and how
 # many steps occurred. Steady-state sums cannot tell "boiler + lamp" from
 # "boiler drawing more", but the switch-on step identifies the joining device.
-AGG_FEATURES = ["Ptot_mean", "Ptot_std", "Ptot_min", "Ptot_max", "Qtot_mean",
-                "PL1_mean", "PL2_mean", "PL3_mean", "PF_mean", "THDI_mean", "hour",
-                "Qtot_std", "QP_ratio", "Stot_mean",
-                "Pstep_max", "Qstep_at_Pstep", "n_steps",
-                # per-order harmonic content of the aggregate current (window
-                # means of the per-sample series from harm_series; zero when
-                # the source carries no spectrum). Appended per the rule above.
-                "h3_mean", "h5_mean", "h7_mean", "h_centroid_mean", "h_energy_mean"]
+AGG_FEATURES_BASE = ["Ptot_mean", "Ptot_std", "Ptot_min", "Ptot_max", "Qtot_mean",
+                     "PL1_mean", "PL2_mean", "PL3_mean", "PF_mean", "THDI_mean", "hour",
+                     "Qtot_std", "QP_ratio", "Stot_mean",
+                     "Pstep_max", "Qstep_at_Pstep", "n_steps"]
+# per-order harmonic content of the aggregate current (window means of the
+# per-sample series from harm_series; zero when the source carries no
+# spectrum). Appended per the rule above. train.py only KEEPS these columns
+# when every training source carries a real spectrum: a corpus where some
+# device was recorded without harmonics (e.g. an in-mix teach capture) would
+# otherwise teach the model "this family = zero harmonics" while the live
+# meter always measures real content -- a systematic train/live mismatch
+# that shows up as phantom detections.
+AGG_FEATURES_HARM = ["h3_mean", "h5_mean", "h7_mean", "h_centroid_mean",
+                     "h_energy_mean"]
+AGG_FEATURES = AGG_FEATURES_BASE + AGG_FEATURES_HARM
 
 
 def slice_features(X, bundle_features):

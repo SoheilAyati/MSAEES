@@ -97,13 +97,23 @@ def load_pac(path: str) -> dict:
         lab = h["metadata"].attrs.get("appliance_label", os.path.basename(path))
         lab = lab.decode() if isinstance(lab, (bytes, bytearray)) else lab
     n = len(P)
+    # a recording HAS harmonics only when a spectrum exists and is not all
+    # zeros (pre-2026-07 recordings carry zero-filled spectra from the
+    # unverified FC-0x14 file numbers; in-mix teach captures carry none).
+    # Members without real spectra are zero-filled below so the aggregate
+    # still builds -- but the scenario gets stamped harmonics_complete=False
+    # and train.py then drops the harmonic feature columns rather than teach
+    # the model a fake "this device has no harmonic content" signature.
+    has_harm = bool(him is not None
+                    and np.isfinite(np.asarray(him, np.float64)).any()
+                    and float(np.nanmax(np.abs(np.asarray(him, np.float64)))) > 1e-9)
     if him is None:
         him = np.zeros((n, N_HARMONICS), np.float32)
     if hip is None:
         hip = np.zeros((n, N_HARMONICS), np.float32)
     return dict(P=P, Q=Q, h_mag=np.asarray(him, np.float32),
                 h_phase=np.asarray(hip, np.float32), sr=sr, label=str(lab), n=n,
-                family=family(str(lab)))
+                family=family(str(lab)), has_harm=has_harm)
 
 
 def _tile_to(arr: np.ndarray, N: int) -> np.ndarray:
@@ -305,7 +315,10 @@ def build(args) -> None:
         pool.setdefault(r["family"], []).append(r)
     fam_names = sorted(pool)
     print(f"{len(recs)} recordings in {len(fam_names)} families: "
-          + ", ".join(f"{f}({len(pool[f])})" for f in fam_names))
+          + ", ".join(
+              f"{f}({len(pool[f])}"
+              + ("" if all(r.get("has_harm") for r in pool[f]) else ", no-harm")
+              + ")" for f in fam_names))
 
     N = int(round(args.duration * args.rate))
     anchor = datetime(2026, 6, 10, 12, 0, 0, tzinfo=timezone.utc)  # shared anchor
@@ -344,9 +357,11 @@ def build(args) -> None:
         tmp = tempfile.mkdtemp(prefix=f"scn{k}_")
         try:
             app_files = []
+            harm_complete = True
             for i, fam in enumerate(chosen):
                 variants = pool[fam]
                 rec = variants[int(rng.integers(0, len(variants)))]
+                harm_complete = harm_complete and rec.get("has_harm", False)
                 ap = os.path.join(tmp, f"{fam}_{i + 1}.h5")
                 write_appliance(ap, rec, N, args.rate, anchor, name=fam,
                                 instance_id=i + 1, rng=rng,
@@ -355,13 +370,18 @@ def build(args) -> None:
             a = agg.aggregate(app_files, scenario_seed=int(rng.integers(0, 1_000_000)))
             out = os.path.join(args.out, f"measured_scenario_{k:02d}.h5")
             agg.write_scenario(out, a, tier="measured")
+            # authoritative stamp for train.py's harmonic-feature policy
+            with h5py.File(out, "a") as fh:
+                md = fh["metadata"] if "metadata" in fh else fh.create_group("metadata")
+                md.attrs["harmonics_complete"] = bool(harm_complete)
             if args.plot:
                 _plot_scenario(out, os.path.join(
                     args.out, f"measured_scenario_{k:02d}_decomposition.png"))
             p_peak = float(np.abs(a["P_total"]).max())
             manifest.append({"scenario": os.path.basename(out), "appliances": chosen,
                              "duration_s": args.duration, "n_samples": N,
-                             "P_total_peak_W": round(p_peak, 1)})
+                             "P_total_peak_W": round(p_peak, 1),
+                             "harmonics_complete": bool(harm_complete)})
             print(f"  [{k:02d}] measured_scenario_{k:02d}.h5  <-  {chosen}"
                   f"   (P_total peak {p_peak:.0f} W)")
         finally:
