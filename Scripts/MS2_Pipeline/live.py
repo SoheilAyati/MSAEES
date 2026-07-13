@@ -355,6 +355,7 @@ class ModelManager:
         self.loaded_utc = None
         self.variant = "latest"          # 'latest' | 'original'
         self.reload_seq = 0
+        self.use_ih = False              # IH matching term, see note above
         self.signatures: list = []       # [{family, label, P, Q, IH}]
         # family -> steady OPERATING MODES, distilled from the signatures:
         # [{label, P, Q}] sorted by watts ('table_fan' -> low 10.6 W / high
@@ -492,8 +493,17 @@ class ModelManager:
         one mode: sub-mode variance is noise here, and every extra pseudo-mode
         multiplies the transition pairs the small-step matcher must
         disambiguate. Families keep their modes sorted by watts."""
+        # rotation/swing variants are a MODIFIER, not a speed: merging
+        # standing_fan_high (30.4 W) with _high_rotate (33.0 W) shifted the
+        # 'high' mode to 31.7 and made high->med (-5.6 W) a metric twin of
+        # the table fan's high->low (-5.8 W) -- the exact ambiguity this
+        # matcher must resolve. Rotation toggles themselves are ~2.6 W,
+        # below the mode-step threshold, so nothing is lost by skipping them.
+        ROT = {"rotate", "rotating", "rotation", "swing", "withswing"}
         by_fam: dict = {}
         for s in sigs:
+            if ROT & set(str(s["label"]).lower().split("_")):
+                continue
             by_fam.setdefault(s["family"], []).append(s)
         modes = {}
         for fam, ss in by_fam.items():
@@ -518,9 +528,17 @@ class ModelManager:
     # THD-derived harmonic current is an RSS DIFFERENCE of two estimates, so
     # for small steps its noise rivals the signal (a fan's whole IH is
     # ~0.008 A). Below this step magnitude the IH term is ignored -- P and Q
-    # decide alone, exactly as they did on the branch's parent. Big steps
-    # (toaster, hair dryer, boiler: the cases the IH term exists for) keep it.
+    # decide alone, exactly as they did on the branch's parent.
     IH_MIN_STEP = 60.0
+    # The IH term is OFF by default (use_ih, --ih-matching): measured on the
+    # 2026-07-13 choreo recordings it vetoed CORRECT matches twice -- the
+    # coffee machine's harmonic current varies 5x across its brew cycle
+    # (grinder burst 0.58 A vs recorded median 0.13 A -> tIH +8.9), and the
+    # meter's ~2.3 % THD floor scales with fundamental current, so a clean
+    # 930 W boiler 'gains' 0.13 A of phantom harmonics at switch-on
+    # (tIH +0.69 degraded a 0.89 match below the claim bar). Its one win
+    # (hair dryer at lamp watts) is preserved behind the flag for devices
+    # with genuinely strong, stationary harmonics.
 
     def match_edge(self, dP: float, dQ: float, ih=None, q_tol_scale: float = 1.0,
                    q_noise: float = 0.0):
@@ -551,7 +569,7 @@ class ModelManager:
                 tol_Q = (max(8.0, 0.25 * abs(s["Q"]) + 0.05 * abs(s["P"]))
                          + 1.5 * max(0.0, q_noise)) * q_tol_scale
                 terms = [(dP - s["P"]) / tol_P, (dQ - s["Q"]) / tol_Q]
-                if (ih is not None and math.isfinite(ih)
+                if (self.use_ih and ih is not None and math.isfinite(ih)
                         and s.get("IH") is not None
                         and math.hypot(dP, dQ) >= self.IH_MIN_STEP):
                     terms.append((ih - s["IH"]) / max(0.05, 0.35 * s["IH"]))
@@ -660,7 +678,12 @@ class ModelManager:
                             continue
                         dp_sig = b["P"] - a["P"]
                         dq_sig = b["Q"] - a["Q"]
-                        t_p = (dP - dp_sig) / max(2.5, 0.30 * abs(dp_sig))
+                        # tight dP floor (1.2 W): mode edges only fire on
+                        # near-flat plateaus, so the step medians resolve to
+                        # ~0.3 W -- and 1.2 W is exactly what separates the
+                        # table fan's -5.8 W drop from the standing fan's
+                        # -4.3 W high->med at the same moment
+                        t_p = (dP - dp_sig) / max(1.2, 0.30 * abs(dp_sig))
                         t_q = (dQ - dq_sig) / (max(3.5, 0.35 * abs(dq_sig))
                                                + 1.5 * max(0.0, q_noise))
                         # the anchor error joins the distance (half weight):
@@ -1472,6 +1495,24 @@ class LiveEngine:
         if not m or m["confidence"] < 0.45 or on_map.get(m["family"]):
             return None
         fam = m["family"]
+        # a kilowatt-class residual while big UNMATCHED edges are still
+        # churning is a cycling load mid-transition (coffee heater bursts),
+        # not a silently-started device -- naming it would pin the watts on
+        # whatever big family sits nearest (the boiler). The legitimate case
+        # this path exists for (engine started while the boiler was already
+        # running) has a QUIET edge history.
+        with self.models.lock:
+            fam_min = min((abs(s["P"]) for s in self.models.signatures
+                           if s["family"] == fam), default=0.0)
+        if fam_min >= self.big_edge_min_W:
+            with self.lock:
+                churn = any(e["kind"].startswith("edge_")
+                            and e["device"] == "unrecognized"
+                            and abs(e.get("dP_W") or 0.0) >= 300.0
+                            and now_ms - e["unix_ms"] < 30000
+                            for e in self.events[-20:])
+            if churn:
+                return None
         with self.lock:
             t0 = int(self._unknown_first or now_ms)
             self.claims[fam] = {"W": abs(float(residual)), "Q": float(q_res),
@@ -3110,6 +3151,11 @@ def main():
                    help="families whose smallest signature exceeds this can "
                         "only switch ON via a real step, never by window-"
                         "model vote alone (kills phantom boiler/coffee)")
+    p.add_argument("--ih-matching", action="store_true",
+                   help="EXPERIMENTAL: include the harmonic-current term in "
+                        "edge matching (off by default: the meter's ~2.3%% "
+                        "THD floor and cycle-varying devices made it veto "
+                        "correct matches; see ModelManager.IH_MIN_STEP note)")
     p.add_argument("--web-port", type=int, default=8300)
     p.add_argument("--no-browser", action="store_true")
     args = p.parse_args()
@@ -3152,6 +3198,7 @@ def main():
     svc = pr.AcquisitionService(reader, args.rate, args.recordings_dir,
                                 write_harmonics=harmonics)
     models = ModelManager(args.models_dir, args.recordings_dir)
+    models.use_ih = bool(args.ih_matching)
     retrainer = Retrainer(models, args.scenarios_dir,
                           window_s=args.retrain_window, on_w=args.on_w)
     engine = LiveEngine(svc, models, retrainer, session_dir,
