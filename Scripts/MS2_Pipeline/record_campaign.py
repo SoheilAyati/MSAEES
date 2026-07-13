@@ -177,6 +177,17 @@ DEFAULT_PLAN = [
                            "SAME moment, then start the brew immediately", 300),
                 ("hold", 120),
                 ("switch", "turn BOTH fully OFF together", 300)]),
+    # -- third pass: thermal states discovered in the 2026-07-13 mixes --------
+    # Next to the boiler the HOT machine brewed at ~700 W steady -- a state no
+    # signature covers (solo cold brew: ~1215-1307 W). Same suspicion for the
+    # kettle: 967 W from cold vs ~1011 W observed on the re-boil.
+    dict(label="coffee_machine_run", kind="single", on_s=120, min_delta_W=4,
+         note="HOT-MACHINE brew: brew one cup, wait ~2 min with the machine "
+              "ON, then record a SECOND brew back-to-back -- captures the "
+              "reduced ~700 W hot-brew state seen next to the boiler"),
+    dict(label="water_boiler_on", kind="single", on_s=60, min_delta_W=300,
+         note="RE-BOIL: boil once, then record switching the still-hot "
+              "kettle on again -- the hot element draws differently"),
     # -- sunny-day items (PV must actually generate!) -------------------------
     dict(label="pv_only", kind="single", on_s=180, min_delta_W=8, sunny=True,
          note="SUNNY DAY ONLY: connect the PV panel, nothing else. Total "

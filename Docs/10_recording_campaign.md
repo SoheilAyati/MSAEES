@@ -109,3 +109,14 @@ synthetic versions of both problems):
 * claim reconciliation pauses while a ≥25 W level change is still
   transiting the edge-detector window (it used to race the detector and
   kill the coffee claim before its off-edge could be read).
+
+## Third pass: thermal states (found in the 2026-07-13 second-pass mixes)
+
+The coffee machine brews at **~1215–1307 W from cold** but only **~700 W
+when already hot** (measured next to the boiler in both mix recordings) —
+a steady state no signature covered. The kettle showed the same drift
+(967 W cold, ~1011 W on the re-boil). Two items added: a HOT-machine
+second brew (`coffee_machine_run`, 120 s) and a RE-BOIL
+(`water_boiler_on`, 60 s). Until the hot-brew recording exists, a
+simultaneous boiler+hot-coffee start can mis-story or go unknown (the
+staggered case already resolves correctly via the model + vetoes).

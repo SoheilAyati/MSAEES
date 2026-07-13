@@ -1368,20 +1368,32 @@ class LiveEngine:
                 return
             # off-edge: release the claim it belongs to
             drop = dev if (dev != "unrecognized" and dev in self.claims) else None
-            drop_unk = None
+            drop_unk = drop_model = None
             if drop is None:
-                # signature match failed (or named an unclaimed device): release
-                # the active claim -- named or unknown -- whose watts best
-                # explain the drop instead
+                # signature match failed (or named an unclaimed device):
+                # release whatever the drop best explains -- a named claim, an
+                # unknown load, or a MODEL-tracked device. Model devices must
+                # compete here: a hot coffee machine drawing 716 W (a state no
+                # signature knows) was model-tracked at exactly 716 W, yet its
+                # off-step got 'released' as the boiler's 967 W claim (26 %
+                # error, inside the 35 % gate) because only claims were
+                # candidates -- killing the boiler that was still heating.
                 best_err = 0.35
                 for fam, c in self.claims.items():
                     err = abs(abs(edge["dP"]) - c["W"]) / max(c["W"], 20.0)
                     if err < best_err:
-                        drop, drop_unk, best_err = fam, None, err
+                        drop, drop_unk, drop_model, best_err = fam, None, None, err
                 for i, u in enumerate(self.unknown_claims):
                     err = abs(abs(edge["dP"]) - u["W"]) / max(u["W"], 20.0)
                     if err < best_err:
-                        drop, drop_unk, best_err = None, i, err
+                        drop, drop_unk, drop_model, best_err = None, i, None, err
+                for fam, v in self.state.items():
+                    w = v.get("power_W")
+                    if (v.get("on") and fam not in self.claims
+                            and w is not None and math.isfinite(w) and w > 0):
+                        err = abs(abs(edge["dP"]) - float(w)) / max(float(w), 20.0)
+                        if err < best_err:
+                            drop, drop_unk, drop_model, best_err = None, None, fam, err
             if drop is not None:
                 released = self.claims.pop(drop, None)
                 self.forced_off[drop] = int(edge["t_ms"]) + flush_ms
@@ -1404,6 +1416,10 @@ class LiveEngine:
                 # the window still holds pre-drop samples that could tempt the
                 # model into naming the leftover watts: keep the veto up
                 self._unknown_flush_until = int(edge["t_ms"]) + flush_ms
+            elif drop_model is not None:
+                # the drop belongs to a model-tracked device: hold IT off
+                # while the window flushes; every claim stays untouched
+                self.forced_off[drop_model] = int(edge["t_ms"]) + flush_ms
             elif dev != "unrecognized":
                 # no claim existed (device was on before the engine started),
                 # but the step names it: hold it off while the window flushes

@@ -18,7 +18,7 @@
     "h_energy"
   ],
   "split": "stratified rows (one instance per class)",
-  "n_windows": 295,
+  "n_windows": 341,
   "classes": [
     "coffee_machine",
     "standing_fan",
@@ -26,7 +26,7 @@
     "table_fan",
     "water_boiler"
   ],
-  "trained_utc": "2026-07-13T12:34:56+00:00",
-  "holdout_macro_f1": 0.9738181818181818,
-  "holdout_accuracy": 0.9864864864864865
+  "trained_utc": "2026-07-13T14:03:13+00:00",
+  "holdout_macro_f1": 0.9595959595959596,
+  "holdout_accuracy": 0.9883720930232558
 }
