@@ -78,3 +78,34 @@ they score the model (`infer.py` set-accuracy) and the engine
    `edge_on` for both fans and a `mode_change` event naming the right fan.
 3. If everything scores, freeze the new originals (copy the three
    `*_original` files) and archive the old top-level recordings.
+
+## Second pass (2026-07-13 evening): live-test problem cases
+
+Live testing surfaced two failures; five items were added to the plan
+(inserted before the sunny-day items — run `--list` for current numbers,
+or select them with `--only fan_low,coffee`):
+
+| Item | Kind | Why |
+|------|------|-----|
+| `table_fan_low__standing_fan_low` | choreo | **problem case**: the 34 W both-low sum reads like standing_fan HIGH alone; table fan toggled mid-mix |
+| `table_fan_low__standing_fan_high` | choreo | cross combo the corpus lacked |
+| `coffee_machine_run` (2nd variant) | single 210 s | FULL cycle from cold — grinder/pump phases enter training |
+| `coffee_machine_run__water_boiler_on` | choreo | **problem case**: full brew (grinding) next to a running boiler |
+| `coffee_machine_run__water_boiler_on` (2nd) | choreo | both big devices ON at the same moment |
+
+Engine changes shipped with them (already replay-verified against
+synthetic versions of both problems):
+
+* pair-vs-single edge decisions now compare raw **distances** (whichever
+  hypothesis fits tighter wins by a 0.15 margin) instead of only trying
+  pairs when the single match is weak — this is what splits both-low;
+* rotation/swing recordings are excluded from the **matching** signature
+  table (they still train the model): `standing_fan_high_rotate`
+  (33.0 W/52.1 var) was a near-exact twin of both-fans-low (34.0/52.8);
+* a claimed device whose ± step lands on another of its known states now
+  **changes state instead of switching off** — the coffee heater's
+  ±1160 W duty cycle keeps one continuous coffee claim tracking
+  1206 ↔ 46 W;
+* claim reconciliation pauses while a ≥25 W level change is still
+  transiting the edge-detector window (it used to race the detector and
+  kill the coffee claim before its off-edge could be read).

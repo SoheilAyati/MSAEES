@@ -140,6 +140,43 @@ DEFAULT_PLAN = [
                 ("hold", 45), ("switch", "turn the BOILER OFF", 300),
                 ("hold", 8), ("switch", "turn the LAMP OFF", 300),
                 ("hold", 8), ("switch", "turn the fan OFF", 8)]),
+    # -- second pass 2026-07-13: live-test problem cases ----------------------
+    dict(label="table_fan_low__standing_fan_low", kind="choreo",
+         note="PROBLEM CASE: both fans on LOW -- their 34 W sum reads like "
+              "standing_fan HIGH alone; table fan also toggled mid-mix",
+         steps=[("switch", "turn the STANDING fan ON at LOW (speed 1)", 12),
+                ("hold", 20), ("switch", "turn the TABLE fan ON at LOW", 6),
+                ("hold", 45), ("switch", "turn the TABLE fan OFF", 6),
+                ("hold", 15), ("switch", "turn the TABLE fan back ON at LOW", 6),
+                ("hold", 20), ("switch", "turn BOTH fans OFF together", 20)]),
+    dict(label="table_fan_low__standing_fan_high", kind="choreo",
+         note="cross combo: table fan LOW next to standing fan HIGH",
+         steps=[("switch", "turn the STANDING fan ON at HIGH", 15),
+                ("hold", 20), ("switch", "turn the TABLE fan ON at LOW", 6),
+                ("hold", 45), ("switch", "turn the TABLE fan OFF", 6),
+                ("hold", 10), ("switch", "turn the STANDING fan OFF", 15)]),
+    dict(label="coffee_machine_run", kind="single", on_s=210, min_delta_W=4,
+         note="SECOND coffee recording, FULL cycle from cold: switch the "
+              "machine ON (standby), immediately start a brew WITH grinding, "
+              "and leave it until it settles back into warm-hold -- the "
+              "grinder/pump phases need to be in the training data"),
+    dict(label="coffee_machine_run__water_boiler_on", kind="choreo",
+         note="PROBLEM CASE: boiler already running, then a FULL brew "
+              "(grinding included) right next to it",
+         steps=[("switch", "turn the WATER BOILER ON", 300),
+                ("hold", 20),
+                ("switch", "switch the COFFEE MACHINE ON and start a full "
+                           "brew (grinding included)", 25),
+                ("hold", 150),
+                ("switch", "turn the COFFEE MACHINE fully OFF", 25),
+                ("hold", 10), ("switch", "turn the BOILER OFF", 300)]),
+    dict(label="coffee_machine_run__water_boiler_on", kind="choreo",
+         note="both big devices ON at the SAME moment (composite-edge test), "
+              "brew started right after",
+         steps=[("switch", "turn the BOILER and the COFFEE MACHINE ON at the "
+                           "SAME moment, then start the brew immediately", 300),
+                ("hold", 120),
+                ("switch", "turn BOTH fully OFF together", 300)]),
     # -- sunny-day items (PV must actually generate!) -------------------------
     dict(label="pv_only", kind="single", on_s=180, min_delta_W=8, sunny=True,
          note="SUNNY DAY ONLY: connect the PV panel, nothing else. Total "

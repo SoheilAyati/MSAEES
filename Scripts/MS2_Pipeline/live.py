@@ -455,7 +455,16 @@ class ModelManager:
         """Steady-state (P, Q, harmonic current) per single-device recording,
         for edge matching. IH is the device's harmonic current in amps
         (THD_I/100 * I_fundamental at nominal 230 V); None when the recording
-        carries no usable THD channel."""
+        carries no usable THD channel.
+
+        Rotation/swing variants are excluded from the MATCHING table entirely
+        (they still train the window model): the rotation motor only shifts a
+        speed by ~2.6 W, which the plain-speed signature already covers within
+        tolerance -- but standing_fan_high_rotate (33.0 W/52.1 var) is a
+        near-exact twin of BOTH FANS ON LOW (34.0 W/52.8 var), and its
+        presence let that composite single-match 'standing_fan' at d=0.07,
+        unbeatable by any pair hypothesis."""
+        ROT = {"rotate", "rotating", "rotation", "swing", "withswing"}
         sigs = []
         for p in sorted(glob.glob(os.path.join(self.recordings_dir, "*.h5"))):
             try:
@@ -463,6 +472,8 @@ class ModelManager:
                     lab = f["metadata"].attrs.get("appliance_label", "")
                     lab = lab.decode() if isinstance(lab, (bytes, bytearray)) else str(lab)
                     if not lab or nl.is_mixed_label(lab):
+                        continue
+                    if ROT & set(lab.lower().split("_")):
                         continue
                     P = np.nan_to_num(f["measurements/P_total"][:])
                     Q = np.nan_to_num(f["measurements/Q_total"][:])
@@ -493,17 +504,10 @@ class ModelManager:
         one mode: sub-mode variance is noise here, and every extra pseudo-mode
         multiplies the transition pairs the small-step matcher must
         disambiguate. Families keep their modes sorted by watts."""
-        # rotation/swing variants are a MODIFIER, not a speed: merging
-        # standing_fan_high (30.4 W) with _high_rotate (33.0 W) shifted the
-        # 'high' mode to 31.7 and made high->med (-5.6 W) a metric twin of
-        # the table fan's high->low (-5.8 W) -- the exact ambiguity this
-        # matcher must resolve. Rotation toggles themselves are ~2.6 W,
-        # below the mode-step threshold, so nothing is lost by skipping them.
-        ROT = {"rotate", "rotating", "rotation", "swing", "withswing"}
+        # (rotate/swing variants never reach here -- _load_signatures already
+        # filters them out of the matching table)
         by_fam: dict = {}
         for s in sigs:
-            if ROT & set(str(s["label"]).lower().split("_")):
-                continue
             by_fam.setdefault(s["family"], []).append(s)
         modes = {}
         for fam, ss in by_fam.items():
@@ -604,7 +608,8 @@ class ModelManager:
                     conf *= min(1.0, factor)
                     break
             return {"family": best["family"], "label": best["label"],
-                    "confidence": round(max(0.0, conf), 2)}
+                    "confidence": round(max(0.0, conf), 2),
+                    "distance": round(best_d, 3)}
 
     def match_edge_pair(self, dP: float, dQ: float, q_noise: float = 0.0):
         """Explain one composite step as TWO devices switching together.
@@ -646,7 +651,8 @@ class ModelManager:
                 if {a2["family"], b2["family"]} != fams and d2 - d < 0.30:
                     return None
             conf = max(0.0, 1.0 - d) * 0.85   # pair guesses stay humbler
-            return {"members": [a, b], "confidence": round(conf, 2)}
+            return {"members": [a, b], "confidence": round(conf, 2),
+                    "distance": round(d, 3)}
 
     def match_mode_change(self, on_watts: dict, dP: float, dQ: float,
                           q_noise: float = 0.0):
@@ -1158,16 +1164,20 @@ class LiveEngine:
             dev, conf = match["family"], match["confidence"]
         else:
             dev, conf = "unrecognized", None
-        # composite check: not only for UNMATCHED steps -- a boiler+fan start
-        # single-matches "water_boiler" at mediocre confidence and swallows
-        # the fan's watts into the boiler claim. A pair must be CLEARLY
-        # better than the single to win, so a clean lone-boiler start (which
-        # also has boiler+tiny-fan pairs nearby) stays a single claim.
-        if (direction == "on" and abs(edge["dP"]) >= 25.0
-                and (dev == "unrecognized" or conf < 0.60)):
+        # composite check for EVERY sizeable on-step, decided by raw DISTANCE:
+        # whichever hypothesis explains the step more tightly wins. Gating the
+        # pair on a weak single match missed the nastiest case -- both fans on
+        # LOW (34 W / 53 var) is a near-twin of standing_fan HIGH alone
+        # (30.4 W / 52 var), which single-matched at 0.76 and swallowed the
+        # table fan. Distance compares the two stories directly: the exact
+        # low+low sum (d~0.03) beats the 3.6 W-off single (d~0.24). A clear
+        # margin (0.15) protects the reverse case: a lone standing_fan start
+        # fits its own signature far tighter than any two-device sum.
+        if direction == "on" and abs(edge["dP"]) >= 25.0:
             pair = m.match_edge_pair(*probe, q_noise=edge.get("q_noise", 0.0))
-            need = max(self.edge_claim_conf, (conf or 0.0) + 0.15)
-            if pair and pair["confidence"] >= need:
+            single_d = match["distance"] if (match and conf is not None) else 9.9
+            if (pair and pair["confidence"] >= self.edge_claim_conf
+                    and pair["distance"] <= single_d - 0.15):
                 self._apply_edge_pair(edge, pair, record=record)
                 if record:
                     names = "+".join(s["family"] for s in pair["members"])
@@ -1178,6 +1188,56 @@ class LiveEngine:
                                            "switched together - both claimed, "
                                            "watts split by signature")
                 return
+        # big MODE transition of an already-claimed device: the coffee
+        # machine's heater duty-cycles between brew (~1206 W) and warm-hold
+        # (~46 W); treating each -1160 W step as "coffee off" released the
+        # claim every cycle, and the window model then re-labelled the watts
+        # ("boiler drawing more"). If the step lands the claim on ANOTHER
+        # known state of the same family, the device CHANGES STATE and the
+        # claim survives; a genuine full-off (drop ~ claim watts) still
+        # releases below.
+        if dev != "unrecognized":
+            with self.lock:
+                c = self.claims.get(dev)
+                w_cur = float(c["W"]) if c else None
+            if c is not None:
+                # where does the claim land after this step? On another known
+                # state of the same family -> state change; near zero (no
+                # state >= 8 W matches) -> genuine off, handled below. The
+                # coffee heater's -1160 W lands on the 46 W warm-hold state;
+                # unplugging the whole machine (-1206 W) lands on nothing.
+                w_new = w_cur + float(edge["dP"])
+                with m.lock:
+                    states = list(m.modes.get(dev, []))
+                target = next((b for b in states
+                               if abs(b["P"]) >= 8.0
+                               and abs(w_new - b["P"]) <= max(3.0, 0.15 * abs(b["P"]))
+                               and abs(w_cur - b["P"]) > max(2.0, 0.10 * abs(b["P"]))),
+                              None)
+                if target is not None:
+                    with self.lock:
+                        c = self.claims.get(dev)
+                        if c is not None:
+                            c["W"] = float(target["P"])
+                            c["Q"] = float(target["Q"])
+                            c["conf"] = max(c["conf"], float(conf))
+                            c["last_ms"] = int(edge["t_ms"])
+                    if record:
+                        with self.lock:
+                            self.edge_history.append(
+                                {"t_ms": int(edge["t_ms"]),
+                                 "dP": float(edge["dP"]),
+                                 "dQ": float(edge["dQ"]),
+                                 "ih": edge.get("ih"),
+                                 "P_after": edge.get("P_after"),
+                                 "q_noise": edge.get("q_noise", 0.0)})
+                        self._log_event(edge["t_ms"], "mode_change", dev, conf,
+                                        edge["dP"], edge["dQ"], edge["P_after"],
+                                        detail=f"state change ~{w_cur:.0f} W -> "
+                                               f"~{target['P']:.0f} W "
+                                               f"({target['label']}) - claim "
+                                               "kept, not an off/on event")
+                    return
         if (dev == "unrecognized" and direction == "off"
                 and self._release_claim_pair(edge, record=record)):
             return
@@ -1492,7 +1552,36 @@ class LiveEngine:
                 q_on += float(np.median(fam_q[nm]))
         q_res = q_now - q_on
         m = self.models.match_edge(residual, q_res, q_tol_scale=3.0)
-        if not m or m["confidence"] < 0.45 or on_map.get(m["family"]):
+        # an unusable single (weak, or naming an already-on family) cannot be
+        # claimed, but its DISTANCE still sets the bar the pair must clear
+        single_d = m["distance"] if m else 9.9
+        if m and (m["confidence"] < 0.45 or on_map.get(m["family"])):
+            m = None
+        # the residual can be TWO devices nobody claimed (engine started with
+        # both fans already running on low: 34 W / 53 var reads exactly like
+        # standing_fan HIGH alone). Same distance rule as the edge path: the
+        # pair must explain the residual clearly more tightly than the single.
+        pair = self.models.match_edge_pair(residual, q_res, q_noise=3.0)
+        if (pair and pair["confidence"] >= 0.40
+                and pair["distance"] <= single_d - 0.15
+                and not any(on_map.get(s["family"]) for s in pair["members"])):
+            tot = sum(abs(s["P"]) for s in pair["members"]) or 1e-6
+            with self.lock:
+                t0 = int(self._unknown_first or now_ms)
+                for s in pair["members"]:
+                    self.claims[s["family"]] = {
+                        "W": abs(float(residual)) * abs(s["P"]) / tot,
+                        "Q": float(s["Q"]),
+                        "conf": float(pair["confidence"]), "t_ms": t0}
+                    self.forced_off.pop(s["family"], None)
+            names = "+".join(s["family"] for s in pair["members"])
+            self._log_event(now_ms, "residual_matched", names,
+                            pair["confidence"], residual, q_res, None,
+                            detail="persistent residual matches the SUM of "
+                                   "two device signatures - both claimed, "
+                                   "watts split by signature")
+            return names
+        if not m:
             return None
         fam = m["family"]
         # a kilowatt-class residual while big UNMATCHED edges are still
@@ -1695,7 +1784,20 @@ class LiveEngine:
         total_W = float(np.nanmean(sig.P))
         k_now = max(1, int(2.5 * sr))
         instant_W = float(np.nanmedian(arrs["P"][-k_now:]))
-        self._reconcile_claims(instant_W, now_ms)
+        # a big level change still TRANSITING the 8 s edge window belongs to
+        # the edge pipeline: reconciling claims against the already-dropped
+        # instant total raced the detector and killed the coffee claim
+        # (1206 W) two strides before its -1160 W heater-off edge could be
+        # read as a state change. Hold the guard until the transition has
+        # either produced its edge or aged out of the lookback.
+        k_a, k_b = int(11.5 * sr), int(9 * sr)
+        in_transition = False
+        if len(arrs["P"]) >= k_a and k_a > k_b:
+            lvl_prev = float(np.nanmedian(arrs["P"][-k_a:-k_b]))
+            in_transition = (math.isfinite(lvl_prev)
+                             and abs(instant_W - lvl_prev) >= 25.0)
+        if not in_transition:
+            self._reconcile_claims(instant_W, now_ms)
         with self.lock:
             claims = {f: dict(c) for f, c in self.claims.items()}
             forced_off = dict(self.forced_off)
