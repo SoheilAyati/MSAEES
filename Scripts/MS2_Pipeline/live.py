@@ -915,7 +915,8 @@ class LiveEngine:
                  unknown_min_W: float = 30.0, unknown_frac: float = 0.15,
                  unknown_persist_s: float = 8.0, edge_min_W: float = 8.0,
                  edge_claim_conf: float = 0.30, teach_record_s: float = 45.0,
-                 mode_min_W: float = 3.5, big_edge_min_W: float = 120.0):
+                 mode_min_W: float = 3.5, big_edge_min_W: float = 120.0,
+                 min_conf: float = 0.70):
         self.svc = svc
         self.models = models
         self.retrainer = retrainer
@@ -925,6 +926,12 @@ class LiveEngine:
         self.unknown_persist_s = unknown_persist_s
         self.edge_min_W = edge_min_W
         self.edge_claim_conf = edge_claim_conf
+        # confidence floor for NAMING an appliance: an edge/residual single, or
+        # a window-model presence vote, below this reads as an UNKNOWN load
+        # instead of a low-confidence device name ("a wrong name is worse than
+        # an unknown"). Composite two-device pairs and mode changes of an
+        # already-identified device keep their own (differently scaled) bars.
+        self.min_conf = min_conf
         self.teach_record_s = teach_record_s
         # small settled steps in [mode_min_W, edge_min_W) are probed as MODE
         # TRANSITIONS of already-on devices (fan high -> low is a -6 W step:
@@ -1160,7 +1167,11 @@ class LiveEngine:
         match = (m.match_edge(*probe, ih=edge.get("ih"),
                               q_noise=edge.get("q_noise", 0.0))
                  if abs(edge["dP"]) >= self.edge_min_W else None)
-        if match and match["confidence"] >= 0.25:
+        # confidence floor: a matched single appliance is only NAMED when it
+        # clears self.min_conf (default 0.70). Below it -- or with no match at
+        # all -- the step is reported as an unknown load, never a low-confidence
+        # guess ("a wrong name is worse than an unknown").
+        if match and match["confidence"] >= self.min_conf:
             dev, conf = match["family"], match["confidence"]
         else:
             dev, conf = "unrecognized", None
@@ -1175,7 +1186,12 @@ class LiveEngine:
         # fits its own signature far tighter than any two-device sum.
         if direction == "on" and abs(edge["dP"]) >= 25.0:
             pair = m.match_edge_pair(*probe, q_noise=edge.get("q_noise", 0.0))
-            single_d = match["distance"] if (match and conf is not None) else 9.9
+            # the pair still has to beat the best SINGLE fit on raw distance;
+            # key it off the match's own confidence (>= 0.25), NOT the min_conf
+            # naming decision, so raising min_conf can never turn a mediocre
+            # single into a fabricated two-device claim.
+            single_d = (match["distance"]
+                        if (match and match["confidence"] >= 0.25) else 9.9)
             if (pair and pair["confidence"] >= self.edge_claim_conf
                     and pair["distance"] <= single_d - 0.15):
                 self._apply_edge_pair(edge, pair, record=record)
@@ -1550,8 +1566,8 @@ class LiveEngine:
         the residual is the only place their identity shows, so a TAUGHT
         device could stay 'unknown' forever without this path. The Q probe is
         an estimate (measured Q minus the ON devices' known vars), hence the
-        relaxed Q tolerance and the higher confidence bar; an ambiguous match
-        still collapses to None and the unknown prompt takes over."""
+        relaxed Q tolerance; the min_conf naming floor still applies, and an
+        ambiguous match collapses to None so the unknown prompt takes over."""
         k = max(1, int(2.5 * self.svc.sample_rate_hz))
         q_now = float(np.nanmedian(arrs["Q"][-k:]))
         if not math.isfinite(q_now):
@@ -1571,7 +1587,7 @@ class LiveEngine:
         # an unusable single (weak, or naming an already-on family) cannot be
         # claimed, but its DISTANCE still sets the bar the pair must clear
         single_d = m["distance"] if m else 9.9
-        if m and (m["confidence"] < 0.45 or on_map.get(m["family"])):
+        if m and (m["confidence"] < self.min_conf or on_map.get(m["family"])):
             m = None
         # the residual can be TWO devices nobody claimed (engine started with
         # both fans already running on low: 34 W / 53 var reads exactly like
@@ -1845,11 +1861,15 @@ class LiveEngine:
                                     if proba_s[i] >= 0.5))
             for i, nm in enumerate(names):
                 was_on = self.state.get(nm, {}).get("on", False)
-                # hysteresis so a 0.5-ish probability doesn't flap on/off
-                # wide hysteresis band: flapping (coffee near ~0.5 in mixes)
-                # costs more than a few seconds of extra latency -- fast
-                # events are the edge claims' job, not the window model's
-                on = bool(proba_s[i] >= (0.40 if was_on else 0.60))
+                # confidence floor with hysteresis: the window model only NAMES
+                # a device it is at least min_conf sure of (default 0.70), then
+                # holds it on down to min_conf - 0.20 so a near-threshold
+                # probability (coffee near ~0.5 in mixes) does not flap on/off.
+                # Power the model is less sure of stays in the residual and is
+                # reported as unknown rather than a low-confidence name -- fast
+                # events are the edge claims' job, not the window model's.
+                on = bool(proba_s[i] >= (self.min_conf - 0.20 if was_on
+                                         else self.min_conf))
                 w = float(watts[i]) if on else 0.0
                 if on and abs(w) < 0.5 and power is None:
                     w = float("nan")
@@ -3269,6 +3289,10 @@ def main():
                    help="families whose smallest signature exceeds this can "
                         "only switch ON via a real step, never by window-"
                         "model vote alone (kills phantom boiler/coffee)")
+    p.add_argument("--min-conf", type=float, default=0.70,
+                   help="minimum confidence to NAME a matched appliance; below "
+                        "this a step/vote is reported as an unknown load "
+                        "instead of a low-confidence guess (default 0.70)")
     p.add_argument("--ih-matching", action="store_true",
                    help="EXPERIMENTAL: include the harmonic-current term in "
                         "edge matching (off by default: the meter's ~2.3%% "
@@ -3323,7 +3347,8 @@ def main():
                         stride_s=args.stride, unknown_min_W=args.unknown_min_w,
                         teach_record_s=args.teach_record_s,
                         mode_min_W=args.mode_min_w,
-                        big_edge_min_W=args.big_edge_w)
+                        big_edge_min_W=args.big_edge_w,
+                        min_conf=args.min_conf)
 
     info = models.info()
     if info["source"] == "none":

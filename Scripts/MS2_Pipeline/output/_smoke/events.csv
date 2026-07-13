@@ -1,0 +1,3 @@
+time_iso,unix_ms,kind,device,confidence,dP_W,dQ_var,P_total_W,detail
+2026-07-13T17:21:11.926+02:00,1783956071926,model_veto,water_boiler,0.73,,,411.5,window model voted ON but no >= 382 W switch-on step was seen - a device this size cannot start silently (phantom suppressed)
+2026-07-13T17:21:06.926+02:00,1783956066926,device_on,table_fan,0.92,,,411.5,~11 W
