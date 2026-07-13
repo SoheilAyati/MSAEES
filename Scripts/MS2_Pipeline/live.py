@@ -355,7 +355,13 @@ class ModelManager:
         self.loaded_utc = None
         self.variant = "latest"          # 'latest' | 'original'
         self.reload_seq = 0
-        self.signatures: list = []       # [{family, label, P, Q}]
+        self.signatures: list = []       # [{family, label, P, Q, IH}]
+        # family -> steady OPERATING MODES, distilled from the signatures:
+        # [{label, P, Q}] sorted by watts ('table_fan' -> low 10.6 W / high
+        # 17.3 W). Small settled steps below the edge threshold are matched
+        # against transitions BETWEEN these modes (fan turned from high to
+        # low), which no on/off signature can represent.
+        self.modes: dict = {}
         self.reload()
 
     def reload(self) -> dict:
@@ -476,8 +482,48 @@ class ModelManager:
                          "P": float(np.median(P[on])), "Q": float(np.median(Q[on])),
                          "IH": ih})
         self.signatures = sigs
+        self.modes = self._build_modes(sigs)
 
-    def match_edge(self, dP: float, dQ: float, ih=None, q_tol_scale: float = 1.0):
+    @staticmethod
+    def _build_modes(sigs) -> dict:
+        """Distill per-family operating modes from the signature table.
+        Recordings of the same physical setting (standing_fan_low and
+        standing_fan_low_rotate differ by the ~2 W rotation motor) merge into
+        one mode: sub-mode variance is noise here, and every extra pseudo-mode
+        multiplies the transition pairs the small-step matcher must
+        disambiguate. Families keep their modes sorted by watts."""
+        by_fam: dict = {}
+        for s in sigs:
+            by_fam.setdefault(s["family"], []).append(s)
+        modes = {}
+        for fam, ss in by_fam.items():
+            groups: list = []
+            for s in sorted(ss, key=lambda x: x["P"]):
+                g = next((g for g in groups
+                          if abs(s["P"] - g["P"]) <= max(2.2, 0.10 * abs(g["P"]))
+                          and abs(s["Q"] - g["Q"]) <= max(3.0, 0.20 * abs(g["Q"]))),
+                         None)
+                if g is None:
+                    groups.append({"label": s["label"], "P": s["P"], "Q": s["Q"],
+                                   "_n": 1})
+                else:                     # running mean keeps the mode centred
+                    g["P"] += (s["P"] - g["P"]) / (g["_n"] + 1)
+                    g["Q"] += (s["Q"] - g["Q"]) / (g["_n"] + 1)
+                    g["_n"] += 1
+            for g in groups:
+                g.pop("_n", None)
+            modes[fam] = groups
+        return modes
+
+    # THD-derived harmonic current is an RSS DIFFERENCE of two estimates, so
+    # for small steps its noise rivals the signal (a fan's whole IH is
+    # ~0.008 A). Below this step magnitude the IH term is ignored -- P and Q
+    # decide alone, exactly as they did on the branch's parent. Big steps
+    # (toaster, hair dryer, boiler: the cases the IH term exists for) keep it.
+    IH_MIN_STEP = 60.0
+
+    def match_edge(self, dP: float, dQ: float, ih=None, q_tol_scale: float = 1.0,
+                   q_noise: float = 0.0):
         """Nearest device signature for a power step; None when nothing is
         close. Elliptical distance with SEPARATE P / Q (and, when both sides
         have it, harmonic-current) tolerances: the old single 35 %-of-magnitude
@@ -498,11 +544,16 @@ class ModelManager:
                 # 10 W laptop charger match table_fan_low (Q 14.4) at 0.43
                 # conf. Q noise on LARGE loads is covered by the 5 %-of-P term.
                 # q_tol_scale > 1 for probes whose Q is an ESTIMATE rather
-                # than a measured step (residual matching)
-                tol_Q = max(8.0, 0.25 * abs(s["Q"]) + 0.05 * abs(s["P"])) * q_tol_scale
+                # than a measured step (residual matching); q_noise is the
+                # MEASURED Q jitter around this specific step, so a gusty
+                # evening on the fans widens the gate instead of turning a
+                # real fan edge into an "unknown load"
+                tol_Q = (max(8.0, 0.25 * abs(s["Q"]) + 0.05 * abs(s["P"]))
+                         + 1.5 * max(0.0, q_noise)) * q_tol_scale
                 terms = [(dP - s["P"]) / tol_P, (dQ - s["Q"]) / tol_Q]
                 if (ih is not None and math.isfinite(ih)
-                        and s.get("IH") is not None):
+                        and s.get("IH") is not None
+                        and math.hypot(dP, dQ) >= self.IH_MIN_STEP):
                     terms.append((ih - s["IH"]) / max(0.05, 0.35 * s["IH"]))
                 # CONJUNCTIVE distance: every dimension must independently
                 # agree. Averaging (RMS) let an uninformative dimension dilute
@@ -519,13 +570,142 @@ class ModelManager:
             best_d, best = cands[0]
             conf = 1.0 - best_d
             # ambiguity penalty against the nearest OTHER family (several
-            # recordings of the same device must not penalize each other)
+            # recordings of the same device must not penalize each other).
+            # The penalty is floored when the step fits the winner WELL
+            # (d <= 0.35): an excellent primary fit with a marginal second
+            # family should read "probably X", not "unrecognized" -- full
+            # collapse turned real fan edges into unknown-load claims, which
+            # then vetoed the model on top (worse than the loose matcher it
+            # replaced). A mediocre fit keeps the hard collapse: at that
+            # point a wrong name IS worse than an unknown.
             for d2, s2 in cands[1:]:
                 if s2["family"] != best["family"]:
-                    conf *= min(1.0, (d2 - best_d) / 0.35)
+                    factor = (d2 - best_d) / 0.35
+                    if best_d <= 0.35:
+                        factor = max(factor, 0.5)
+                    conf *= min(1.0, factor)
                     break
             return {"family": best["family"], "label": best["label"],
                     "confidence": round(max(0.0, conf), 2)}
+
+    def match_edge_pair(self, dP: float, dQ: float, q_noise: float = 0.0):
+        """Explain one composite step as TWO devices switching together.
+
+        Two devices flipped within the same detector window merge into a
+        single step no single signature can match (both fans started at once:
+        +46.6 W = table_fan 16 + standing_fan 31). Without this, that step
+        became a permanent anonymous unknown load whose model veto then hid
+        both devices for the rest of the session. A UNIQUE two-family sum
+        within tolerance claims both; anything ambiguous stays unknown."""
+        with self.lock:
+            cands = []
+            sigs = self.signatures
+            for i in range(len(sigs)):
+                for j in range(i + 1, len(sigs)):
+                    a, b = sigs[i], sigs[j]
+                    if a["family"] == b["family"]:
+                        continue          # one family cannot be claimed twice
+                    P2, Q2 = a["P"] + b["P"], a["Q"] + b["Q"]
+                    tol_P = max(18.0, 0.22 * abs(P2))
+                    # Q slack couples to P at only 2 % here (vs 5 % for single
+                    # matches): the ~17 var gap between 'boiler+table_fan' and
+                    # 'boiler+standing_fan' IS the discriminator, and a 5 %
+                    # slack (47 var at a 950 W composite) blinds it
+                    tol_Q = (max(10.0, 0.22 * abs(Q2) + 0.02 * abs(P2))
+                             + 1.5 * max(0.0, q_noise))
+                    d = max(abs(dP - P2) / tol_P, abs(dQ - Q2) / tol_Q)
+                    if d < 1.0:
+                        cands.append((d, a, b))
+            if not cands:
+                return None
+            cands.sort(key=lambda x: x[0])
+            d, a, b = cands[0]
+            fams = {a["family"], b["family"]}
+            # a DIFFERENT family pair fitting almost as well = ambiguous (the
+            # same two families in other modes is fine -- watts are split
+            # proportionally either way)
+            for d2, a2, b2 in cands[1:]:
+                if {a2["family"], b2["family"]} != fams and d2 - d < 0.30:
+                    return None
+            conf = max(0.0, 1.0 - d) * 0.85   # pair guesses stay humbler
+            return {"members": [a, b], "confidence": round(conf, 2)}
+
+    def match_mode_change(self, on_watts: dict, dP: float, dQ: float,
+                          q_noise: float = 0.0):
+        """Explain a SMALL settled step as a mode transition of a device that
+        is already ON ('table fan turned from high to low'). `on_watts` maps
+        each candidate family to its current per-device watt estimate, which
+        anchors the FROM mode -- without the anchor, a -6 W step is equally
+        'table_fan high->low' and 'standing_fan high->med' and the wrong fan
+        gets its watts lowered (the exact complaint this solves).
+
+        Returns {family, from, to, dP_sig, dQ_sig, confidence} or None when
+        nothing fits or two different families fit about equally well."""
+        with self.lock:
+            cands = []
+            for fam, w_cur in on_watts.items():
+                for a in self.modes.get(fam, []):
+                    # the device must currently BE in mode a -- and precisely
+                    # so: claim watts are edge-measured to ~1 W, and a loose
+                    # anchor lets a 30 W fan 'depart' from a neighbouring
+                    # 28 W pseudo-mode, doubling the candidate transitions
+                    if w_cur is None:
+                        continue
+                    tol_a = max(2.0, 0.10 * abs(a["P"]))
+                    a_err = abs(w_cur - a["P"]) / tol_a
+                    if a_err > 1.0:
+                        continue
+                    for b in self.modes.get(fam, []):
+                        if b is a or abs(b["P"] - a["P"]) < 2.0:
+                            continue
+                        dp_sig = b["P"] - a["P"]
+                        dq_sig = b["Q"] - a["Q"]
+                        t_p = (dP - dp_sig) / max(2.5, 0.30 * abs(dp_sig))
+                        t_q = (dQ - dq_sig) / (max(3.5, 0.35 * abs(dq_sig))
+                                               + 1.5 * max(0.0, q_noise))
+                        # the anchor error joins the distance (half weight):
+                        # between two transitions that both fit the step, the
+                        # one whose device actually SITS at the from-mode wins
+                        d = max(abs(t_p), abs(t_q), 0.5 * a_err)
+                        if d < 1.0:
+                            cands.append((d, fam, a, b, dp_sig, dq_sig))
+            if not cands:
+                return None
+            cands.sort(key=lambda x: x[0])
+            d, fam, a, b, dp_sig, dq_sig = cands[0]
+            # a transition of ANOTHER on-device that fits almost as well means
+            # the step is genuinely ambiguous -> better no reassignment than
+            # lowering the wrong fan
+            for d2, fam2, *_ in cands[1:]:
+                if fam2 != fam and d2 - d < 0.22:
+                    return None
+            return {"family": fam, "from": a, "to": b,
+                    "dP_sig": dp_sig, "dQ_sig": dq_sig,
+                    "confidence": round(max(0.0, 1.0 - d), 2)}
+
+    def signature_report(self, label: str):
+        """How separable is this (freshly taught) device from the rest of the
+        vocabulary? Returns the nearest OTHER family in signature space and a
+        rough conjunctive distance; None when there is nothing to compare."""
+        fam = nl.parse_family(label)
+        with self.lock:
+            own = [s for s in self.signatures if s["family"] == fam]
+            others = [s for s in self.signatures if s["family"] != fam]
+        if not own or not others:
+            return None
+        newest = own[-1]
+        worst = None
+        for s in others:
+            tol_P = max(15.0, 0.25 * abs(s["P"]))
+            tol_Q = max(8.0, 0.25 * abs(s["Q"]) + 0.05 * abs(s["P"]))
+            d = max(abs(newest["P"] - s["P"]) / tol_P,
+                    abs(newest["Q"] - s["Q"]) / tol_Q)
+            if worst is None or d < worst["distance"]:
+                worst = {"family": s["family"], "label": s["label"],
+                         "distance": round(d, 2),
+                         "dP_W": round(newest["P"] - s["P"], 1),
+                         "dQ_var": round(newest["Q"] - s["Q"], 1)}
+        return worst
 
     def info(self) -> dict:
         with self.lock:
@@ -705,7 +885,8 @@ class LiveEngine:
                  retrainer: Retrainer, out_dir: str, stride_s: float = 2.0,
                  unknown_min_W: float = 30.0, unknown_frac: float = 0.15,
                  unknown_persist_s: float = 8.0, edge_min_W: float = 8.0,
-                 edge_claim_conf: float = 0.30, teach_record_s: float = 45.0):
+                 edge_claim_conf: float = 0.30, teach_record_s: float = 45.0,
+                 mode_min_W: float = 3.5, big_edge_min_W: float = 120.0):
         self.svc = svc
         self.models = models
         self.retrainer = retrainer
@@ -716,6 +897,16 @@ class LiveEngine:
         self.edge_min_W = edge_min_W
         self.edge_claim_conf = edge_claim_conf
         self.teach_record_s = teach_record_s
+        # small settled steps in [mode_min_W, edge_min_W) are probed as MODE
+        # TRANSITIONS of already-on devices (fan high -> low is a -6 W step:
+        # far below the on/off edge threshold, yet decisive for which fan to
+        # attribute the drop to)
+        self.mode_min_W = mode_min_W
+        # a family whose smallest signature is above this cannot switch ON by
+        # window-model vote alone: real kilowatt-class devices always announce
+        # themselves with a step. This kills the phantom "coffee machine /
+        # water boiler popped up while other devices ran" reports.
+        self.big_edge_min_W = big_edge_min_W
         self._teach_thread: threading.Thread | None = None
         self._teach_cancel = False
         self.guide: dict | None = None   # current guided-teach instruction
@@ -764,6 +955,9 @@ class LiveEngine:
         self._unknown_stale_ms: float | None = None
         self._last_edge_ms = 0
         self._last_edge_dP = 0.0
+        self._mode_ambig_ms = 0          # throttle for mode_ambiguous events
+        self._veto_log_ms: dict = {}     # family -> last model_veto event ms
+        self._last_taught_family = None  # checked against F1 after retrain
         self._teach_note = ""
         # replay ground-truth comparison: available only when the reader
         # replays a file that carries ground truth (scenario /ground_truth or
@@ -851,7 +1045,13 @@ class LiveEngine:
     # ---- edge detection -----------------------------------------------------
     def _detect_edge(self, arrs):
         """Settled-before vs settled-after step detector on P_total; returns the
-        edge (exact sample timestamp) or None. Runs on every stride."""
+        edge (exact sample timestamp) or None. Runs on every stride.
+
+        Two tiers: a FULL edge (>= edge_min_W) drives the on/off claim
+        machinery; a small MODE edge (>= mode_min_W but below the full
+        threshold, with stricter settling) is only ever interpreted as a mode
+        transition of a device that is already on -- it can never create or
+        release claims or unknown loads."""
         sr = self.svc.sample_rate_hz
         need = int(8 * sr)
         P, Q, t_ms = arrs["P"], arrs["Q"], arrs["t_ms"]
@@ -862,12 +1062,18 @@ class LiveEngine:
         pre_P, post_P = np.nanmedian(P8[:k]), np.nanmedian(P8[-k:])
         pre_Q, post_Q = np.nanmedian(Q8[:k]), np.nanmedian(Q8[-k:])
         dP, dQ = post_P - pre_P, post_Q - pre_Q
-        if abs(dP) < self.edge_min_W and abs(dQ) < 2 * self.edge_min_W:
+        full = abs(dP) >= self.edge_min_W or abs(dQ) >= 2 * self.edge_min_W
+        if not full and abs(dP) < self.mode_min_W:
             return None
         # both sides must be settled so a ramp isn't logged sample-by-sample
         if np.nanstd(P8[:k]) > max(6.0, 0.05 * abs(pre_P)):
             return None
         if np.nanstd(P8[-k:]) > max(6.0, 0.05 * abs(post_P)):
+            return None
+        # a mode edge is barely above meter noise; demand near-flat plateaus
+        # so P wobble cannot fabricate fan-speed changes every few strides
+        if not full and (np.nanstd(P8[:k]) > max(1.5, 0.25 * abs(dP))
+                         or np.nanstd(P8[-k:]) > max(1.5, 0.25 * abs(dP))):
             return None
         mid = P8[k:-k]
         if len(mid) == 0:
@@ -901,8 +1107,125 @@ class LiveEngine:
             d2 = (ih_post ** 2 - ih_pre ** 2) if dP > 0 else (ih_pre ** 2 - ih_post ** 2)
             if math.isfinite(d2):
                 ih = math.sqrt(max(0.0, d2))
+        # measured Q jitter around this step: the matcher widens its Q gate by
+        # it, so real-world reactive noise cannot veto a correct match
+        q_noise = float(max(np.nanstd(Q8[:k]), np.nanstd(Q8[-k:])))
+        if not math.isfinite(q_noise):
+            q_noise = 0.0
         return {"t_ms": t_edge, "dP": float(dP), "dQ": float(dQ),
-                "P_after": float(post_P), "ih": ih}
+                "P_after": float(post_P), "ih": ih,
+                "kind": "full" if full else "mode", "q_noise": q_noise}
+
+    # ---- full edge -> match (single, then pair) -> device state -------------
+    def _handle_full_edge(self, edge, record=True):
+        """Resolve a full (on/off) edge against the signature table and apply
+        it: single-device match first, then a two-device COMPOSITE match (both
+        fans started within one detector window), then the unknown-load path.
+        `record=False` replays history after a model reload: state changes
+        happen, but nothing is re-logged or re-appended."""
+        m = self.models
+        direction = "on" if edge["dP"] > 0 else "off"
+        # an on-edge is the device's own (P, Q); an off-edge is its negative
+        probe = (edge["dP"], edge["dQ"]) if direction == "on" \
+            else (-edge["dP"], -edge["dQ"])
+        match = (m.match_edge(*probe, ih=edge.get("ih"),
+                              q_noise=edge.get("q_noise", 0.0))
+                 if abs(edge["dP"]) >= self.edge_min_W else None)
+        if match and match["confidence"] >= 0.25:
+            dev, conf = match["family"], match["confidence"]
+        else:
+            dev, conf = "unrecognized", None
+        # composite check: not only for UNMATCHED steps -- a boiler+fan start
+        # single-matches "water_boiler" at mediocre confidence and swallows
+        # the fan's watts into the boiler claim. A pair must be CLEARLY
+        # better than the single to win, so a clean lone-boiler start (which
+        # also has boiler+tiny-fan pairs nearby) stays a single claim.
+        if (direction == "on" and abs(edge["dP"]) >= 25.0
+                and (dev == "unrecognized" or conf < 0.60)):
+            pair = m.match_edge_pair(*probe, q_noise=edge.get("q_noise", 0.0))
+            need = max(self.edge_claim_conf, (conf or 0.0) + 0.15)
+            if pair and pair["confidence"] >= need:
+                self._apply_edge_pair(edge, pair, record=record)
+                if record:
+                    names = "+".join(s["family"] for s in pair["members"])
+                    self._log_event(edge["t_ms"], "edge_on", names,
+                                    pair["confidence"], edge["dP"], edge["dQ"],
+                                    edge["P_after"],
+                                    detail="composite step: two devices "
+                                           "switched together - both claimed, "
+                                           "watts split by signature")
+                return
+        if (dev == "unrecognized" and direction == "off"
+                and self._release_claim_pair(edge, record=record)):
+            return
+        if record:
+            if dev != "unrecognized":
+                det = "step matched to device signature"
+            elif direction == "on" and abs(edge["dP"]) >= self.unknown_claim_min_W:
+                det = ("step matches no known device signature - "
+                       "tracking as unknown load")
+            else:
+                det = "step matches no known device signature"
+            self._log_event(edge["t_ms"], f"edge_{direction}", dev, conf,
+                            edge["dP"], edge["dQ"], edge["P_after"], detail=det)
+        self._apply_edge(edge, direction, dev, conf, record=record)
+
+    def _apply_edge_pair(self, edge, pair, record=True):
+        """Claim BOTH members of a composite on-edge; the measured step watts
+        are split between them in proportion to their signature watts."""
+        tot = sum(abs(s["P"]) for s in pair["members"]) or 1e-6
+        with self.lock:
+            if record:
+                self.edge_history.append({"t_ms": int(edge["t_ms"]),
+                                          "dP": float(edge["dP"]),
+                                          "dQ": float(edge["dQ"]),
+                                          "ih": edge.get("ih"),
+                                          "P_after": edge.get("P_after"),
+                                          "q_noise": edge.get("q_noise", 0.0)})
+            for s in pair["members"]:
+                w = abs(float(edge["dP"])) * abs(s["P"]) / tot
+                self.claims[s["family"]] = {"W": w, "Q": float(s["Q"]),
+                                            "conf": float(pair["confidence"]),
+                                            "t_ms": int(edge["t_ms"]),
+                                            "last_ms": int(edge["t_ms"]),
+                                            "pre_W": None}
+                self.forced_off.pop(s["family"], None)
+
+    def _release_claim_pair(self, edge, record=True) -> bool:
+        """A composite OFF step whose drop equals the watt-sum of exactly two
+        active claims releases both (the twin of _apply_edge_pair)."""
+        drop = abs(float(edge["dP"]))
+        with self.models.lock:
+            ws = self.models.window_s
+        flush_ms = int((ws + 5) * 1000)
+        with self.lock:
+            fams = list(self.claims)
+            best = None
+            for i in range(len(fams)):
+                for j in range(i + 1, len(fams)):
+                    s = self.claims[fams[i]]["W"] + self.claims[fams[j]]["W"]
+                    err = abs(drop - s) / max(s, 20.0)
+                    if err < 0.18 and (best is None or err < best[0]):
+                        best = (err, fams[i], fams[j])
+            if best is None:
+                return False
+            _, f1, f2 = best
+            if record:
+                self.edge_history.append({"t_ms": int(edge["t_ms"]),
+                                          "dP": float(edge["dP"]),
+                                          "dQ": float(edge["dQ"]),
+                                          "ih": edge.get("ih"),
+                                          "P_after": edge.get("P_after"),
+                                          "q_noise": edge.get("q_noise", 0.0)})
+            for f in (f1, f2):
+                self.claims.pop(f, None)
+                self.forced_off[f] = int(edge["t_ms"]) + flush_ms
+        if record:
+            self._log_event(edge["t_ms"], "edge_off", f"{f1}+{f2}", None,
+                            edge["dP"], edge["dQ"], edge["P_after"],
+                            detail="composite step: two claimed devices "
+                                   "switched off together - both released")
+        return True
 
     # ---- edge -> device state (claims) --------------------------------------
     def _apply_edge(self, edge, direction, dev, conf, record=True):
@@ -919,7 +1242,8 @@ class LiveEngine:
                                           "dP": float(edge["dP"]),
                                           "dQ": float(edge["dQ"]),
                                           "ih": edge.get("ih"),
-                                          "P_after": edge.get("P_after")})
+                                          "P_after": edge.get("P_after"),
+                                          "q_noise": edge.get("q_noise", 0.0)})
             if direction == "on":
                 p_after = edge.get("P_after")
                 if dev != "unrecognized" and conf is not None and conf >= self.edge_claim_conf:
@@ -976,8 +1300,22 @@ class LiveEngine:
                     if err < best_err:
                         drop, drop_unk, best_err = None, i, err
             if drop is not None:
-                self.claims.pop(drop, None)
+                released = self.claims.pop(drop, None)
                 self.forced_off[drop] = int(edge["t_ms"]) + flush_ms
+                # composite off: when the drop clearly exceeds the released
+                # claim, it took a second claimed device down with it (boiler
+                # + fan unplugged together) -- release the claim that covers
+                # the remainder too, or it lingers at 16 W against a dead bus
+                if released is not None:
+                    rem = abs(float(edge["dP"])) - float(released["W"])
+                    if rem >= 8.0 and self.claims:
+                        f2 = min(self.claims, key=lambda f: abs(
+                            rem - self.claims[f]["W"]) / max(self.claims[f]["W"], 20.0))
+                        err2 = abs(rem - self.claims[f2]["W"]) / max(
+                            self.claims[f2]["W"], 20.0)
+                        if err2 < 0.35:
+                            self.claims.pop(f2, None)
+                            self.forced_off[f2] = int(edge["t_ms"]) + flush_ms
             elif drop_unk is not None:
                 self.unknown_claims.pop(drop_unk)
                 # the window still holds pre-drop samples that could tempt the
@@ -987,6 +1325,78 @@ class LiveEngine:
                 # no claim existed (device was on before the engine started),
                 # but the step names it: hold it off while the window flushes
                 self.forced_off[dev] = int(edge["t_ms"]) + flush_ms
+
+    # ---- small edge -> mode transition of an already-on device --------------
+    def _apply_mode_change(self, edge, record=True):
+        """A settled step below the on/off threshold: try to read it as a
+        device changing OPERATING MODE (table fan high -> low is -6 W). The
+        step is matched against transitions between the known modes of every
+        device currently on, anchored at each device's present watt estimate,
+        and the winning device's claim watts are updated -- this is what
+        finally attributes 'the fan was turned down' to the RIGHT fan instead
+        of letting the window model shave watts off its sibling."""
+        with self.lock:
+            if record:
+                self.edge_history.append({"t_ms": int(edge["t_ms"]),
+                                          "dP": float(edge["dP"]),
+                                          "dQ": float(edge["dQ"]),
+                                          "ih": edge.get("ih"),
+                                          "P_after": edge.get("P_after"),
+                                          "q_noise": edge.get("q_noise", 0.0),
+                                          "kind": "mode"})
+            on_watts = {}
+            for fam, c in self.claims.items():
+                on_watts[fam] = float(c["W"])
+            for nm, v in self.state.items():
+                if (v.get("on") and nm not in on_watts
+                        and v.get("power_W") is not None):
+                    on_watts[nm] = float(v["power_W"])
+        if not on_watts:
+            return
+        mc = self.models.match_mode_change(on_watts, edge["dP"], edge["dQ"],
+                                           q_noise=edge.get("q_noise", 0.0))
+        now_ms = int(edge["t_ms"])
+        if mc is None:
+            # a small unexplained step is normal churn (thermostat nudges,
+            # PV clouds); log at most one 'ambiguous' note per 30 s and only
+            # when at least two multi-mode devices were candidates
+            multi = sum(1 for f in on_watts
+                        if len(self.models.modes.get(f, [])) >= 2)
+            if record and multi >= 2 and now_ms - self._mode_ambig_ms > 30000:
+                self._mode_ambig_ms = now_ms
+                self._log_event(now_ms, "mode_ambiguous", "-", None,
+                                edge["dP"], edge["dQ"], edge.get("P_after"),
+                                detail="small step matches no single device's "
+                                       "mode change unambiguously - watts left "
+                                       "to the window model")
+            return
+        fam, to = mc["family"], mc["to"]
+        with self.lock:
+            c = self.claims.get(fam)
+            if c is not None:
+                w_new = c["W"] + float(edge["dP"])
+                # snap to the target mode's nameplate watts when the measured
+                # arithmetic lands near it (drift-free display); keep the
+                # measured value when it does not
+                if abs(w_new - to["P"]) <= max(2.0, 0.15 * abs(to["P"])):
+                    w_new = to["P"]
+                c["W"] = max(0.5, w_new)
+                c["Q"] = to["Q"]
+                c["last_ms"] = now_ms
+            else:
+                # device was on by model vote only: the observed transition is
+                # edge-grade evidence, so pin it with a claim at the new mode
+                self.claims[fam] = {"W": float(to["P"]), "Q": float(to["Q"]),
+                                    "conf": float(mc["confidence"]),
+                                    "t_ms": now_ms, "last_ms": now_ms,
+                                    "pre_W": None}
+                self.forced_off.pop(fam, None)
+        if record:
+            frm = mc["from"]
+            self._log_event(now_ms, "mode_change", fam, mc["confidence"],
+                            edge["dP"], edge["dQ"], edge.get("P_after"),
+                            detail=f"mode ~{frm['P']:.0f} W -> ~{to['P']:.0f} W "
+                                   f"({frm['label']} -> {to['label']})")
 
     def _reconcile_claims(self, instant_W, now_ms):
         """Physical guard against stale claims: the claimed devices alone can
@@ -1081,7 +1491,6 @@ class LiveEngine:
         in order. A step that read 'unrecognized' before a device was taught
         now resolves to that device; a step that matched the wrong sibling
         (table fan as standing fan) gets re-decided with the new signatures."""
-        m = self.models
         with self.lock:
             hist = list(self.edge_history)
             self.claims = {}
@@ -1090,15 +1499,10 @@ class LiveEngine:
             self._unknown_flush_until = 0
             self.smooth.clear()
         for e in hist:
-            direction = "on" if e["dP"] > 0 else "off"
-            probe = (e["dP"], e["dQ"]) if direction == "on" else (-e["dP"], -e["dQ"])
-            match = (m.match_edge(*probe, ih=e.get("ih"))
-                     if abs(e["dP"]) >= self.edge_min_W else None)
-            if match and match["confidence"] >= 0.25:
-                dev, conf = match["family"], match["confidence"]
+            if e.get("kind") == "mode":
+                self._apply_mode_change(e, record=False)
             else:
-                dev, conf = "unrecognized", None
-            self._apply_edge(e, direction, dev, conf, record=False)
+                self._handle_full_edge(e, record=False)
         with self.lock:
             on_now = sorted(self.claims)
         self._log_event(now_ms, "state_rebuilt", ", ".join(on_now) or "-", None,
@@ -1212,30 +1616,34 @@ class LiveEngine:
         if seq != self._model_seq:       # retrain finished or variant switched
             self._model_seq = seq
             self._rebuild_state_from_history(int(arrs["t_ms"][-1]))
+            # how well did the retrain actually LEARN the taught device?
+            fam = self._last_taught_family
+            if fam:
+                self._last_taught_family = None
+                with m.lock:
+                    f1 = (m.metrics.get("per_appliance_f1") or {}).get(fam)
+                    in_vocab = fam in m.appliances
+                now = int(arrs["t_ms"][-1])
+                if not in_vocab:
+                    self._log_event(now, "teach_warning", fam, None, None, None,
+                                    None, detail="device did not enter the "
+                                    "model vocabulary - check that its "
+                                    "recording was saved and retrain again")
+                elif f1 is not None and f1 < 0.70:
+                    self._log_event(now, "teach_warning", fam, f1, None, None,
+                                    None, detail=f"model learned this device "
+                                    f"only weakly (held-out F1 {f1:.2f}) - "
+                                    "record it again, ideally isolated and in "
+                                    "every operating mode")
 
         # -- edge first (needs only the raw signal, works even with no model) --
         edge = self._detect_edge(arrs)
-        if edge is not None:
-            direction = "on" if edge["dP"] > 0 else "off"
-            # an on-edge is the device's own (P, Q); an off-edge is its negative
-            probe = (edge["dP"], edge["dQ"]) if direction == "on" \
-                else (-edge["dP"], -edge["dQ"])
-            match = (m.match_edge(*probe, ih=edge.get("ih"))
-                     if abs(edge["dP"]) >= self.edge_min_W else None)
-            if match and match["confidence"] >= 0.25:
-                dev, conf = match["family"], match["confidence"]
-            else:
-                dev, conf = "unrecognized", None
-            if dev != "unrecognized":
-                det = "step matched to device signature"
-            elif direction == "on" and abs(edge["dP"]) >= self.unknown_claim_min_W:
-                det = ("step matches no known device signature - "
-                       "tracking as unknown load")
-            else:
-                det = "step matches no known device signature"
-            self._log_event(edge["t_ms"], f"edge_{direction}", dev, conf,
-                            edge["dP"], edge["dQ"], edge["P_after"], detail=det)
-            self._apply_edge(edge, direction, dev, conf)
+        if edge is not None and edge.get("kind") == "mode":
+            # sub-threshold settled step: mode transition of an on device,
+            # never an on/off event
+            self._apply_mode_change(edge)
+        elif edge is not None:
+            self._handle_full_edge(edge)
 
         sr = self.svc.sample_rate_hz
         w_samples = max(1, int(round(ws * sr)))
@@ -1255,6 +1663,7 @@ class LiveEngine:
             prev_on_map = {nm: v.get("on", False) for nm, v in self.state.items()}
 
         on_map, power_map, prob_map, src_map = {}, {}, {}, {}
+        raw_model_W = 0.0        # unvetoed model estimate, for staleness only
         if presence is not None and names:
             X, _, _ = nl.aggregate_windows(sig, ws, canon=names)
             with m.lock:
@@ -1268,6 +1677,13 @@ class LiveEngine:
                 self.smooth.append(proba)
                 proba_s = np.median(np.vstack(list(self.smooth)), axis=0)
             watts = power.predict(X)[0] if power is not None else np.zeros(len(names))
+            # what the model would explain WITHOUT any veto: the unknown-load
+            # staleness check must not judge support from post-veto watts (a
+            # bogus unknown claim vetoes the very devices that explain the
+            # power, then looks 'supported' by the residual it manufactured)
+            raw_model_W = float(sum(max(0.0, float(watts[i]))
+                                    for i in range(len(names))
+                                    if proba_s[i] >= 0.5))
             for i, nm in enumerate(names):
                 was_on = self.state.get(nm, {}).get("on", False)
                 # hysteresis so a 0.5-ish probability doesn't flap on/off
@@ -1294,17 +1710,51 @@ class LiveEngine:
         # on-edge named are untouched.
         headroom = (total_W - sum(c["W"] for c in claims.values())
                     - sum(u["W"] for u in unk_claims))
+        with self.lock:
+            recent_named = {ev["device"] for ev in self.events[-12:]
+                            if ev["kind"] == "edge_on"
+                            and now_ms - ev["unix_ms"] < (ws + 6) * 1000}
+            recent_on_dPs = [e["dP"] for e in self.edge_history
+                             if e["dP"] > 0 and e.get("kind") != "mode"
+                             and now_ms - e["t_ms"] < (ws + 6) * 1000]
         if unk_veto or headroom < max(10.0, 2 * on_W):
-            with self.lock:
-                recent_named = {ev["device"] for ev in self.events[-12:]
-                                if ev["kind"] == "edge_on"
-                                and now_ms - ev["unix_ms"] < (ws + 6) * 1000}
             for nm in list(on_map):
                 if (on_map[nm] and nm not in claims
                         and not prev_on_map.get(nm, False)
                         and nm not in recent_named):
                     on_map[nm] = False
                     power_map[nm] = 0.0
+        # -- big devices only switch ON with a real step ------------------------
+        # A kilowatt-class load physically cannot appear without an edge; a
+        # window-model vote alone ("coffee machine popped up while the fans
+        # ran") is always the model re-labeling someone else's watts. The ONE
+        # legitimate no-edge case -- the engine started while the device was
+        # already running -- is covered by the residual-claiming path, which
+        # names a persistent residual against the signature table within
+        # seconds. Applies regardless of headroom.
+        with m.lock:
+            fam_min_sig = {}
+            for s in m.signatures:
+                fam_min_sig[s["family"]] = min(
+                    fam_min_sig.get(s["family"], float("inf")), abs(s["P"]))
+        for nm in list(on_map):
+            min_sig = fam_min_sig.get(nm)
+            if (on_map[nm] and nm not in claims
+                    and not prev_on_map.get(nm, False)
+                    and min_sig is not None and min_sig >= self.big_edge_min_W
+                    and nm not in recent_named
+                    and not any(dp >= 0.4 * min_sig for dp in recent_on_dPs)):
+                on_map[nm] = False
+                power_map[nm] = 0.0
+                if now_ms - self._veto_log_ms.get(nm, 0) > 60000:
+                    self._veto_log_ms[nm] = now_ms
+                    self._log_event(now_ms, "model_veto", nm,
+                                    prob_map.get(nm), None, None, total_W,
+                                    detail=f"window model voted ON but no "
+                                           f">= {0.4 * min_sig:.0f} W switch-on "
+                                           "step was seen - a device this size "
+                                           "cannot start silently (phantom "
+                                           "suppressed)")
 
         # -- merge edge claims over the model ----------------------------------
         # A claim forces the device ON with the watts its own switch-on step
@@ -1333,6 +1783,18 @@ class LiveEngine:
             scale = remaining / pred_sum
             for nm in model_on:
                 power_map[nm] = power_map[nm] * scale
+        # -- snap model watts to the nearest known operating mode --------------
+        # A model-tracked device's regressed watts land BETWEEN its physical
+        # modes ('table_fan 13.9 W'); when exactly one mode is close, report
+        # that mode's watts instead -- the leftover goes back into the
+        # residual, where it is honest information rather than smeared error.
+        with m.lock:
+            fam_modes = {f: list(ms) for f, ms in m.modes.items()}
+        for nm in model_on:
+            near = [md for md in fam_modes.get(nm, [])
+                    if abs(power_map[nm] - md["P"]) <= max(3.0, 0.20 * abs(md["P"]))]
+            if len(near) == 1:
+                power_map[nm] = float(near[0]["P"])
 
         # replay only: score this stride against the file's ground truth
         gt_chart = self._update_gt(on_map, power_map, w_samples, instant_W, on_W)
@@ -1408,7 +1870,7 @@ class LiveEngine:
         # the smallest claim first; if a genuine unknown is ever evicted, its
         # unexplained watts re-raise the prompt through the residual monitor.
         if unk_claims and not settling:
-            deficit = total_W - claimed_W - pred_sum
+            deficit = total_W - claimed_W - max(pred_sum, raw_model_W)
             mature_unknowns = (now_ms - min(u["t_ms"] for u in unk_claims)
                                > (ws + 6) * 1000)
             if deficit < 0.5 * unknown_W and mature_unknowns:
@@ -1599,6 +2061,27 @@ class LiveEngine:
             time.sleep(0.5)
         return False
 
+    def _post_teach_checks(self, label: str):
+        """After a teach recording is saved: warn when the new device's
+        signature sits on top of an existing family (they WILL be confused in
+        mixes), and remember the family so the post-retrain hook can verify
+        the model actually learned it."""
+        fam = nl.parse_family(label)
+        with self.lock:
+            self._last_taught_family = fam
+        try:
+            rep = self.models.signature_report(label)
+        except Exception:                 # noqa: BLE001 - advisory only
+            rep = None
+        if rep and rep["distance"] < 1.2:
+            self._log_event(int(time.time() * 1000), "teach_warning", fam,
+                            None, rep["dP_W"], rep["dQ_var"], None,
+                            detail=f"signature is close to '{rep['family']}' "
+                                   f"({rep['label']}: dP {rep['dP_W']:+.0f} W, "
+                                   f"dQ {rep['dQ_var']:+.0f} var) - expect "
+                                   "confusion in mixes; record its other "
+                                   "modes or a longer run to separate them")
+
     def _teach_worker(self, label, retrain):
         off_W, lead_s, tail_s = 5.0, 5.0, 5.0
         on_W = max(8.0, self.edge_min_W)
@@ -1650,6 +2133,7 @@ class LiveEngine:
             done = self.svc.stop_session() or {}
             started = False
             self.models._load_signatures()
+            self._post_teach_checks(label)
             fname = os.path.basename(str(done.get("file", "recording")))
             self._log_event(int(time.time() * 1000), "taught",
                             nl.parse_family(label), None, None, None, None,
@@ -1797,6 +2281,7 @@ class LiveEngine:
                     "measurable device found on top of the background")
             path = self._save_inmix_recording(label, iso, base_a, base_b, drift)
             self.models._load_signatures()
+            self._post_teach_checks(label)
             fname = os.path.basename(path)
             self._log_event(int(time.time() * 1000), "taught",
                             nl.parse_family(label), None, None, None, None,
@@ -2516,7 +3001,8 @@ async function pollEvents(){
       if(e.kind.includes("on") && !e.kind.includes("unknown")) cls = "kind-on";
       if(e.kind.includes("off")) cls = "kind-off";
       if(e.kind.includes("unknown")) cls = "kind-unknown";
-      if(e.kind.includes("fail")) cls = "kind-unknown";
+      if(e.kind.includes("fail") || e.kind.includes("warning") || e.kind.includes("veto")) cls = "kind-unknown";
+      if(e.kind === "mode_change") cls = "kind-on";
       if(e.kind === "taught" || e.kind === "residual_matched") cls = "kind-taught";
       tr.innerHTML = '<td class="time">'+hmsMs(e.time_iso)+'</td><td class="'+cls+'">'+e.kind+
         '</td><td><b>'+e.device+'</b></td><td>'+(e.dP_W==null?"":e.dP_W)+
@@ -2616,6 +3102,14 @@ def main():
     p.add_argument("--teach-record-s", type=float, default=45.0,
                    help="teach: seconds of ON time to record (guided flow) "
                         "before retraining")
+    p.add_argument("--mode-min-w", type=float, default=3.5,
+                   help="settled steps above this (but below the edge "
+                        "threshold) are matched as MODE changes of an "
+                        "already-on device (fan high -> low)")
+    p.add_argument("--big-edge-w", type=float, default=120.0,
+                   help="families whose smallest signature exceeds this can "
+                        "only switch ON via a real step, never by window-"
+                        "model vote alone (kills phantom boiler/coffee)")
     p.add_argument("--web-port", type=int, default=8300)
     p.add_argument("--no-browser", action="store_true")
     args = p.parse_args()
@@ -2662,7 +3156,9 @@ def main():
                           window_s=args.retrain_window, on_w=args.on_w)
     engine = LiveEngine(svc, models, retrainer, session_dir,
                         stride_s=args.stride, unknown_min_W=args.unknown_min_w,
-                        teach_record_s=args.teach_record_s)
+                        teach_record_s=args.teach_record_s,
+                        mode_min_W=args.mode_min_w,
+                        big_edge_min_W=args.big_edge_w)
 
     info = models.info()
     if info["source"] == "none":
