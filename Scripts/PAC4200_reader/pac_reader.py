@@ -734,6 +734,15 @@ class AcquisitionService:
         # live ring buffer for charts: list of (t_ms, {channel: value})
         self._buffer: deque = deque(maxlen=LIVE_BUFFER_SAMPLES)
         self._latest: Dict[str, float] = {}
+        # PARALLEL ring buffer of the raw L1 current spectrum: (t_ms, mag[39]).
+        # Kept separate from _buffer so its consumers (the chart, the NILM
+        # engine) keep seeing the plain (t_ms, scalars) tuples they expect.
+        # Only the in-mix teach reads this: it has no recording session to
+        # hand the full Sample to, so without the spectrum here its captures
+        # carry no harmonics at all -- and the scenario mixer then zero-fills
+        # them, teaching the model that a switching supply has NO harmonic
+        # content (the laptop trained at THD 0 % against a real 168 %).
+        self._spec_buffer: deque = deque(maxlen=LIVE_BUFFER_SAMPLES)
 
         # recording session
         self._writer: Optional[IncrementalHDF5Writer] = None
@@ -890,6 +899,10 @@ class AcquisitionService:
                     self.total_samples += 1
                     self._latest = sample.scalars
                     self._buffer.append((int(now * 1000), sample.scalars))
+                    mag_l1 = sample.h_I_mag.get("L1")
+                    if mag_l1 is not None and getattr(mag_l1, "size", 0):
+                        self._spec_buffer.append(
+                            (int(now * 1000), np.asarray(mag_l1, dtype=np.float32)))
                     if self._writer is not None:
                         self._writer.add(sample)
                         self.session["samples"] = self._writer.n_samples

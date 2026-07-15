@@ -82,7 +82,14 @@ def _clf(kind):
 def train_identify(files, args, out):
     rows, all_harm = [], True
     for f in files:                                   # stream one file at a time
-        s = nl.load_signal(f)
+        # one unreadable recording must not take the whole corpus with it: an
+        # aborted capture leaves a truncated .h5 stub, and it would otherwise
+        # abort EVERY training run from then on
+        try:
+            s = nl.load_signal(f)
+        except (OSError, KeyError) as e:
+            print(f"  SKIP (unreadable, ignoring): {os.path.basename(f)}  [{e}]")
+            continue
         if not s.label:
             continue
         if nl.is_mixed_label(s.label):                # 'a__b' = several devices at once
@@ -181,7 +188,11 @@ def _collect_agg(files, args, what):
         sys.exit(f"{what} needs scenario .h5 files with /ground_truth")
     Xs, Ys, gs, k, harm_ok = [], [], [], 0, True
     for f in files:                                   # stream one scenario at a time
-        s = nl.load_signal(f)
+        try:
+            s = nl.load_signal(f)
+        except (OSError, KeyError) as e:
+            print(f"  SKIP (unreadable, ignoring): {os.path.basename(f)}  [{e}]")
+            continue
         if s.gt_P is None:
             del s; continue
         harm_ok = harm_ok and _scenario_harm_ok(s, f)

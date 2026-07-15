@@ -1,0 +1,1111 @@
+[
+  {
+    "scenario": "measured_scenario_00.h5",
+    "appliances": [
+      "pv",
+      "standing_lamp",
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1768.2,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_01.h5",
+    "appliances": [
+      "table_fan",
+      "standing_fan",
+      "water_boiler"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 989.0,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_02.h5",
+    "appliances": [
+      "water_boiler",
+      "pv",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 985.5,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_03.h5",
+    "appliances": [
+      "standing_lamp",
+      "table_fan",
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 588.2,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_04.h5",
+    "appliances": [
+      "coffee_machine",
+      "water_boiler",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 2296.5,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_05.h5",
+    "appliances": [
+      "water_boiler"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 956.5,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_06.h5",
+    "appliances": [
+      "pv",
+      "standing_lamp"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 588.2,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_07.h5",
+    "appliances": [
+      "table_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 19.3,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_08.h5",
+    "appliances": [
+      "standing_fan",
+      "water_boiler",
+      "table_fan",
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 2226.0,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_09.h5",
+    "appliances": [
+      "water_boiler",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 986.1,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_10.h5",
+    "appliances": [
+      "standing_fan",
+      "pv",
+      "standing_lamp"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 613.2,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_11.h5",
+    "appliances": [
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1330.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_12.h5",
+    "appliances": [
+      "standing_lamp"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 587.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_13.h5",
+    "appliances": [
+      "standing_fan",
+      "table_fan",
+      "standing_lamp",
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 588.6,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_14.h5",
+    "appliances": [
+      "standing_lamp",
+      "water_boiler",
+      "table_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1542.6,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_15.h5",
+    "appliances": [
+      "standing_lamp",
+      "table_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 599.0,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_16.h5",
+    "appliances": [
+      "standing_lamp",
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 587.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_17.h5",
+    "appliances": [
+      "standing_fan",
+      "table_fan",
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 34.5,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_18.h5",
+    "appliances": [
+      "water_boiler",
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 956.6,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_19.h5",
+    "appliances": [
+      "table_fan",
+      "standing_fan",
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 45.3,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_20.h5",
+    "appliances": [
+      "standing_lamp"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 587.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_21.h5",
+    "appliances": [
+      "standing_lamp",
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 588.2,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_22.h5",
+    "appliances": [
+      "pv",
+      "standing_fan",
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 185.2,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_23.h5",
+    "appliances": [
+      "standing_fan",
+      "table_fan",
+      "coffee_machine",
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1366.7,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_24.h5",
+    "appliances": [
+      "standing_lamp",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 587.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_25.h5",
+    "appliances": [
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 42.3,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_26.h5",
+    "appliances": [
+      "pv",
+      "coffee_machine",
+      "water_boiler",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 2334.5,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_27.h5",
+    "appliances": [
+      "pv",
+      "water_boiler",
+      "standing_lamp"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1456.5,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_28.h5",
+    "appliances": [
+      "coffee_machine",
+      "water_boiler"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1012.4,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_29.h5",
+    "appliances": [
+      "coffee_machine",
+      "table_fan",
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1372.0,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_30.h5",
+    "appliances": [
+      "table_fan",
+      "standing_fan",
+      "standing_lamp",
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1721.4,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_31.h5",
+    "appliances": [
+      "standing_lamp",
+      "table_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 587.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_32.h5",
+    "appliances": [
+      "standing_lamp"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 587.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_33.h5",
+    "appliances": [
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 43.5,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_34.h5",
+    "appliances": [
+      "table_fan",
+      "standing_fan",
+      "standing_lamp",
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1872.3,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_35.h5",
+    "appliances": [
+      "table_fan",
+      "pv",
+      "standing_lamp"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 568.6,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_36.h5",
+    "appliances": [
+      "pv",
+      "water_boiler",
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 2308.7,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_37.h5",
+    "appliances": [
+      "table_fan",
+      "standing_fan",
+      "water_boiler",
+      "standing_lamp"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1496.1,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_38.h5",
+    "appliances": [
+      "pv",
+      "table_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 17.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_39.h5",
+    "appliances": [
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 184.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_40.h5",
+    "appliances": [
+      "water_boiler",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 986.7,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_41.h5",
+    "appliances": [
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 43.5,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_42.h5",
+    "appliances": [
+      "standing_lamp",
+      "pv",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 588.2,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_43.h5",
+    "appliances": [
+      "water_boiler",
+      "standing_fan",
+      "pv",
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1026.8,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_44.h5",
+    "appliances": [
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 43.4,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_45.h5",
+    "appliances": [
+      "standing_fan",
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1381.5,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_46.h5",
+    "appliances": [
+      "water_boiler"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 956.2,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_47.h5",
+    "appliances": [
+      "coffee_machine",
+      "standing_fan",
+      "table_fan",
+      "water_boiler"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 2304.0,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_48.h5",
+    "appliances": [
+      "pv",
+      "standing_fan",
+      "water_boiler"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 981.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_49.h5",
+    "appliances": [
+      "standing_lamp",
+      "pv",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 588.2,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_50.h5",
+    "appliances": [
+      "table_fan",
+      "standing_fan",
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 218.0,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_51.h5",
+    "appliances": [
+      "coffee_machine",
+      "table_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1225.2,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_52.h5",
+    "appliances": [
+      "water_boiler",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 986.7,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_53.h5",
+    "appliances": [
+      "standing_lamp",
+      "pv",
+      "water_boiler"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1542.6,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_54.h5",
+    "appliances": [
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 43.5,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_55.h5",
+    "appliances": [
+      "table_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 17.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_56.h5",
+    "appliances": [
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 26.8,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_57.h5",
+    "appliances": [
+      "table_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 17.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_58.h5",
+    "appliances": [
+      "standing_lamp",
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 587.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_59.h5",
+    "appliances": [
+      "water_boiler",
+      "table_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 973.4,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_60.h5",
+    "appliances": [
+      "standing_lamp",
+      "water_boiler",
+      "coffee_machine",
+      "table_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1603.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_61.h5",
+    "appliances": [
+      "standing_fan",
+      "table_fan",
+      "standing_lamp",
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1892.0,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_62.h5",
+    "appliances": [
+      "table_fan",
+      "standing_fan",
+      "standing_lamp",
+      "water_boiler"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1507.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_63.h5",
+    "appliances": [
+      "standing_lamp",
+      "coffee_machine",
+      "table_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1789.0,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_64.h5",
+    "appliances": [
+      "water_boiler",
+      "coffee_machine",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1167.0,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_65.h5",
+    "appliances": [
+      "water_boiler",
+      "table_fan",
+      "standing_lamp"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1473.8,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_66.h5",
+    "appliances": [
+      "standing_lamp",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 618.1,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_67.h5",
+    "appliances": [
+      "standing_lamp"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 587.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_68.h5",
+    "appliances": [
+      "coffee_machine",
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 159.2,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_69.h5",
+    "appliances": [
+      "standing_lamp",
+      "table_fan",
+      "water_boiler"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1543.0,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_70.h5",
+    "appliances": [
+      "water_boiler"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 956.5,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_71.h5",
+    "appliances": [
+      "water_boiler",
+      "table_fan",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1003.7,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_72.h5",
+    "appliances": [
+      "table_fan",
+      "coffee_machine",
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1330.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_73.h5",
+    "appliances": [
+      "pv",
+      "standing_fan",
+      "table_fan",
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1398.1,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_74.h5",
+    "appliances": [
+      "water_boiler",
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 2287.0,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_75.h5",
+    "appliances": [
+      "standing_fan",
+      "standing_lamp",
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 587.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_76.h5",
+    "appliances": [
+      "water_boiler"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 956.5,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_77.h5",
+    "appliances": [
+      "pv",
+      "water_boiler",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 979.1,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_78.h5",
+    "appliances": [
+      "coffee_machine",
+      "standing_lamp",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 650.4,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_79.h5",
+    "appliances": [
+      "coffee_machine",
+      "standing_fan",
+      "standing_lamp"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1852.5,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_80.h5",
+    "appliances": [
+      "standing_fan",
+      "coffee_machine",
+      "table_fan",
+      "water_boiler"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 2325.5,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_81.h5",
+    "appliances": [
+      "standing_lamp"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 501.0,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_82.h5",
+    "appliances": [
+      "water_boiler",
+      "pv",
+      "table_fan",
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 2257.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_83.h5",
+    "appliances": [
+      "water_boiler",
+      "pv",
+      "standing_lamp",
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1584.8,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_84.h5",
+    "appliances": [
+      "coffee_machine",
+      "standing_lamp"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1811.6,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_85.h5",
+    "appliances": [
+      "standing_fan",
+      "water_boiler",
+      "table_fan",
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 2324.2,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_86.h5",
+    "appliances": [
+      "pv",
+      "standing_lamp",
+      "water_boiler"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1505.5,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_87.h5",
+    "appliances": [
+      "water_boiler",
+      "standing_fan",
+      "table_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 995.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_88.h5",
+    "appliances": [
+      "coffee_machine",
+      "pv",
+      "standing_lamp",
+      "table_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 1819.5,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_89.h5",
+    "appliances": [
+      "coffee_machine",
+      "table_fan",
+      "standing_fan",
+      "water_boiler"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 2261.4,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_90.h5",
+    "appliances": [
+      "pv",
+      "table_fan",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 51.0,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_91.h5",
+    "appliances": [
+      "coffee_machine",
+      "table_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 195.9,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_92.h5",
+    "appliances": [
+      "standing_lamp",
+      "standing_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 610.4,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_93.h5",
+    "appliances": [
+      "standing_fan",
+      "pv"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 42.7,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_94.h5",
+    "appliances": [
+      "standing_fan",
+      "table_fan",
+      "standing_lamp",
+      "coffee_machine"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 650.4,
+    "harmonics_complete": true
+  },
+  {
+    "scenario": "measured_scenario_95.h5",
+    "appliances": [
+      "standing_lamp",
+      "pv",
+      "table_fan"
+    ],
+    "duration_s": 300.0,
+    "n_samples": 1500,
+    "P_total_peak_W": 605.1,
+    "harmonics_complete": true
+  }
+]

@@ -45,6 +45,11 @@ import live                              # noqa: E402
 SR = 5.0                                 # Hz, like the real default poll rate
 
 
+N_ORDERS = 39                            # orders 2..40, as the real meter
+I_BG = 1                                 # order 3  -> background's harmonics
+I_DEV = 3                                # order 5  -> the device's harmonics
+
+
 class FakeSvc:
     """The slice of pr.AcquisitionService the teach flow touches."""
 
@@ -52,6 +57,8 @@ class FakeSvc:
         self.sample_rate_hz = SR
         self._lock = threading.RLock()
         self._buffer = deque(maxlen=8000)
+        # the parallel per-order spectrum ring buffer the real service keeps
+        self._spec_buffer = deque(maxlen=8000)
         self.state = "connected"
         self.session = None
         self.reader = types.SimpleNamespace(gt=None)
@@ -69,13 +76,14 @@ class Feeder(threading.Thread):
     """Synthetic meter: steady background + the device under teach."""
 
     def __init__(self, svc, bg_W=300.0, bg_Q=50.0, dev_W=120.0, dev_Q=20.0,
-                 emit_he=True):
+                 emit_he=True, emit_spec=True):
         super().__init__(daemon=True, name="feeder")
         self.svc = svc
         self.bg_W, self.bg_Q = bg_W, bg_Q
         self.dev_W, self.dev_Q = dev_W, dev_Q
         self.dev_on = True               # the unknown device is running
         self.emit_he = emit_he           # False -> THD%-fallback path
+        self.emit_spec = emit_spec       # False -> meter gives no spectrum
         self.stop_flag = False
         self.rng = np.random.default_rng(7)
 
@@ -104,8 +112,19 @@ class Feeder(threading.Thread):
                       "THD_I_L1": thd}
             if self.emit_he:
                 sample["HE_I_L1"] = i_h_amp
+            # per-order spectrum: the background's harmonics sit on one order
+            # and the device's on another, so the RSS isolation can be checked
+            # exactly -- the device's order must survive, the background's
+            # must cancel to ~0
+            mag = np.zeros(N_ORDERS, dtype=np.float32)
+            mag[I_BG] = 0.08 * i_f_bg
+            if self.dev_on:
+                mag[I_DEV] = 0.05 * math.hypot(self.dev_W, self.dev_Q) / 230.0
+            t_ms = int(time.time() * 1000)
             with self.svc._lock:
-                self.svc._buffer.append((int(time.time() * 1000), sample))
+                self.svc._buffer.append((t_ms, sample))
+                if self.emit_spec:
+                    self.svc._spec_buffer.append((t_ms, mag))
             time.sleep(1.0 / SR)
 
 
@@ -184,7 +203,10 @@ def load_saved(models):
     files = sorted(glob.glob(os.path.join(models.onthego_dir, "*.h5")))
     assert files, "no recording saved in on-the-go/"
     with h5py.File(files[-1], "r") as f:
-        data = {ch: f["measurements/" + ch][:] for ch in f["measurements"]}
+        data = {ch: f["measurements/" + ch][:] for ch in f["measurements"]
+                if ch != "harmonics"}
+        if "harmonics" in f["measurements"]:
+            data["_I_mag_L1"] = f["measurements/harmonics/I_mag_L1"][:]
         md = dict(f["metadata"].attrs)
         summary = json.loads(md["recording_summary"])
     return data, md, summary
@@ -251,6 +273,31 @@ def scenario_steady():
             f"S misses the distortion VA: {med_S:.1f} vs {exp_S:.1f}"
         print(f"device THD {med_thd:.1f} %, S {med_S:.1f} VA "
               f"(expected {exp_S:.1f})")
+
+        # the saved file MUST carry a real per-order spectrum. Without it the
+        # scenario mixer zero-fills the device and the mix model is taught
+        # that it has NO harmonic content -- which for a switching supply is
+        # the inverse of the truth (the laptop trained at THD 0 % against a
+        # real 168 % and was then read as the coffee machine live).
+        assert md["harmonics_enabled"], "saved recording claims no harmonics"
+        assert "_I_mag_L1" in data, "no harmonics/I_mag_L1 group was written"
+        mag = data["_I_mag_L1"]
+        assert mag.shape == (len(P), N_ORDERS), f"spectrum shape {mag.shape}"
+        # the DEVICE's order must survive the isolation...
+        body_mag = mag[on]
+        got_dev = float(np.median(body_mag[:, I_DEV]))
+        exp_dev = 0.05 * i_f_dev
+        assert abs(got_dev - exp_dev) <= 0.15 * exp_dev, \
+            f"device harmonic order lost: {got_dev:.4f} A vs {exp_dev:.4f} A"
+        # ...and the BACKGROUND's order must be subtracted out
+        got_bg = float(np.median(body_mag[:, I_BG]))
+        assert got_bg <= 0.15 * exp_dev, \
+            f"background harmonics leaked into the spectrum: {got_bg:.4f} A"
+        # the off lead carries no device -> no harmonics
+        assert float(np.max(mag[:n_lead - 2])) == 0.0, \
+            "off lead has harmonic content"
+        print(f"spectrum isolated: device order {got_dev:.4f} A "
+              f"(expected {exp_dev:.4f}), background order {got_bg:.4f} A")
         print("scenario 1 PASSED\n")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

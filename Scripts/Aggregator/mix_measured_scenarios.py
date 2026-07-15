@@ -294,7 +294,17 @@ def build(args) -> None:
 
     recs = []
     for p in files:
-        r = load_pac(p)
+        # A recording that cannot be read must not take the whole corpus with
+        # it. An aborted capture leaves a truncated .h5 (a 96-byte stub whose
+        # superblock promises 2048), and load_pac raised straight out of the
+        # loop -- so ONE dead stub in the corpus broke EVERY retrain from then
+        # on, with a traceback the dashboard only showed as "error".
+        try:
+            r = load_pac(p)
+        except (OSError, KeyError) as e:
+            print(f"  SKIP (unreadable, ignoring): {os.path.basename(p)}  [{e}]",
+                  file=sys.stderr)
+            continue
         # mixed recordings ('a__b__c' = several devices at once) have no
         # per-device ground truth -> not usable as single-appliance sources;
         # they serve as real test inputs for infer/live instead.

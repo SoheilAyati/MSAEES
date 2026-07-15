@@ -526,12 +526,19 @@ class ModelManager:
             if len(P) < 25 or not on.any():
                 continue
             sel = self._trim_soft_start(P, on)
-            ih = None
+            ih = thd = None
             if T is not None and len(T) == len(P):
                 fin = sel & np.isfinite(T)
                 if fin.sum() >= max(10, 0.3 * sel.sum()):
                     ih = float(np.median(
                         T[fin] / 100.0 * np.hypot(P[fin], Q[fin]) / 230.0))
+                    # the harmonic RATIO, unlike IH in amps, does not scale
+                    # with load: a laptop charger reads ~172 % at 43 W and at
+                    # 66 W alike, while every other family here sits under
+                    # 22 %. That scale-invariance is what lets the residual
+                    # matcher recognise a variable-draw device far from the
+                    # watts it was taught at (see match_edge's thd gate).
+                    thd = float(np.median(T[fin])) / 100.0
             # the signature carries the observed steady RANGE (p5..p95), not
             # just the median: a laptop charger's draw tapers with battery
             # state across tens of watts, and a point signature turned every
@@ -542,7 +549,7 @@ class ModelManager:
                          "P": float(np.median(P[sel])), "Q": float(np.median(Q[sel])),
                          "P_lo": float(p_lo), "P_hi": float(p_hi),
                          "Q_lo": float(q_lo), "Q_hi": float(q_hi),
-                         "IH": ih})
+                         "IH": ih, "THD": thd})
         self.signatures = sigs
         self.modes = self._build_modes(sigs)
 
@@ -608,6 +615,20 @@ class ModelManager:
     # ~0.008 A). Below this step magnitude the IH term is ignored -- P and Q
     # decide alone, exactly as they did on the branch's parent.
     IH_MIN_STEP = 60.0
+    # ...but a device whose harmonic RATIO is distinctive (THD_DISTINCTIVE)
+    # is worth checking against its harmonic current at ANY step size, flag
+    # or no flag. It is the ONLY thing separating a switching supply
+    # switching off from a GENERATOR's output ramping: both are (-P, ~0 var)
+    # steps, and a PV ramp matched 'monitor off' at d=0.00 -- a perfect fit
+    # to a device nobody touched. A ramp carries no harmonics (ih ~ 0)
+    # because nothing SWITCHED; a real off-step carries the device's own.
+    #
+    # The gate is the RATIO, never the absolute amps: IH scales with device
+    # size, so the monitor (THD 173 %, but only 15 W -> IH 0.114 A) sits
+    # BELOW the coffee machine (THD 2 %, 1206 W -> IH 0.128 A). No IH
+    # threshold can judge the monitor without also judging the coffee
+    # machine -- whose harmonics vary 5x across a brew, and which is exactly
+    # what disabled --ih-matching. THD separates them by 86x.
     # The IH term is OFF by default (use_ih, --ih-matching): measured on the
     # 2026-07-13 choreo recordings it vetoed CORRECT matches twice -- the
     # coffee machine's harmonic current varies 5x across its brew cycle
@@ -618,8 +639,31 @@ class ModelManager:
     # (hair dryer at lamp watts) is preserved behind the flag for devices
     # with genuinely strong, stationary harmonics.
 
+    # Harmonic-RATIO (THD) gate, used only by probes that pass thd= (the
+    # residual matcher). Unlike the IH-in-amps term above it compares a
+    # scale-invariant ratio, and it bites only on LARGE ABSOLUTE
+    # disagreement: the tolerance floors at THD_GATE_ABS and otherwise
+    # follows the SMALLER of the two ratios, so the meter's ~2.3 % THD floor
+    # and a coffee machine's cycle-varying harmonics (both moves of a few
+    # percentage points) can never rule a signature out, while laptop 172 %
+    # vs coffee_standby 22 % (8x, 150 points apart) always does.
+    THD_GATE_ABS = 0.20
+    # A signature this distinctive is identified by its harmonic fingerprint
+    # alone -- no other family here comes within 8x of the laptop's 172 %.
+    THD_DISTINCTIVE = 0.5
+    # ...and when the measured ratio matches such a signature this tightly,
+    # its POWER is allowed to range down toward idle: a switching supply
+    # tapers with battery/CPU state (the laptop taught at 66 W idles at
+    # 43 W), and a taught point-signature would otherwise name the nearest
+    # watt-twin instead -- coffee_machine at conf 0.91, which is exactly the
+    # bug this gate exists for.
+    THD_TIGHT_ABS = 0.10
+    THD_TIGHT_REL = 0.25
+    THD_TAPER_FLOOR = 0.15           # fraction of P_hi a taper may reach down to
+    THD_TAPER_PENALTY = 0.15         # -> conf caps at 0.85 when named off-watts
+
     def match_edge(self, dP: float, dQ: float, ih=None, q_tol_scale: float = 1.0,
-                   q_noise: float = 0.0):
+                   q_noise: float = 0.0, thd=None):
         """Nearest device signature for a power step; None when nothing is
         close. Elliptical distance with SEPARATE P / Q (and, when both sides
         have it, harmonic-current) tolerances: the old single 35 %-of-magnitude
@@ -632,6 +676,16 @@ class ModelManager:
         with self.lock:
             cands = []
             for s in self.signatures:
+                s_thd = s.get("THD")
+                taper = False
+                if (thd is not None and math.isfinite(thd)
+                        and s_thd is not None and s_thd > 0):
+                    gate = max(self.THD_GATE_ABS, min(thd, s_thd))
+                    if abs(thd - s_thd) > gate:
+                        continue          # harmonic shape rules this one out
+                    taper = (s_thd >= self.THD_DISTINCTIVE
+                             and abs(thd - s_thd) <= max(self.THD_TIGHT_ABS,
+                                                         self.THD_TIGHT_REL * s_thd))
                 tol_P = max(15.0, 0.25 * abs(s["P"]))
                 # Q floor stays TIGHT (8 var): reactive power is the only
                 # feature separating a small fan (14-52 var) from a small
@@ -651,15 +705,34 @@ class ModelManager:
                 # beyond it counts (chargers taper, PV drifts with the sun)
                 p_lo, p_hi = s.get("P_lo", s["P"]), s.get("P_hi", s["P"])
                 q_lo, q_hi = s.get("Q_lo", s["Q"]), s.get("Q_hi", s["Q"])
+                terms = []
+                if taper and not (p_lo <= dP <= p_hi):
+                    # the fingerprint, not the watts, is naming this device:
+                    # let its draw sit anywhere between idle and the taught
+                    # level, and let Q shrink with it (both scale with load).
+                    # Never certain, though -- ANOTHER switching supply of
+                    # similar size would show the same ratio, so cap the
+                    # confidence here: enough to name a taught device,
+                    # little enough that a device matched AT its own watts
+                    # always outranks it.
+                    p_lo = min(p_lo, self.THD_TAPER_FLOOR * abs(p_hi))
+                    q_lo, q_hi = min(q_lo, 0.0), max(q_hi, 0.0)
+                    terms.append(self.THD_TAPER_PENALTY)
                 dp_err = 0.0 if p_lo <= dP <= p_hi else \
                     min(abs(dP - p_lo), abs(dP - p_hi))
                 dq_err = 0.0 if q_lo <= dQ <= q_hi else \
                     min(abs(dQ - q_lo), abs(dQ - q_hi))
-                terms = [dp_err / tol_P, dq_err / tol_Q]
+                terms += [dp_err / tol_P, dq_err / tol_Q]
+                # Harmonic-current term. Applied when the SIGNATURE's own
+                # harmonics are distinctive (see IH_DISTINCTIVE) -- there the
+                # signal towers over the RSS-difference noise even on a small
+                # step -- or, for everything else, only behind the
+                # experimental use_ih flag and its IH_MIN_STEP floor.
+                s_ih = s.get("IH")
                 if (self.use_ih and ih is not None and math.isfinite(ih)
-                        and s.get("IH") is not None
+                        and s_ih is not None
                         and math.hypot(dP, dQ) >= self.IH_MIN_STEP):
-                    terms.append((ih - s["IH"]) / max(0.05, 0.35 * s["IH"]))
+                    terms.append((ih - s_ih) / max(0.05, 0.35 * s_ih))
                 # CONJUNCTIVE distance: every dimension must independently
                 # agree. Averaging (RMS) let an uninformative dimension dilute
                 # a real disagreement -- two resistive loads both sit at Q~0,
@@ -963,6 +1036,13 @@ class MixCapture:
         self.engine = engine
         self.chunks = {k: [] for k in self.KEYS}
         self.last_t = 0
+        # raw per-order L1 current spectrum, drained from the acquisition
+        # service's parallel ring buffer: (t_ms[], mag[n, 39]). The in-mix
+        # teach has no recording session, so this is the only path by which
+        # its capture can carry real harmonics into the saved file.
+        self.spec_t: list = []
+        self.spec_mag: list = []
+        self.last_spec_t = 0
 
     def collect(self):
         arrs = self.engine._buffer_arrays()
@@ -974,6 +1054,41 @@ class MixCapture:
         for k in self.KEYS:
             self.chunks[k].append(np.asarray(arrs[k])[sel])
         self.last_t = int(arrs["t_ms"][sel][-1])
+        self._collect_spectra()
+
+    def _collect_spectra(self):
+        buf = getattr(self.engine.svc, "_spec_buffer", None)
+        if buf is None:
+            return
+        with self.engine.svc._lock:
+            fresh = [(t, m) for t, m in buf if t > self.last_spec_t]
+        if not fresh:
+            return
+        for t, m in fresh:
+            self.spec_t.append(int(t))
+            self.spec_mag.append(np.asarray(m, dtype=float))
+        self.last_spec_t = int(fresh[-1][0])
+
+    def spectra(self):
+        """(t_ms[n], mag[n, orders]) of everything captured; (None, None)
+        when the meter delivered no spectrum this session."""
+        if not self.spec_mag:
+            return None, None
+        width = max(m.shape[0] for m in self.spec_mag)
+        out = np.full((len(self.spec_mag), width), np.nan)
+        for i, m in enumerate(self.spec_mag):
+            out[i, :m.shape[0]] = m
+        return np.asarray(self.spec_t, dtype=np.int64), out
+
+    def spec_median(self, t0_ms: int, t1_ms: int):
+        """Median per-order spectrum over [t0, t1]; None when too thin."""
+        t, mag = self.spectra()
+        if t is None:
+            return None
+        sel = (t >= t0_ms) & (t <= t1_ms)
+        if int(sel.sum()) < 3:
+            return None
+        return np.nanmedian(mag[sel], axis=0)
 
     def arrays(self) -> dict:
         return {k: (np.concatenate(self.chunks[k]) if self.chunks[k]
@@ -1011,7 +1126,7 @@ class LiveEngine:
 
     def __init__(self, svc: pr.AcquisitionService, models: ModelManager,
                  retrainer: Retrainer, out_dir: str, stride_s: float = 2.0,
-                 unknown_min_W: float = 30.0, unknown_frac: float = 0.15,
+                 unknown_min_W: float = 12.0, unknown_frac: float = 0.15,
                  unknown_persist_s: float = 8.0, edge_min_W: float = 8.0,
                  edge_claim_conf: float = 0.30, teach_record_s: float = 45.0,
                  mode_min_W: float = 3.5, big_edge_min_W: float = 120.0,
@@ -1079,7 +1194,12 @@ class LiveEngine:
         # switch-on produces its own edge), the residual stays unexplained,
         # and the unknown-device prompt fires instead of a wrong name.
         self.unknown_claims: list = []   # [{W, t_ms}]
-        self.unknown_claim_min_W = max(15.0, edge_min_W)
+        # a step this size or larger may claim its watts as an unknown load.
+        # Anchored to the edge detector's own floor rather than a flat 15 W:
+        # a 14 W monitor sat in the gap between the two -- detectable as an
+        # edge, yet too small to claim OR to prompt (unknown_min_W), so it
+        # could never be taught from the prompt at all.
+        self.unknown_claim_min_W = max(edge_min_W, 0.5 * unknown_min_W)
         self._unknown_flush_until = 0    # model-veto after an unknown off-edge
         # every settled edge this session, matched or not. After a model
         # reload (retrain / variant switch) the history is re-matched against
@@ -1276,8 +1396,153 @@ class LiveEngine:
         if not math.isfinite(q_noise):
             q_noise = 0.0
         return {"t_ms": t_edge, "dP": float(dP), "dQ": float(dQ),
-                "P_after": float(post_P), "ih": ih,
+                "P_after": float(post_P), "Q_after": float(post_Q), "ih": ih,
                 "kind": "full" if full else "mode", "q_noise": q_noise}
+
+    # margin by which a STOP reading must be beaten before an unclaimed
+    # device is invented to explain the same step instead
+    STOP_PREFERENCE_D = 0.15
+
+    def _ih_contradicts(self, fam: str, ih) -> bool:
+        """Do this step's harmonics rule OUT that `fam` is what switched?
+
+        A device whose harmonic current is distinctive TAKES ITS HARMONICS
+        WITH IT when it switches, so its off-step carries them. A step that
+        carries none cannot be that device leaving -- however well the watts
+        line up. This is what stops PV merely ramping (-14 W, ~0 var, no
+        harmonics, nothing switched) from releasing the monitor's claim: by
+        watts alone the two are indistinguishable, and the matcher fit the
+        wrong one at d=0.00.
+
+        DISABLED -- always False. Kept as the record of why, because the
+        idea keeps looking good and is not.
+
+        It gated on the harmonic RATIO (only families above THD_DISTINCTIVE
+        were argued with) and compared their harmonic CURRENT, which seemed
+        to dodge what shelved --ih-matching. It does not. The gate only picks
+        WHICH devices are judged; the comparison is still absolute amps, and
+        that is fragile for precisely the small high-THD devices the gate
+        selects. The monitor's IH is 0.114 A, so the tolerance is +-0.04 A --
+        and ih is an RSS DIFFERENCE of two THD estimates, which for a 14 W
+        device behind a 731 W toaster is mostly noise. Live, a real monitor
+        off-step read low, was ruled "impossible", and the claim STRANDED:
+        it could not be released at all until the toaster left and the watts
+        guard caught it. A phantom that outlives the device is worse than the
+        PV ramp this was meant to stop.
+
+        Separating a switching supply switching off from a generator ramping
+        needs evidence that does not degrade with device size -- the ratio
+        itself, measured per-sample rather than as a step difference. Until
+        that exists, the watts decide."""
+        return False
+
+    def _read_edge(self, edge):
+        """Decide whether a step is a device STARTING or STOPPING, and which.
+
+        The sign of the step cannot answer this on its own. A consumer
+        starting and a GENERATOR STOPPING are the same event at the meter --
+        both are +P -- and so are a consumer stopping and a generator
+        starting. The old rule (`"on" if dP > 0 else "off"`) simply assumed
+        every device consumes, so PV starting to export read as a device
+        switching OFF, and its -8.5 W step was probed as +8.5 W and pinned on
+        the table fan, force-holding a fan that was never touched.
+
+        Both readings are matched instead, and the better FIT decides:
+          START: some family's signature equals the step itself
+          STOP : some family's signature equals the step negated
+        Where they fit equally (a fan starting looks exactly like PV
+        stopping), the tie goes to the reading that resolves a device we
+        already believe is running -- a device that is not on cannot stop.
+        With no START reading at all, the STOP reading stands unchallenged,
+        which is how a device that was already running when the engine
+        started still releases its watts."""
+        if abs(edge["dP"]) < self.edge_min_W:
+            return ("on" if edge["dP"] > 0 else "off"), None
+        m, kw = self.models, dict(ih=edge.get("ih"),
+                                  q_noise=edge.get("q_noise", 0.0))
+        m_start = m.match_edge(edge["dP"], edge["dQ"], **kw)
+        m_stop = m.match_edge(-edge["dP"], -edge["dQ"], **kw)
+        if m_start is None and m_stop is None:
+            return ("on" if edge["dP"] > 0 else "off"), None
+        # A device we already believe is RUNNING merely changing mode beats
+        # inventing a family out of nothing. PV's signature is a near-twin of
+        # a fan slowing down -- standing_fan high->low is (-8.1 W, -15.0 var)
+        # against pv's (-8.5, -17.4): a shedding inductive load and an
+        # inverter starting to export are the same step. Matching both
+        # polarities put 'pv started' on the table and it fits BEST, so a fan
+        # being turned down claimed a generator that was never plugged in.
+        # _handle_full_edge's own state-change check could not catch it: that
+        # only runs when the MATCHED family is already claimed, and pv never
+        # was.
+        if m_start is not None and self._generation_impossible(edge, m_start):
+            return ("on" if edge["dP"] > 0 else "off"), None
+        if m_start is not None and self._mode_change_explains(edge, m_start):
+            return ("on" if edge["dP"] > 0 else "off"), None
+        if m_start is None:
+            return "off", m_stop
+        if m_stop is None:
+            return "on", m_start
+        with self.lock:
+            running = (m_stop["family"] in self.claims
+                       or bool((self.state.get(m_stop["family"]) or {}).get("on")))
+        if running and m_stop["distance"] <= m_start["distance"] + self.STOP_PREFERENCE_D:
+            return "off", m_stop
+        return "on", m_start
+
+    def _generation_impossible(self, edge, m_start) -> bool:
+        """Would claiming this GENERATOR contradict the meter itself?
+
+        An inverter's reactive power is a fixed property of the hardware: it
+        is there, capacitive, the whole time the thing is plugged in. So if a
+        step were a generator starting, the bus AFTERWARDS must show that
+        reactive power. When the bus is left strongly INDUCTIVE instead, no
+        generator started -- whatever else happened.
+
+        This is what a fan slowing down looks like, and it is why the step
+        alone cannot be trusted: standing_fan high->low is (-8.1 W, -15.0
+        var) against pv's (-8.5, -17.4) -- the same step. But the fan leaves
+        the bus at Q ~ +37 var (it is still spinning), while a real PV start
+        leaves it at Q ~ -17. The DELTAS are twins; the absolute states are
+        opposites.
+
+        Checked only for generators (signature P < 0), and only when the
+        meter gave a settled post-step Q."""
+        with self.models.lock:
+            sigs = [s for s in self.models.signatures
+                    if s["family"] == m_start["family"]]
+        if not sigs or float(np.median([s["P"] for s in sigs])) >= 0:
+            return False                     # not a generator; nothing to say
+        q_after = edge.get("Q_after")
+        if q_after is None or not math.isfinite(q_after):
+            return False
+        q_sig = float(np.median([s["Q"] for s in sigs]))
+        # the generator's own reactive power must be somewhere in what the
+        # bus now shows; a bus sitting on the OPPOSITE side of zero cannot
+        # contain it
+        tol = max(8.0, 0.5 * abs(q_sig)) + 1.5 * max(0.0, edge.get("q_noise", 0.0))
+        return (q_after - q_sig) > tol
+
+    def _mode_change_explains(self, edge, m_start) -> bool:
+        """Would a device already running explain this step by changing mode?
+
+        Only asked when the START reading would name a family that is NOT
+        currently on -- a running device shifting between its own known modes
+        needs no new device to appear, so it wins. The step then falls
+        through to the mode path (_apply_mode_change) as an unrecognized
+        full edge, which is where it belonged."""
+        with self.lock:
+            if m_start["family"] in self.claims:
+                return False            # it IS this device; let it claim
+            on_watts = {f: float(c["W"]) for f, c in self.claims.items()}
+            for nm, v in self.state.items():
+                if (v.get("on") and nm not in on_watts
+                        and v.get("power_W") is not None):
+                    on_watts[nm] = float(v["power_W"])
+        if not on_watts:
+            return False
+        mc = self.models.match_mode_change(on_watts, edge["dP"], edge["dQ"],
+                                           q_noise=edge.get("q_noise", 0.0))
+        return mc is not None
 
     # ---- full edge -> match (single, then pair) -> device state -------------
     def _handle_full_edge(self, edge, record=True):
@@ -1287,13 +1552,9 @@ class LiveEngine:
         `record=False` replays history after a model reload: state changes
         happen, but nothing is re-logged or re-appended."""
         m = self.models
-        direction = "on" if edge["dP"] > 0 else "off"
-        # an on-edge is the device's own (P, Q); an off-edge is its negative
+        direction, match = self._read_edge(edge)
         probe = (edge["dP"], edge["dQ"]) if direction == "on" \
             else (-edge["dP"], -edge["dQ"])
-        match = (m.match_edge(*probe, ih=edge.get("ih"),
-                              q_noise=edge.get("q_noise", 0.0))
-                 if abs(edge["dP"]) >= self.edge_min_W else None)
         # confidence floor: a matched single appliance is only NAMED when it
         # clears self.min_conf (default 0.70). Below it -- or with no match at
         # all -- the step is reported as an unknown load, never a low-confidence
@@ -1410,7 +1671,11 @@ class LiveEngine:
                                           "P_after": edge.get("P_after"),
                                           "q_noise": edge.get("q_noise", 0.0)})
             for s in pair["members"]:
-                w = abs(float(edge["dP"])) * abs(s["P"]) / tot
+                # split the step's magnitude by signature share, then give
+                # each member ITS OWN sign back (a pair could pair a
+                # generator with a load)
+                w = math.copysign(abs(float(edge["dP"])) * abs(s["P"]) / tot,
+                                  s["P"])
                 self.claims[s["family"]] = {"W": w, "Q": float(s["Q"]),
                                             "conf": float(pair["confidence"]),
                                             "t_ms": int(edge["t_ms"]),
@@ -1474,7 +1739,12 @@ class LiveEngine:
             if direction == "on":
                 p_after = edge.get("P_after")
                 if dev != "unrecognized" and conf is not None and conf >= self.edge_claim_conf:
-                    self.claims[dev] = {"W": abs(float(edge["dP"])),
+                    # SIGNED: a consumer's step is positive, a generator's
+                    # negative. abs() here used to erase the only feature that
+                    # identifies generation -- PV exporting 18 W was claimed
+                    # as an 18 W CONSUMER, and _reconcile_claims then killed
+                    # the claim on sight because the meter read -16 W.
+                    self.claims[dev] = {"W": float(edge["dP"]),
                                         "Q": float(edge["dQ"]),
                                         "conf": float(conf),
                                         "t_ms": int(edge["t_ms"]),
@@ -1491,19 +1761,25 @@ class LiveEngine:
                 # another unknown -- fold it into the most recent still-
                 # growing claim, NAMED or anonymous; the claim's watts become
                 # the cumulative rise over its own pre-switch level.
-                W = abs(float(edge["dP"]))
+                W = float(edge["dP"])
                 grow, grow_last = None, None
                 for c in list(self.claims.values()) + self.unknown_claims:
                     lm = c.get("last_ms", c.get("t_ms", 0))
+                    # only a claim of the SAME polarity can be this device
+                    # still ramping: a +30 W step is not a generator growing
                     if (int(edge["t_ms"]) - lm < 12000
+                            and (c["W"] >= 0) == (W >= 0)
                             and (grow_last is None or lm > grow_last)):
                         grow, grow_last = c, lm
                 if grow is not None:
                     if p_after is not None and grow.get("pre_W") is not None:
-                        W = max(W, float(p_after) - grow["pre_W"])
-                    grow["W"] = max(grow["W"], W)
+                        cum = float(p_after) - grow["pre_W"]
+                        if abs(cum) > abs(W):
+                            W = cum
+                    if abs(W) > abs(grow["W"]):
+                        grow["W"] = W
                     grow["last_ms"] = int(edge["t_ms"])
-                elif W >= self.unknown_claim_min_W:
+                elif abs(W) >= self.unknown_claim_min_W:
                     self.unknown_claims.append(
                         {"W": W, "t_ms": int(edge["t_ms"]),
                          "last_ms": int(edge["t_ms"]),
@@ -1522,20 +1798,28 @@ class LiveEngine:
                 # off-step got 'released' as the boiler's 967 W claim (26 %
                 # error, inside the 35 % gate) because only claims were
                 # candidates -- killing the boiler that was still heating.
+                # a claim of W ends with a step of -W: a 950 W boiler stops at
+                # -950, and PV exporting -18 stops at +18. Comparing signed
+                # values (rather than abs(dP) against a magnitude) is what
+                # lets a generator's release be recognised at all, and it also
+                # stops an ON-step from releasing a same-sized claim.
                 best_err = 0.35
                 for fam, c in self.claims.items():
-                    err = abs(abs(edge["dP"]) - c["W"]) / max(c["W"], 20.0)
+                    if self._ih_contradicts(fam, edge.get("ih")):
+                        continue
+                    err = abs(float(edge["dP"]) + c["W"]) / max(abs(c["W"]), 20.0)
                     if err < best_err:
                         drop, drop_unk, drop_model, best_err = fam, None, None, err
                 for i, u in enumerate(self.unknown_claims):
-                    err = abs(abs(edge["dP"]) - u["W"]) / max(u["W"], 20.0)
+                    err = abs(float(edge["dP"]) + u["W"]) / max(abs(u["W"]), 20.0)
                     if err < best_err:
                         drop, drop_unk, drop_model, best_err = None, i, None, err
                 for fam, v in self.state.items():
                     w = v.get("power_W")
                     if (v.get("on") and fam not in self.claims
-                            and w is not None and math.isfinite(w) and w > 0):
-                        err = abs(abs(edge["dP"]) - float(w)) / max(float(w), 20.0)
+                            and w is not None and math.isfinite(w) and abs(w) > 0
+                            and not self._ih_contradicts(fam, edge.get("ih"))):
+                        err = abs(float(edge["dP"]) + float(w)) / max(abs(float(w)), 20.0)
                         if err < best_err:
                             drop, drop_unk, drop_model, best_err = None, None, fam, err
             if drop is not None:
@@ -1546,12 +1830,15 @@ class LiveEngine:
                 # + fan unplugged together) -- release the claim that covers
                 # the remainder too, or it lingers at 16 W against a dead bus
                 if released is not None:
-                    rem = abs(float(edge["dP"])) - float(released["W"])
-                    if rem >= 8.0 and self.claims:
+                    # what the step did NOT account for, signed: the released
+                    # claim ends at -released["W"], anything left over is a
+                    # second device that went with it
+                    rem = -(float(edge["dP"]) + float(released["W"]))
+                    if abs(rem) >= 8.0 and self.claims:
                         f2 = min(self.claims, key=lambda f: abs(
-                            rem - self.claims[f]["W"]) / max(self.claims[f]["W"], 20.0))
+                            rem - self.claims[f]["W"]) / max(abs(self.claims[f]["W"]), 20.0))
                         err2 = abs(rem - self.claims[f2]["W"]) / max(
-                            self.claims[f2]["W"], 20.0)
+                            abs(self.claims[f2]["W"]), 20.0)
                         if err2 < 0.35:
                             self.claims.pop(f2, None)
                             self.forced_off[f2] = int(edge["t_ms"]) + flush_ms
@@ -1623,7 +1910,10 @@ class LiveEngine:
                 # measured value when it does not
                 if abs(w_new - to["P"]) <= max(2.0, 0.15 * abs(to["P"])):
                     w_new = to["P"]
-                c["W"] = max(0.5, w_new)
+                # keep the claim on its own side of zero: a mode change never
+                # turns a load into a generator (the old max(0.5, ...) floor
+                # would have flipped a generator's claim positive)
+                c["W"] = (max(0.5, w_new) if c["W"] >= 0 else min(-0.5, w_new))
                 c["Q"] = to["Q"]
                 c["last_ms"] = now_ms
             else:
@@ -1641,10 +1931,59 @@ class LiveEngine:
                             detail=f"mode ~{frm['P']:.0f} W -> ~{to['P']:.0f} W "
                                    f"({frm['label']} -> {to['label']})")
 
+    def _unclaimed_generation_W(self) -> float:
+        """How much generation could be hiding load from the meter right now.
+
+        A generator we have NOT claimed makes the meter read LESS than the
+        loads actually draw, so the claims legitimately exceed it. Live, PV
+        exporting ~11 W behind a 14 W monitor left the meter at 2.6 W and the
+        guard killed the monitor -- the user saw an empty dashboard with two
+        devices running.
+
+        Bounded by what the generator can actually produce (its signature's
+        most negative watts), and only while it is unclaimed: once PV holds a
+        claim its watts are in the sum and the meter adds up again, so the
+        headroom vanishes and stale claims are caught as tightly as ever."""
+        with self.models.lock:
+            gen = {}
+            for s in self.models.signatures:
+                if s["P"] < 0:
+                    gen[s["family"]] = max(gen.get(s["family"], 0.0),
+                                           abs(float(s.get("P_lo", s["P"]))))
+        with self.lock:
+            return sum(w for f, w in gen.items() if f not in self.claims)
+
+    def _claim_slack_W(self, claimed: float) -> float:
+        """How far the claimed watts may exceed the measured total before a
+        claim is dropped: meter drift, settling, and any generation we have
+        not accounted for.
+
+        The proportional term carries big claims (a 950 W boiler gets ~95 W).
+        The FLOOR is what small devices live or die by, and it used to be a
+        flat 30 W -- larger than the entire claim of every small device here,
+        which made them IMMORTAL: a 17 W table_fan claim survived
+        `17 <= 0 + 30` with the meter reading 0.0 W, and stayed "on" forever
+        after its off-step was masked by a big device switching at the same
+        moment. Anchor the floor to the smallest step the edge detector can
+        see instead: a mismatch below that is not evidence of anything, and
+        one above it is exactly what a missed off-edge looks like.
+        """
+        return (max(self.edge_min_W, 0.10 * abs(claimed))
+                + self._unclaimed_generation_W())
+
     def _reconcile_claims(self, instant_W, now_ms):
-        """Physical guard against stale claims: the claimed devices alone can
-        never draw more than the meter reads RIGHT NOW. Compares against the
-        settled instantaneous total (median of the last ~2.5 s), NOT the lagging
+        """Physical guard against stale claims: the claims' NET power can
+        never exceed what the meter reads RIGHT NOW.
+
+        Claims are SIGNED, so this holds with generation too: PV's -18 W
+        offsets the loads in the same sum the meter does, and a boiler behind
+        exporting PV keeps its claim instead of being dropped for watts the
+        PV was hiding. (While claims stored abs(dP) that was impossible -- a
+        generator read as a consumer of the same size, doubling the apparent
+        load rather than cancelling it.)
+
+        Compares against the settled instantaneous total (median of the last
+        ~2.5 s), NOT the lagging
         window mean -- right after a 970 W boiler switches on, the 10 s window
         mean is still near the pre-switch level and would kill every big claim
         within one stride (that was the water-boiler regression). Claims also
@@ -1660,15 +1999,19 @@ class LiveEngine:
                 # unplugged). Resume the guard once the flush is over.
                 return
             while self.claims or self.unknown_claims:
+                # only CONSUMERS are eviction candidates. The loop runs when
+                # the claims' net exceeds the meter, and dropping a generator
+                # would raise that net -- it would chase its own tail and
+                # evict every load to "fix" an over-claim caused by nothing.
                 mature = {f: c for f, c in self.claims.items()
-                          if now_ms - c["t_ms"] >= 6000}
+                          if now_ms - c["t_ms"] >= 6000 and c["W"] > 0}
                 mature_unk = [i for i, u in enumerate(self.unknown_claims)
-                              if now_ms - u["t_ms"] >= 6000]
+                              if now_ms - u["t_ms"] >= 6000 and u["W"] > 0]
                 if not mature and not mature_unk:
                     break
                 claimed = (sum(c["W"] for c in self.claims.values())
                            + sum(u["W"] for u in self.unknown_claims))
-                if claimed <= instant_W + max(30.0, 0.10 * claimed):
+                if claimed <= instant_W + self._claim_slack_W(claimed):
                     break
                 if mature_unk:           # anonymous loads go before named ones
                     i = max(mature_unk, key=lambda k: self.unknown_claims[k]["W"])
@@ -1706,6 +2049,43 @@ class LiveEngine:
                 q_on += float(np.median(fam_q[nm]))
         return q_now - q_on
 
+    def _residual_thd(self, residual, q_res, arrs, on_map):
+        """Harmonic ratio (THD, as a fraction) of the UNEXPLAINED watts.
+
+        Harmonic currents of independent loads add ~orthogonally, so the
+        residual's own harmonic current is the RSS DIFFERENCE of the measured
+        spectrum energy and the known harmonic currents of everything ON --
+        the same subtraction the in-mix teach uses to isolate a device.
+        Dividing by the residual's own fundamental gives a ratio that does
+        NOT scale with load, which is what makes it usable against a device
+        sitting far from its taught watts. None when the meter delivered no
+        spectrum, or when the residual is too small for the ratio to mean
+        anything (a few watts of noise divided by a few watts of noise)."""
+        he = arrs.get("HE")
+        if he is None or not len(he) or q_res is None:
+            return None
+        k = max(1, int(2.5 * self.svc.sample_rate_hz))
+        tail = he[-k:]
+        if not np.isfinite(tail).any():
+            return None
+        ih_now = float(np.nanmedian(tail))
+        if not math.isfinite(ih_now):
+            return None
+        with self.models.lock:
+            fam_ih: dict = {}
+            for s in self.models.signatures:
+                if s.get("IH") is not None:
+                    fam_ih.setdefault(s["family"], []).append(s["IH"])
+        ih2_on = 0.0
+        for nm, on in on_map.items():
+            if on and nm in fam_ih:
+                ih2_on += float(np.median(fam_ih[nm])) ** 2
+        ih_res = math.sqrt(max(0.0, ih_now ** 2 - ih2_on))
+        i_f = math.hypot(float(residual), float(q_res)) / 230.0
+        if i_f < 0.05:                    # under ~12 VA the ratio is noise
+            return None
+        return ih_res / i_f
+
     def _claim_residual(self, residual, now_ms, arrs, on_map, src_map,
                         prob_map=None):
         """NAME a persistent residual before calling it unknown: probe the
@@ -1718,19 +2098,33 @@ class LiveEngine:
         an estimate (measured Q minus the ON devices' known vars), hence the
         relaxed Q tolerance; the min_conf naming floor still applies.
 
-        When the signature match COLLAPSES because two families sit on the
-        same watts (the taught laptop at 42.9 W is a near-twin of
-        coffee_machine_standby at 46.0 W -- no (P, Q) rule can separate
-        them, so the collapse alone left the laptop 'unknown' FOREVER after
-        teaching), the window model arbitrates: among the watt-plausible
-        contender families, the one whose smoothed presence probability
-        clears min_conf AND beats every rival by a clear margin gets the
-        name. The model sees harmonics/THD/dynamics the signature table does
-        not, and it is exactly the evidence a teach-then-retrain added."""
+        The probe also carries the residual's own harmonic RATIO, which
+        settles the watt-twin cases the (P, Q) table cannot. A variable-draw
+        device sits far from the watts it was taught at -- the laptop taught
+        at 66 W idles at 43 W -- and there it is not merely ambiguous but
+        ABSENT from the candidate list (its P-term is 1.37, past the 1.0
+        cut), so the nearest watt-twin wins outright: coffee_machine_standby
+        at 46 W, named at conf 0.91 with an empty contender list, on a bench
+        where no coffee machine was plugged in. No confidence floor could
+        have caught that; the arbitration below never fired because there
+        was nothing to arbitrate. THD does not scale with load (172 % at
+        43 W and at 66 W alike, against 22 % for the coffee machine and
+        under 13 % for everything else), so match_edge's thd gate rules the
+        impostor out and lets the real device taper down to idle.
+
+        When the signature match still COLLAPSES because two families sit on
+        the same watts AND the same harmonics, the window model arbitrates:
+        among the watt-plausible contender families, the one whose smoothed
+        presence probability clears min_conf AND beats every rival by a
+        clear margin gets the name. The model sees dynamics the signature
+        table does not, and it is exactly the evidence a teach-then-retrain
+        added."""
         q_res = self._residual_q(arrs, on_map, src_map)
         if q_res is None:
             return None
-        m = self.models.match_edge(residual, q_res, q_tol_scale=3.0)
+        thd_res = self._residual_thd(residual, q_res, arrs, on_map)
+        m = self.models.match_edge(residual, q_res, q_tol_scale=3.0,
+                                   thd=thd_res)
         # an unusable single (naming an already-on family) cannot be claimed,
         # but its DISTANCE still sets the bar the pair must clear; a WEAK
         # single stays alive as arbitration input below
@@ -1751,7 +2145,8 @@ class LiveEngine:
                 t0 = int(self._unknown_first or now_ms)
                 for s in pair["members"]:
                     self.claims[s["family"]] = {
-                        "W": abs(float(residual)) * abs(s["P"]) / tot,
+                        "W": math.copysign(
+                            abs(float(residual)) * abs(s["P"]) / tot, s["P"]),
                         "Q": float(s["Q"]),
                         "conf": float(pair["confidence"]), "t_ms": t0}
                     self.forced_off.pop(s["family"], None)
@@ -1811,7 +2206,7 @@ class LiveEngine:
                 return None
         with self.lock:
             t0 = int(self._unknown_first or now_ms)
-            self.claims[fam] = {"W": abs(float(residual)), "Q": float(q_res),
+            self.claims[fam] = {"W": float(residual), "Q": float(q_res),
                                 "conf": float(conf), "t_ms": t0}
             self.forced_off.pop(fam, None)
         self._log_event(now_ms, "residual_matched", fam, conf,
@@ -2304,7 +2699,7 @@ class LiveEngine:
                         self.unknown_frac * abs(model_W) + 0.04 * claimed_W)
         # a persisting unmatched on-edge is direct evidence, no need to wait
         # for the window residual to agree
-        big_unknown = any(u["W"] >= self.unknown_min_W
+        big_unknown = any(abs(u["W"]) >= self.unknown_min_W
                           and now_ms - u["t_ms"] >= self.unknown_persist_s * 1000
                           for u in unk_claims)
         retraining = self.retrainer.status()["state"] == "running"
@@ -2699,9 +3094,13 @@ class LiveEngine:
                     left=max(0.0, dur_s - (time.time() - t0))))
                 time.sleep(0.5)
             cap.collect()
-            st = cap.stats(t0_ms, int(time.time() * 1000))
+            t1_ms = int(time.time() * 1000)
+            st = cap.stats(t0_ms, t1_ms)
             if st is None:
                 raise RuntimeError("no samples captured for the baseline")
+            # the background's own per-order spectrum, so _clean_segment can
+            # RSS-subtract it out of the mix and leave the DEVICE's harmonics
+            st["spec"] = cap.spec_median(t0_ms, t1_ms)
             if st["P_std"] <= max(6.0, 0.05 * abs(st["P"])):
                 break
         return st
@@ -2976,6 +3375,22 @@ class LiveEngine:
                                 detail=thd_warn + "; check the meter's "
                                        "harmonic spectrum reads and teach "
                                        "again if recognition stays weak")
+            elif not all(c.get("spec") is not None for c in cleaned):
+                # a recording with no SPECTRUM does not merely lose a feature:
+                # the scenario mixer zero-fills it, stamps the whole scenario
+                # harmonics_complete=False, and the mix model is then taught
+                # that this device has no harmonic content. For a switching
+                # supply that is the exact inverse of the truth and it will
+                # be mistaken for whatever else sits at its watts. Say so.
+                thd_warn = ("no harmonic spectrum captured - the mix model "
+                            "cannot learn this device's harmonics and may "
+                            "confuse it with devices at similar watts")
+                self._log_event(int(time.time() * 1000), "teach_warning",
+                                nl.parse_family(label), None, None, None, None,
+                                detail=thd_warn + "; run live.py with "
+                                       "harmonics enabled (and verified "
+                                       "HARMONIC_I_FILE numbers), or teach "
+                                       "this device with the guided flow")
             path = self._save_teach_recording(label, cleaned, base_a, {
                 "n_toggles": n_toggles,
                 "device_W_level": round(level, 1),
@@ -3098,12 +3513,72 @@ class LiveEngine:
         act = settled if int(settled.sum()) >= 10 else on
         dev_W = (float(np.nanmedian(P[act])) if act.any()
                  else float(np.nanmedian(P)))
+        # per-order spectrum of the DEVICE alone, isolated exactly like the
+        # THD above: harmonic currents of independent loads add ~orthogonally,
+        # so each order subtracts in quadrature. Without this the saved file
+        # carries no spectrum at all, the scenario mixer zero-fills the device
+        # and stamps harmonics_complete=False, and the mix model is taught
+        # that this device has NO harmonic content -- which for a switching
+        # supply is the exact opposite of the truth and makes it unmatchable.
+        spec = self._segment_spectrum(cap, t0_ms, t1_ms, base, settled)
         return {"t_ms": t, "P_total": P, "Q_total": Q, "S_total": S,
                 "PF_total": PF, "P_L1": P1, "P_L2": P2, "P_L3": P3,
-                "THD_I_L1": THD, "device_W": dev_W,
+                "THD_I_L1": THD, "device_W": dev_W, "spec": spec,
                 "thd_ok": bool(np.isfinite(THD[act]).any()) if act.any()
                 else bool(np.isfinite(THD).any()),
                 "noise_scale": round(float(scale), 3), "n": int(len(t))}
+
+    ORDER_MIN_RISE = 0.15
+    """An order must clear this fraction of the background's own magnitude at
+    that order before its watts are credited to the device. sqrt(mix^2 -
+    base^2) is not a benign subtraction: a fluctuation d on a strong
+    background b leaves ~sqrt(2*b*d), so a NOISY BACKGROUND ORDER FABRICATES
+    device harmonics -- measured here, a 300 W background's order 3 leaked
+    0.004 A into a device whose real content sat on a different order. Below
+    this ratio the rise cannot be told from that artefact, so the order is
+    credited to the background and zeroed."""
+
+    def _segment_spectrum(self, cap: MixCapture, t0_ms: int, t1_ms: int,
+                          base, settled):
+        """Per-sample spectrum of the device alone over one ON stretch,
+        on the stretch's own timeline.
+
+        The spectrum arrives on the meter's own cadence, so each output
+        sample takes the nearest spectrum by timestamp rather than by index.
+        No time masking is needed: where the device is off the mix equals the
+        baseline and the quadrature difference already falls to ~0. Orders
+        that never rise clearly above the background ARE masked -- see
+        ORDER_MIN_RISE.
+
+        Returns None when the meter delivered no spectrum (harmonics off, or
+        the FC-0x14 file numbers unverified) -- the caller then saves no
+        harmonics group at all, exactly as before, rather than writing a
+        fabricated one."""
+        t_spec, mag = cap.spectra()
+        if t_spec is None or base.get("spec") is None:
+            return None
+        a = cap.arrays()
+        t_all = a["t_ms"].astype(np.int64)
+        t_out = t_all[(t_all >= t0_ms) & (t_all <= t1_ms)]
+        if not len(t_out):
+            return None
+        base_spec = np.asarray(base["spec"], dtype=float)
+        n_ord = min(mag.shape[1], base_spec.shape[0])
+        base_spec = base_spec[:n_ord]
+        idx = np.clip(np.searchsorted(t_spec, t_out), 0, len(t_spec) - 1)
+        mix = mag[idx][:, :n_ord]
+        with np.errstate(invalid="ignore"):
+            dev = np.nan_to_num(
+                np.sqrt(np.clip(mix ** 2 - base_spec[None, :] ** 2, 0.0, None)))
+        # decide per ORDER, on the settled body, whether the rise is real
+        body = (settled if (settled is not None
+                            and settled.shape[0] == dev.shape[0]
+                            and int(settled.sum()) >= 5)
+                else np.ones(dev.shape[0], dtype=bool))
+        with np.errstate(invalid="ignore"):
+            keep = np.nanmedian(dev[body], axis=0) >= self.ORDER_MIN_RISE * base_spec
+        dev[:, ~keep] = 0.0
+        return dev
 
     def _save_teach_recording(self, label, segments, base_a, extra) -> str:
         """Write the cleaned ON stretch(es) as a standard recorder .h5 (same
@@ -3118,11 +3593,23 @@ class LiveEngine:
         dt_ms = 1000.0 / max(sr, 1e-6)
         lead_s, gap_s, tail_s = 10.0, 5.0, 8.0
 
+        # the device's isolated spectrum, when the meter delivered one for
+        # EVERY stretch; a partial spectrum is worse than none (the mixer
+        # would treat the gaps as "no harmonic content")
+        n_ord = None
+        if all(s.get("spec") is not None for s in segments):
+            widths = {int(s["spec"].shape[1]) for s in segments}
+            if len(widths) == 1:
+                n_ord = widths.pop()
+
         def zeros(n):
-            return {"P_total": np.zeros(n), "Q_total": np.zeros(n),
-                    "S_total": np.zeros(n), "PF_total": np.ones(n),
-                    "P_L1": np.zeros(n), "P_L2": np.zeros(n),
-                    "P_L3": np.zeros(n), "THD_I_L1": np.full(n, np.nan)}
+            z = {"P_total": np.zeros(n), "Q_total": np.zeros(n),
+                 "S_total": np.zeros(n), "PF_total": np.ones(n),
+                 "P_L1": np.zeros(n), "P_L2": np.zeros(n),
+                 "P_L3": np.zeros(n), "THD_I_L1": np.full(n, np.nan)}
+            if n_ord:
+                z["_spec"] = np.zeros((n, n_ord))   # device off -> no harmonics
+            return z
 
         t_parts, ch_parts = [], []
         cursor = float(segments[0]["t_ms"][0]) - lead_s * 1000.0
@@ -3138,8 +3625,10 @@ class LiveEngine:
                 cursor += n_gap * dt_ms
             rel = (seg["t_ms"] - seg["t_ms"][0]).astype(float)
             t_parts.append(cursor + rel)          # keeps real sample spacing
-            ch_parts.append({ch: np.asarray(seg[ch], dtype=float)
-                             for ch in channels})
+            part = {ch: np.asarray(seg[ch], dtype=float) for ch in channels}
+            if n_ord:
+                part["_spec"] = np.asarray(seg["spec"], dtype=float)
+            ch_parts.append(part)
             cursor += float(rel[-1]) + dt_ms
         n_tail = max(1, int(round(tail_s * sr)))
         t_parts.append(cursor + np.arange(n_tail) * dt_ms)
@@ -3153,12 +3642,30 @@ class LiveEngine:
         os.makedirs(self.models.onthego_dir, exist_ok=True)
         path = os.path.join(self.models.onthego_dir, fname)
         t_us = np.round(t_ms * 1000.0).astype(np.int64)
+        spec = (np.concatenate([p["_spec"] for p in ch_parts])
+                if n_ord else None)
         with h5py.File(path, "w") as f:
             f.create_dataset("timestamp", data=t_us, compression="lzf")
             m = f.create_group("measurements")
             for ch in channels:
                 m.create_dataset(ch, data=np.asarray(data[ch], dtype=np.float32),
                                  compression="lzf")
+            if spec is not None:
+                # same layout as pac_reader's writer, so the scenario mixer
+                # reads harmonics/I_mag_L1 straight off this file and stops
+                # zero-filling the device. Only L1 is real (every appliance
+                # here is on L1); phase is not recoverable from magnitudes,
+                # and harmonic_phase_captured=False records that honestly.
+                h = m.create_group("harmonics")
+                for ph in ("L1", "L2", "L3"):
+                    arr = (spec if ph == "L1"
+                           else np.zeros_like(spec))
+                    h.create_dataset(f"I_mag_{ph}",
+                                     data=np.asarray(arr, dtype=np.float32),
+                                     compression="lzf")
+                    h.create_dataset(f"I_phase_{ph}",
+                                     data=np.zeros_like(spec, dtype=np.float32),
+                                     compression="lzf")
             md = f.create_group("metadata")
             md.attrs["format_version"] = pr.FORMAT_VERSION
             md.attrs["app_version"] = pr.APP_VERSION
@@ -3168,7 +3675,11 @@ class LiveEngine:
             md.attrs["source"] = "live_teach_inmix"
             md.attrs["appliance_label"] = label
             md.attrs["channels"] = json.dumps(channels)
-            md.attrs["harmonics_enabled"] = False
+            md.attrs["harmonics_enabled"] = spec is not None
+            if spec is not None:
+                md.attrs["harmonic_orders"] = json.dumps(
+                    list(range(2, 2 + int(spec.shape[1]))))
+                md.attrs["harmonic_phase_captured"] = False
             md.attrs["teach_mode"] = "on_the_go"
             md.attrs["baseline_P_W"] = round(float(base_a["P"]), 1)
             md.attrs["n_toggles"] = int(extra["n_toggles"])
@@ -3184,7 +3695,7 @@ class LiveEngine:
                 "n_toggles": int(extra["n_toggles"]),
                 "noise_scale": [s["noise_scale"] for s in segments],
                 "configured_sample_rate_hz": sr,
-                "harmonics_enabled": False,
+                "harmonics_enabled": bool(spec is not None),
                 "completed_utc": datetime.now(timezone.utc).isoformat()})
         return path
 
@@ -3401,167 +3912,373 @@ LIVE_HTML = r"""<!DOCTYPE html>
 <title>Live NILM</title>
 <style>
   :root{
-    --bg:#0e1116; --panel:#171c24; --panel2:#1e2530; --line:#2a3340;
-    --txt:#e6edf3; --muted:#8b98a9; --accent:#4aa8ff; --good:#3ecf8e;
-    --warn:#f0b429; --bad:#ff5c5c;
+    color-scheme:dark;
+    --bg:#071017; --bg-soft:#0b151e; --surface:#101c26; --surface-hi:#142431;
+    --surface-low:#0c1821; --line:#20313e; --line-hi:#304755;
+    --txt:#f2f7f8; --muted:#8ea2ad; --dim:#607782;
+    --accent:#53e0c1; --accent-deep:#153f3b; --blue:#65a9ff;
+    --good:#65dda5; --warn:#f4bd62; --bad:#ff7878;
+    --radius:18px; --shadow:0 18px 50px rgba(0,0,0,.22);
   }
   *{box-sizing:border-box}
-  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-       background:var(--bg);color:var(--txt);font-size:14px}
-  header{display:flex;align-items:center;gap:12px;padding:12px 18px;background:var(--panel);
-         border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10;flex-wrap:wrap}
-  header h1{font-size:16px;margin:0;font-weight:600}
-  .dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:middle}
-  .pill{padding:4px 10px;border-radius:20px;background:var(--panel2);border:1px solid var(--line);
-        font-size:12px;color:var(--muted);white-space:nowrap}
-  .pill b{color:var(--txt);font-weight:600}
-  .grow{flex:1}
-  button{background:var(--panel2);color:var(--txt);border:1px solid var(--line);border-radius:8px;
-         padding:7px 13px;font-size:13px;cursor:pointer}
-  button:hover{border-color:var(--accent)}
-  button.primary{background:var(--accent);border-color:var(--accent);color:#04121f;font-weight:600}
-  button.warn{background:#3a2f14;border-color:#6b5716;color:#ffd97a}
-  button:disabled{opacity:.4;cursor:not-allowed}
-  main{display:grid;grid-template-columns:360px 1fr;gap:14px;padding:14px;align-items:start}
-  @media(max-width:980px){main{grid-template-columns:1fr}}
-  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
-  .panel h2{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin:0 0 10px}
-  input[type=text]{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
-        color:var(--txt);padding:8px 10px;font-size:13px;width:100%}
-  .devcard{display:flex;align-items:center;gap:10px;background:var(--panel2);
-           border:1px solid var(--line);border-radius:10px;padding:9px 12px;margin-bottom:8px}
-  .devcard .nm{font-weight:600}
-  .devcard .w{margin-left:auto;font-variant-numeric:tabular-nums;font-weight:600}
-  .devcard .meta{font-size:11px;color:var(--muted)}
-  .swatch{width:12px;height:12px;border-radius:3px;flex:none}
-  .unknown{border:1px solid #6b5716;background:#241d0b;border-radius:10px;padding:12px;margin-bottom:10px}
-  .unknown b{color:var(--warn)}
-  .row{display:flex;gap:8px;margin-top:8px}
-  table{width:100%;border-collapse:collapse;font-size:12.5px}
-  th,td{padding:5px 8px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
-  th{color:var(--muted);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
-  td.time{font-variant-numeric:tabular-nums;color:var(--muted)}
-  .kind-on{color:var(--good)} .kind-off{color:var(--muted)}
-  .kind-unknown{color:var(--warn)} .kind-taught{color:var(--accent)}
-  canvas{width:100%;height:280px;display:block}
-  .kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;font-size:12.5px}
+  html{background:var(--bg);scrollbar-color:var(--line-hi) var(--bg)}
+  body{margin:0;min-width:320px;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,
+       "Segoe UI",sans-serif;background:
+       radial-gradient(circle at 8% -10%,rgba(83,224,193,.10),transparent 26rem),
+       radial-gradient(circle at 96% 12%,rgba(101,169,255,.08),transparent 30rem),var(--bg);
+       color:var(--txt);font-size:14px;line-height:1.45}
+  body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.16;
+       background-image:linear-gradient(rgba(255,255,255,.02) 1px,transparent 1px),
+       linear-gradient(90deg,rgba(255,255,255,.02) 1px,transparent 1px);
+       background-size:48px 48px;mask-image:linear-gradient(to bottom,#000,transparent 72%)}
+  button,input,select{font:inherit}
+  button{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:38px;
+       padding:8px 13px;border:1px solid var(--line-hi);border-radius:10px;background:var(--surface-hi);
+       color:var(--txt);font-size:12px;font-weight:650;cursor:pointer;transition:.18s ease}
+  button:hover{border-color:#507080;background:#19303e;transform:translateY(-1px)}
+  button:active{transform:translateY(0)}
+  button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);
+       outline-offset:2px}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#06221f}
+  button.primary:hover{background:#70ead0;border-color:#70ead0}
+  button.warn{background:#302714;border-color:#64512b;color:#f8ce86}
+  button.warn:hover{background:#3a2f17;border-color:#96763a}
+  button.danger{background:#341d20;border-color:#6d363b;color:#ffaaa9}
+  button:disabled{opacity:.38;cursor:not-allowed;transform:none}
+  input[type=text],select{width:100%;min-height:42px;padding:9px 12px;border:1px solid var(--line);
+       border-radius:11px;background:var(--surface-low);color:var(--txt);transition:.18s ease}
+  input[type=text]::placeholder{color:var(--dim)}
+  input[type=text]:hover,select:hover{border-color:var(--line-hi)}
+  .topbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:14px;
+       min-height:68px;padding:10px max(18px,calc((100vw - 1500px)/2));border-bottom:1px solid rgba(48,71,85,.75);
+       background:rgba(7,16,23,.84);backdrop-filter:blur(18px);box-shadow:0 8px 28px rgba(0,0,0,.16)}
+  .brand{display:flex;align-items:center;gap:11px;min-width:max-content}
+  .brand-mark{position:relative;width:38px;height:38px;border:1px solid rgba(83,224,193,.4);
+       border-radius:12px;background:linear-gradient(145deg,rgba(83,224,193,.20),rgba(83,224,193,.04));
+       box-shadow:inset 0 0 18px rgba(83,224,193,.06)}
+  .brand-mark:before,.brand-mark:after{content:"";position:absolute;left:9px;right:9px;height:2px;
+       border-radius:2px;background:var(--accent);box-shadow:0 6px 0 rgba(83,224,193,.6)}
+  .brand-mark:before{top:12px;transform:skewY(-24deg)}
+  .brand-mark:after{top:20px;transform:skewY(24deg);opacity:.72}
+  .brand-eyebrow{color:var(--accent);font-size:9px;font-weight:800;letter-spacing:.19em;text-transform:uppercase}
+  .brand h1{margin:1px 0 0;font-size:15px;line-height:1.15;letter-spacing:-.01em}
+  .connection{display:flex;align-items:center;gap:8px;min-width:0;margin-left:8px;padding-left:18px;
+       border-left:1px solid var(--line)}
+  .dot{position:relative;width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
+  .dot:after{content:"";position:absolute;inset:-4px;border:1px solid currentColor;border-radius:50%;opacity:.2}
+  .connection-copy{min-width:0}
+  .connection-label{font-size:9px;color:var(--muted);letter-spacing:.12em;text-transform:uppercase}
+  #conn-txt{display:block;max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+       color:#cbd7dc;font-size:11px;font-weight:600}
+  .top-actions{display:flex;align-items:center;gap:9px;margin-left:auto}
+  .sim-control{display:none;align-items:center;gap:6px;padding:4px 4px 4px 10px;border:1px solid var(--line);
+       border-radius:12px;background:var(--surface-low);color:var(--muted);font-size:10px;text-transform:uppercase;
+       letter-spacing:.08em;white-space:nowrap}
+  .sim-control button{min-height:29px;padding:4px 8px;border-radius:8px;font-size:10px}
+  .dashboard{position:relative;z-index:1;width:min(1500px,100%);margin:0 auto;padding:22px 18px 36px}
+  .summary-grid{display:grid;grid-template-columns:1.12fr 1fr .88fr 1.5fr;gap:12px;margin-bottom:16px}
+  .metric{position:relative;min-height:122px;overflow:hidden;padding:18px;border:1px solid var(--line);
+       border-radius:var(--radius);background:linear-gradient(145deg,rgba(20,36,49,.92),rgba(12,24,33,.96));
+       box-shadow:0 14px 34px rgba(0,0,0,.13)}
+  .metric:after{content:"";position:absolute;right:-34px;bottom:-48px;width:130px;height:130px;border-radius:50%;
+       background:radial-gradient(circle,rgba(83,224,193,.1),transparent 68%)}
+  .metric-label{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:10px;font-weight:750;
+       letter-spacing:.13em;text-transform:uppercase}
+  .metric-icon{display:grid;place-items:center;width:25px;height:25px;border-radius:8px;
+       background:rgba(83,224,193,.09);color:var(--accent);font-size:13px}
+  .metric-value{position:relative;z-index:1;margin-top:12px;font-size:32px;font-weight:720;line-height:1;
+       letter-spacing:-.045em;font-variant-numeric:tabular-nums}
+  .metric-value.compact{font-size:18px;line-height:1.2;letter-spacing:-.025em;overflow:hidden;text-overflow:ellipsis;
+       white-space:nowrap}
+  .metric-foot{margin-top:9px;color:var(--dim);font-size:10px}
+  .meter-track{height:4px;margin-top:14px;overflow:hidden;border-radius:9px;background:#20303a}
+  .meter-fill{width:0;height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--blue),var(--accent));
+       box-shadow:0 0 12px rgba(83,224,193,.5);transition:width .45s ease}
+  .alert{display:none;position:relative;overflow:hidden;margin-bottom:14px;padding:18px 18px 18px 64px;
+       border:1px solid #65502d;border-radius:var(--radius);background:linear-gradient(110deg,#2c2415,#191b1b);
+       box-shadow:var(--shadow)}
+  .alert:before{content:"!";position:absolute;left:18px;top:18px;display:grid;place-items:center;width:30px;height:30px;
+       border:1px solid rgba(244,189,98,.45);border-radius:10px;background:rgba(244,189,98,.1);color:var(--warn);
+       font-weight:800}
+  .alert.guide:before{content:"\2192";color:var(--accent);border-color:rgba(83,224,193,.4);background:rgba(83,224,193,.1)}
+  .alert.guide{border-color:#28594f;background:linear-gradient(110deg,#12352f,#131e21)}
+  .alert-title{color:var(--warn);font-size:14px;font-weight:750}
+  .alert.guide .alert-title{color:var(--accent)}
+  .alert-copy{max-width:980px;margin-top:4px;color:#b9c5c8;font-size:12px}
+  .alert-actions{display:flex;align-items:center;gap:8px;max-width:720px;margin-top:12px}
+  .workspace{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:16px;align-items:start}
+  .main-column,.side-column{min-width:0}
+  .side-column{position:sticky;top:84px}
+  .panel{overflow:hidden;margin-bottom:16px;border:1px solid var(--line);border-radius:var(--radius);
+       background:linear-gradient(155deg,rgba(16,28,38,.97),rgba(11,23,31,.98));box-shadow:var(--shadow)}
+  .panel-pad{padding:18px}
+  .panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:18px 18px 0}
+  .panel-title{margin:0;font-size:14px;font-weight:720;letter-spacing:-.015em}
+  .panel-kicker{margin-top:3px;color:var(--muted);font-size:10px}
+  .eyebrow{color:var(--accent);font-size:9px;font-weight:800;letter-spacing:.16em;text-transform:uppercase}
+  .live-badge{display:flex;align-items:center;gap:7px;padding:5px 9px;border:1px solid rgba(83,224,193,.24);
+       border-radius:999px;background:rgba(83,224,193,.07);color:var(--accent);font-size:9px;font-weight:800;
+       letter-spacing:.12em;text-transform:uppercase}
+  .live-badge:before{content:"";width:6px;height:6px;border-radius:50%;background:var(--accent);
+       box-shadow:0 0 0 4px rgba(83,224,193,.09);animation:pulse 2s ease-out infinite}
+  .section-rule{height:1px;margin:16px 18px 0;background:linear-gradient(90deg,var(--line),transparent)}
+  .device-list{padding:14px 18px 18px}
+  .empty-state{display:grid;place-items:center;min-height:112px;text-align:center;color:var(--muted);font-size:12px}
+  .empty-state:before{content:"";display:block;width:28px;height:28px;margin:0 auto 8px;border:1px solid var(--line-hi);
+       border-radius:50%;box-shadow:inset 0 0 0 7px var(--surface-low)}
+  .devcard{position:relative;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;
+       overflow:hidden;margin-bottom:8px;padding:13px 14px 13px 17px;border:1px solid var(--line);
+       border-radius:13px;background:rgba(18,33,44,.78);transition:.18s ease}
+  .devcard:hover{border-color:var(--line-hi);transform:translateX(2px)}
+  .devcard:before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--device-color,var(--dim))}
+  .device-main{display:flex;align-items:center;gap:11px;min-width:0}
+  .device-symbol{display:grid;place-items:center;width:31px;height:31px;flex:none;border-radius:10px;
+       background:color-mix(in srgb,var(--device-color,var(--dim)) 12%,transparent);
+       border:1px solid color-mix(in srgb,var(--device-color,var(--dim)) 28%,transparent)}
+  .device-symbol .swatch{width:8px;height:8px;border-radius:50%;background:var(--device-color,var(--dim));
+       box-shadow:0 0 10px var(--device-color,var(--dim))}
+  .devcard .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:700}
+  .devcard .meta{margin-top:2px;color:var(--muted);font-size:9.5px;letter-spacing:.01em}
+  .device-reading{text-align:right}
+  .devcard .w{font-size:16px;font-weight:720;line-height:1;font-variant-numeric:tabular-nums}
+  .confidence{display:flex;align-items:center;justify-content:flex-end;gap:6px;margin-top:6px;color:var(--dim);font-size:9px}
+  .confidence-track{width:46px;height:3px;overflow:hidden;border-radius:4px;background:#263945}
+  .confidence-fill{height:100%;border-radius:inherit;background:var(--device-color,var(--accent))}
+  .source-tag{padding:1px 5px;border-radius:5px;background:rgba(83,224,193,.1);color:var(--accent);font-size:8px;
+       font-weight:750;text-transform:uppercase}
+  .side-card{padding:17px}
+  .side-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:13px}
+  .side-title h2{margin:0;font-size:12px;font-weight:720}
+  .side-icon{display:grid;place-items:center;width:28px;height:28px;border:1px solid var(--line);border-radius:9px;
+       background:var(--surface-low);color:var(--accent)}
+  .helper{margin:0 0 12px;color:var(--muted);font-size:10.5px;line-height:1.55}
+  .row{display:flex;gap:8px;margin-top:9px}
+  .row>*{min-width:0}
+  .row button{flex:1}
+  .kv{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 12px;margin-top:13px;font-size:10.5px}
   .kv div:nth-child(odd){color:var(--muted)}
-  .muted{color:var(--muted)} .small{font-size:12px}
-  #retrainbar{display:none;margin-top:8px;font-size:12px;color:var(--warn)}
-  .spin{display:inline-block;width:11px;height:11px;border:2px solid var(--warn);
-        border-top-color:transparent;border-radius:50%;animation:sp 1s linear infinite;
-        vertical-align:-2px;margin-right:6px}
-  @keyframes sp{to{transform:rotate(360deg)}}
+  .kv div:nth-child(even){overflow:hidden;color:#d8e2e5;text-align:right;text-overflow:ellipsis;white-space:nowrap}
+  .device-vocab{margin-top:12px;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--surface-low);
+       color:var(--muted);font-size:9.5px;line-height:1.55}
+  #retrainbar{display:none;margin:0 18px 16px;padding:10px 12px;border:1px solid #5d4b29;border-radius:10px;
+       background:#241f14;color:var(--warn);font-size:10px}
+  .spin{display:inline-block;width:11px;height:11px;margin-right:7px;border:2px solid var(--warn);
+       border-top-color:transparent;border-radius:50%;vertical-align:-2px;animation:spin 1s linear infinite}
+  #teach-note:not(:empty),#rec-status:not(:empty){margin-top:10px;padding:8px 10px;border-radius:9px;
+       background:var(--surface-low);color:#b9c7cb}
+  .chart-wrap{position:relative;padding:10px 16px 6px}
+  canvas{display:block;width:100%;height:320px}
+  .legend{display:flex;flex-wrap:wrap;gap:6px 14px;padding:5px 18px 17px;color:var(--muted);font-size:9.5px}
+  .legend-item{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+  .legend-sample{width:16px;height:3px;border-radius:3px;background:currentColor}
+  .legend-sample.area{height:7px;border-radius:2px;opacity:.75}
+  .legend-sample.dashed{height:0;border-top:2px dashed currentColor;background:none}
+  .table-wrap{overflow:auto;max-height:360px;margin-top:14px;border-top:1px solid var(--line)}
+  table{width:100%;border-collapse:collapse;font-size:10.5px}
+  th,td{padding:9px 11px;text-align:left;border-bottom:1px solid rgba(32,49,62,.72);white-space:nowrap}
+  th{position:sticky;top:0;z-index:2;background:#101c26;color:var(--dim);font-size:8.5px;font-weight:800;
+       letter-spacing:.1em;text-transform:uppercase}
+  tbody tr{transition:background .16s ease}
+  tbody tr:hover{background:rgba(101,169,255,.035)}
+  td.time{color:var(--muted);font-variant-numeric:tabular-nums}
+  td.detail-cell{max-width:360px;overflow:hidden;text-overflow:ellipsis;color:var(--muted)}
+  .table-swatch{display:inline-block;width:8px;height:8px;border-radius:50%;box-shadow:0 0 8px currentColor}
+  .event-badge{display:inline-flex;padding:3px 7px;border:1px solid currentColor;border-radius:999px;
+       font-size:8px;font-weight:750;letter-spacing:.04em;text-transform:uppercase}
+  .kind-on{color:var(--good)} .kind-off{color:var(--muted)}
+  .kind-unknown{color:var(--warn)} .kind-taught{color:var(--blue)}
+  .gt-summary{margin:14px 18px 0;padding:10px 12px;border:1px solid var(--line);border-radius:10px;
+       background:var(--surface-low);color:var(--muted);font-size:10px}
+  .muted{color:var(--muted)} .small{font-size:11px}
+  .toast{position:fixed;right:18px;bottom:18px;z-index:40;max-width:min(390px,calc(100vw - 36px));padding:12px 15px;
+       border:1px solid var(--line-hi);border-radius:12px;background:#142431;color:var(--txt);box-shadow:var(--shadow);
+       font-size:11px;opacity:0;transform:translateY(12px);pointer-events:none;transition:.22s ease}
+  .toast.show{opacity:1;transform:translateY(0)}
+  .toast.error{border-color:#723b42;background:#2b1b20;color:#ffc2c2}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @keyframes pulse{0%,100%{box-shadow:0 0 0 4px rgba(83,224,193,.08)}50%{box-shadow:0 0 0 8px rgba(83,224,193,0)}}
+  @media(max-width:1100px){
+    .summary-grid{grid-template-columns:repeat(2,1fr)}
+    .workspace{grid-template-columns:minmax(0,1fr) 310px}
+    #conn-txt{max-width:240px}
+  }
+  @media(max-width:850px){
+    .topbar{align-items:flex-start;flex-wrap:wrap;padding:10px 14px}
+    .connection{order:3;width:100%;margin:0;padding:8px 0 0;border-left:0;border-top:1px solid var(--line)}
+    #conn-txt{max-width:none}
+    .workspace{grid-template-columns:1fr}
+    .side-column{position:static;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+    .side-column .panel{margin-bottom:0}
+  }
+  @media(max-width:600px){
+    .dashboard{padding:14px 10px 28px}
+    .summary-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+    .metric{min-height:106px;padding:14px}
+    .metric-value{font-size:25px}.metric-value.compact{font-size:14px}
+    .sim-control{order:4;width:100%;justify-content:space-between}
+    .top-actions{gap:6px}.top-actions>button{padding:8px 10px}
+    .side-column{grid-template-columns:1fr}
+    .alert{padding:54px 14px 14px}.alert:before{top:14px;left:14px}
+    .alert-actions{align-items:stretch;flex-direction:column}.alert-actions .row{width:100%}
+    .panel-head{padding:15px 15px 0}.device-list{padding:12px 15px 15px}
+    canvas{height:260px}.table-wrap{max-height:300px}
+  }
+  @media(prefers-reduced-motion:reduce){*,*:before,*:after{scroll-behavior:auto!important;animation:none!important;transition:none!important}}
 </style>
 </head>
 <body>
-<header>
-  <h1>Live NILM</h1>
-  <span class="pill"><span id="conn-dot" class="dot" style="background:var(--bad)"></span><b id="conn-txt">connecting…</b></span>
-  <span class="pill">total <b id="p-total">-</b></span>
-  <span class="pill">explained <b id="explained">-</b></span>
-  <span class="pill">model <b id="model-info">-</b></span>
-  <span class="grow"></span>
-  <span class="pill" id="sim-pill" style="display:none">simulated meter:
-    <button onclick="simLoad(0)" style="padding:2px 8px">0%</button>
-    <button onclick="simLoad(1)" style="padding:2px 8px">100%</button>
-    <button onclick="simLoad(1.6)" style="padding:2px 8px">160%</button>
-  </span>
-  <button id="retrain-btn" class="warn" onclick="retrain()">Retrain now</button>
+<header class="topbar">
+  <div class="brand" aria-label="MSAEES live NILM">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <div><div class="brand-eyebrow">MSAEES</div><h1>Live energy intelligence</h1></div>
+  </div>
+  <div class="connection" aria-live="polite">
+    <span id="conn-dot" class="dot" style="background:var(--bad);color:var(--bad)"></span>
+    <div class="connection-copy">
+      <div class="connection-label">Meter connection</div>
+      <b id="conn-txt">Connecting...</b>
+    </div>
+  </div>
+  <div class="top-actions">
+    <div id="sim-pill" class="sim-control">
+      <span>Simulated load</span>
+      <button onclick="simLoad(0)" title="Set simulated load to 0%">0%</button>
+      <button onclick="simLoad(1)" title="Set simulated load to 100%">100%</button>
+      <button onclick="simLoad(1.6)" title="Set simulated load to 160%">160%</button>
+    </div>
+    <button id="retrain-btn" class="warn" onclick="retrain()">
+      <span aria-hidden="true">&#8635;</span> Retrain model
+    </button>
+  </div>
 </header>
 
-<main>
-  <section>
-    <div id="guide-box" class="unknown" style="display:none">
-      <b>Teaching - follow the steps</b>
-      <div class="small" id="guide-msg" style="margin-top:6px"></div>
-      <div class="row"><button onclick="teachCancel()">Cancel</button></div>
-    </div>
+<main class="dashboard">
+  <section class="summary-grid" aria-label="Live system summary">
+    <article class="metric">
+      <div class="metric-label"><span class="metric-icon">&#9889;</span>Measured power</div>
+      <div class="metric-value" id="p-total">-</div>
+      <div class="metric-foot">Aggregate draw at the meter</div>
+    </article>
+    <article class="metric">
+      <div class="metric-label"><span class="metric-icon">&#9673;</span>Power explained</div>
+      <div class="metric-value" id="explained">-</div>
+      <div class="meter-track"><div class="meter-fill" id="explained-fill"></div></div>
+      <div class="metric-foot">Assigned to recognized loads</div>
+    </article>
+    <article class="metric">
+      <div class="metric-label"><span class="metric-icon">&#9679;</span>Active loads</div>
+      <div class="metric-value" id="active-count">-</div>
+      <div class="metric-foot">Recognized and currently on</div>
+    </article>
+    <article class="metric">
+      <div class="metric-label"><span class="metric-icon">M</span>Recognition model</div>
+      <div class="metric-value compact" id="model-info">-</div>
+      <div class="metric-foot">Latest held-out model performance</div>
+    </article>
+  </section>
 
-    <div id="unknown-box" class="unknown" style="display:none">
-      <b>Unknown device detected</b>
-      <div class="small" style="margin-top:4px">
-        ~<span id="unk-w">?</span> W of unexplained power since <span id="unk-since">?</span>.
-        What device is this? Name it, then either record it in ISOLATION
-        (disconnect everything first - cleanest data) or teach it ON THE GO:
-        the other devices keep running and you switch just this one device
-        off and back on once when asked. Its signal is isolated from the mix
-        and cross-checked against independent measurements; only if the
-        background interferes are you asked for one or two more toggles.
-      </div>
+  <section id="guide-box" class="alert guide" aria-live="assertive">
+    <div class="alert-title">Teaching in progress</div>
+    <div class="alert-copy" id="guide-msg">Follow the current capture step.</div>
+    <div class="alert-actions"><button class="danger" onclick="teachCancel()">Cancel teaching</button></div>
+  </section>
+
+  <section id="unknown-box" class="alert" aria-live="assertive">
+    <div class="alert-title">Unknown load detected</div>
+    <div class="alert-copy">
+      About <b><span id="unk-w">?</span> W</b> has remained unexplained since
+      <span id="unk-since">?</span>. Name the device and choose a clean isolated
+      capture, or keep everything running and teach it in the current mix.
+    </div>
+    <div class="alert-actions">
+      <input type="text" id="teach-name" aria-label="Unknown device name" placeholder="Device name, e.g. kettle">
       <div class="row">
-        <input type="text" id="teach-name" placeholder="e.g. kettle">
+        <button class="primary" onclick="teach('isolated')">Teach isolated</button>
+        <button class="warn" onclick="teach('inmix')">Teach in mix</button>
       </div>
-      <div class="row">
-        <button class="primary" onclick="teach('isolated')">Teach&nbsp;(isolated)</button>
-        <button class="warn" onclick="teach('inmix')">Teach&nbsp;on&nbsp;the&nbsp;go</button>
-      </div>
-    </div>
-
-    <div class="panel">
-      <h2>Currently on</h2>
-      <div id="on-list" class="muted small">-</div>
-      <div id="retrainbar"><span class="spin"></span><span id="retrain-step">retraining…</span></div>
-      <div id="teach-note" class="small muted" style="margin-top:6px"></div>
-    </div>
-
-    <div class="panel">
-      <h2>Model</h2>
-      <select id="model-variant" onchange="setVariant(this.value)"
-              style="width:100%;margin-bottom:10px;background:var(--panel2);
-                     border:1px solid var(--line);border-radius:8px;
-                     color:var(--txt);padding:8px 10px;font-size:13px">
-        <option value="latest">train-on-the-go (latest)</option>
-      </select>
-      <div class="kv" id="model-kv"></div>
-      <div class="small muted" id="model-devices" style="margin-top:8px"></div>
-      <button class="warn" id="model-reset-btn" onclick="modelReset()"
-              style="width:100%;margin-top:10px;display:none">
-        Erase retrained models (start clean from original)</button>
-    </div>
-
-    <div class="panel">
-      <h2>Teach a device by recording it</h2>
-      <div class="small muted" style="margin-bottom:8px">
-        Plug in ONLY the new device, give it a name, record ~75 s (like a
-        campaign single), stop - the recording lands in on-the-go/ and the
-        model retrains automatically with the new device included.
-      </div>
-      <input type="text" id="rec-name" placeholder="device name, e.g. desk_lamp">
-      <div class="row">
-        <button class="primary" id="rec-start" onclick="recStart()">Start recording</button>
-        <button id="rec-stop" onclick="recStop()" disabled>Stop&nbsp;+&nbsp;retrain</button>
-      </div>
-      <div class="small muted" id="rec-status" style="margin-top:6px"></div>
     </div>
   </section>
 
-  <section>
-    <div class="panel">
-      <h2>Live power &amp; per-device estimate</h2>
-      <canvas id="chart" width="1200" height="280"></canvas>
-      <div id="legend" class="small muted" style="margin-top:6px"></div>
-    </div>
-    <div class="panel" id="gt-panel" style="display:none">
-      <h2>Replay: prediction vs ground truth</h2>
-      <div id="gt-summary" class="small muted" style="margin-bottom:8px"></div>
-      <table>
-        <thead><tr><th></th><th>device</th><th>truth</th><th>predicted</th>
-          <th>match</th><th>truth W</th><th>predicted W</th><th>&Delta;W</th></tr></thead>
-        <tbody id="gt-body"></tbody>
-      </table>
-    </div>
-    <div class="panel">
-      <h2>Event log: what switched, exactly when</h2>
-      <div style="max-height:340px;overflow:auto">
-        <table>
-          <thead><tr><th>time</th><th>event</th><th>device</th><th>ΔP (W)</th><th>ΔQ (var)</th><th>conf</th><th>detail</th></tr></thead>
-          <tbody id="ev-body"></tbody>
-        </table>
-      </div>
-    </div>
-  </section>
+  <div class="workspace">
+    <section class="main-column">
+      <article class="panel">
+        <div class="panel-head">
+          <div><div class="eyebrow">Disaggregation</div><h2 class="panel-title">Loads on now</h2>
+            <div class="panel-kicker">Live estimates, confidence, and switch-on time</div></div>
+          <span class="live-badge">Live</span>
+        </div>
+        <div class="section-rule"></div>
+        <div id="on-list" class="device-list"><div class="empty-state">Waiting for a recognized load</div></div>
+        <div id="retrainbar"><span class="spin"></span><span id="retrain-step">Retraining...</span></div>
+        <div id="teach-note" class="small muted" style="margin:0 18px 16px"></div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <div><div class="eyebrow">Last 60 seconds</div><h2 class="panel-title">Power composition</h2>
+            <div class="panel-kicker">Measured total with stacked per-device estimates</div></div>
+          <span class="live-badge">Streaming</span>
+        </div>
+        <div class="chart-wrap"><canvas id="chart" width="1200" height="320" aria-label="Live power chart"></canvas></div>
+        <div id="legend" class="legend"></div>
+      </article>
+
+      <article class="panel" id="gt-panel" style="display:none">
+        <div class="panel-head">
+          <div><div class="eyebrow">Replay validation</div><h2 class="panel-title">Prediction vs ground truth</h2>
+            <div class="panel-kicker">Live evaluation against the recorded scenario</div></div>
+        </div>
+        <div id="gt-summary" class="gt-summary"></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th></th><th>Device</th><th>Truth</th><th>Predicted</th>
+              <th>Match</th><th>Truth W</th><th>Predicted W</th><th>&Delta; W</th></tr></thead>
+            <tbody id="gt-body"></tbody>
+          </table>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <div><div class="eyebrow">Session timeline</div><h2 class="panel-title">Switching events</h2>
+            <div class="panel-kicker">Exact event time, signature match, and power delta</div></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Time</th><th>Event</th><th>Device</th><th>&Delta;P (W)</th><th>&Delta;Q (var)</th><th>Conf.</th><th>Detail</th></tr></thead>
+            <tbody id="ev-body"></tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <aside class="side-column">
+      <article class="panel side-card">
+        <div class="side-title"><h2>Model control</h2><span class="side-icon" aria-hidden="true">M</span></div>
+        <p class="helper">Inspect the active bundle or switch to the frozen baseline model.</p>
+        <select id="model-variant" onchange="setVariant(this.value)" aria-label="Model variant">
+          <option value="latest">Train-on-the-go (latest)</option>
+        </select>
+        <div class="kv" id="model-kv"></div>
+        <div class="device-vocab" id="model-devices">No devices yet</div>
+        <button class="danger" id="model-reset-btn" onclick="modelReset()"
+                style="width:100%;margin-top:10px;display:none">Restore original model</button>
+      </article>
+
+      <article class="panel side-card">
+        <div class="side-title"><h2>Record a new device</h2><span class="side-icon" aria-hidden="true">+</span></div>
+        <p class="helper">Connect only the new device, record roughly 75 seconds, then stop. The model retrains automatically.</p>
+        <input type="text" id="rec-name" aria-label="New device name" placeholder="Device name, e.g. desk_lamp">
+        <div class="row">
+          <button class="primary" id="rec-start" onclick="recStart()">Start recording</button>
+          <button id="rec-stop" onclick="recStop()" disabled>Stop + retrain</button>
+        </div>
+        <div class="small muted" id="rec-status"></div>
+      </article>
+    </aside>
+  </div>
 </main>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
 
 <script>
 // family -> color, injected by live.py from nilm_pipeline.FAMILY_COLORS:
@@ -3588,15 +4305,29 @@ async function j(url, opts){ const r = await fetch(url, opts); return r.json(); 
 function fmtW(v){ return v==null ? "-" : (Math.abs(v)>=1000 ? (v/1000).toFixed(2)+" kW" : v.toFixed(0)+" W"); }
 function hms(iso){ return iso ? iso.substring(11,19) : "-"; }
 function hmsMs(iso){ return iso ? iso.substring(11,23) : "-"; }
+function esc(v){
+  return String(v==null ? "" : v).replace(/[&<>"']/g, ch =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[ch]);
+}
+function prettyDevice(v){ return String(v||"unknown").replace(/_/g," "); }
+function showToast(message, error=false){
+  const el = document.getElementById("toast");
+  el.textContent = message;
+  el.className = "toast show" + (error ? " error" : "");
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(()=>{ el.className = "toast"; }, 3600);
+}
 
 async function pollStatus(){
   try{
     const s = await j("/api/status");
     const ok = s.state === "connected";
-    document.getElementById("conn-dot").style.background = ok ? "var(--good)" : "var(--bad)";
+    const connDot = document.getElementById("conn-dot");
+    connDot.style.background = ok ? "var(--good)" : "var(--bad)";
+    connDot.style.color = ok ? "var(--good)" : "var(--bad)";
     document.getElementById("conn-txt").textContent =
       (s.simulated ? "simulated" : s.host) + " · " + s.state + " · " + (s.effective_rate_hz||0) + " Hz";
-    document.getElementById("sim-pill").style.display = s.simulated ? "" : "none";
+    document.getElementById("sim-pill").style.display = s.simulated ? "flex" : "none";
 
     const m = s.model || {};
     const acc = m.holdout_accuracy || {};
@@ -3619,7 +4350,7 @@ async function pollStatus(){
 
     const kv = document.getElementById("model-kv");
     kv.innerHTML = "";
-    const add = (k,v)=>{ kv.innerHTML += "<div>"+k+"</div><div>"+v+"</div>"; };
+    const add = (k,v)=>{ kv.innerHTML += "<div>"+esc(k)+"</div><div title=\""+esc(v)+"\">"+esc(v)+"</div>"; };
     add("bundle", m.source||"-");
     add("held-out presence F1", acc.presence_macro_f1!=null ? acc.presence_macro_f1.toFixed(3) : "-");
     add("held-out power MAE", acc.power_mae_W!=null ? acc.power_mae_W.toFixed(1)+" W" : "-");
@@ -3627,7 +4358,7 @@ async function pollStatus(){
     add("trained", m.trained_utc ? m.trained_utc.replace("T"," ").substring(0,19) : "-");
     add("signatures", m.n_signatures);
     document.getElementById("model-devices").textContent =
-      (m.appliances||[]).length ? "knows: " + m.appliances.join(", ") : "no devices yet";
+      (m.appliances||[]).length ? "Knows: " + m.appliances.map(prettyDevice).join(", ") : "No devices yet";
 
     const rt = s.retrain || {};
     const bar = document.getElementById("retrainbar");
@@ -3640,43 +4371,57 @@ async function pollStatus(){
       bar.style.display = "none";
       document.getElementById("retrain-btn").disabled = false;
       if(rt.state === "error") document.getElementById("teach-note").textContent =
-        "retrain FAILED - see console/log";
+        "Retraining failed — see the console or log for details.";
     }
     const sess = s.session;
     recActive = !!sess;
     document.getElementById("rec-start").disabled = !!sess;
     document.getElementById("rec-stop").disabled = !sess;
     document.getElementById("rec-status").textContent = sess ?
-      ("recording '"+sess.label+"' - "+sess.samples+" samples") : "";
+      ("Recording '"+sess.label+"' · "+sess.samples+" samples") : "";
   }catch(e){}
 }
 
 async function pollState(){
   try{
     const st = await j("/api/state");
+    const active = st.currently_on || [];
+    const explainedPct = st.explained_frac!=null ? 100*st.explained_frac : null;
     document.getElementById("p-total").textContent = fmtW(st.total_W);
     document.getElementById("explained").textContent =
-      st.explained_frac!=null ? (100*st.explained_frac).toFixed(0)+"%" : "-";
+      explainedPct!=null ? explainedPct.toFixed(0)+"%" : "-";
+    document.getElementById("explained-fill").style.width = explainedPct==null ? "0%" :
+      Math.max(0,Math.min(100,explainedPct))+"%";
+    document.getElementById("active-count").textContent = active.length;
 
     const box = document.getElementById("on-list");
-    let cards = st.currently_on.map(d =>
-      '<div class="devcard"><span class="swatch" style="background:'+col(d.device)+'"></span>'+
-      '<div><div class="nm">'+d.device+'</div><div class="meta">since '+hms(d.since_iso)+
-      ' · conf '+(100*d.prob).toFixed(0)+'%'+(d.src==="edge" ? ' · edge' : '')+'</div></div>'+
-      '<span class="w">'+fmtW(d.power_W)+'</span></div>').join("");
+    let cards = active.map(d => {
+      const color = col(d.device), conf = Math.max(0,Math.min(100,100*(d.prob||0)));
+      return '<div class="devcard" style="--device-color:'+color+'">'+
+        '<div class="device-main"><span class="device-symbol"><span class="swatch"></span></span>'+
+        '<div style="min-width:0"><div class="nm" title="'+esc(d.device)+'">'+esc(prettyDevice(d.device))+'</div>'+
+        '<div class="meta">On since '+esc(hms(d.since_iso))+'</div></div></div>'+
+        '<div class="device-reading"><div class="w">'+fmtW(d.power_W)+'</div>'+
+        '<div class="confidence"><span>'+conf.toFixed(0)+'%</span><span class="confidence-track">'+
+        '<span class="confidence-fill" style="display:block;width:'+conf+'%"></span></span>'+
+        (d.src==="edge" ? '<span class="source-tag">edge</span>' : '')+'</div></div></div>';
+    }).join("");
     cards += (st.unknown_loads||[]).map(u =>
-      '<div class="devcard" style="border-color:#6b5716"><span class="swatch" style="background:var(--warn)"></span>'+
-      '<div><div class="nm" style="color:var(--warn)">unknown device</div>'+
-      '<div class="meta">since '+hms(u.since_iso)+' · switch-on matched no signature</div></div>'+
-      '<span class="w">'+fmtW(u.W)+'</span></div>').join("");
+      '<div class="devcard" style="--device-color:var(--warn);border-color:#604e2e">'+
+      '<div class="device-main"><span class="device-symbol"><span class="swatch"></span></span>'+
+      '<div><div class="nm" style="color:var(--warn)">Unknown device</div>'+
+      '<div class="meta">On since '+esc(hms(u.since_iso))+' · no signature match</div></div></div>'+
+      '<div class="device-reading"><div class="w">'+fmtW(u.W)+'</div></div></div>').join("");
     if(!cards){
-      box.textContent = "nothing recognized as ON";
+      box.innerHTML = '<div class="empty-state">No recognized loads are currently on</div>';
     } else {
       box.innerHTML = cards;
     }
-    if(Math.abs(st.residual_W) > 1 && st.currently_on.length){
-      box.innerHTML += '<div class="devcard" style="opacity:.7"><span class="swatch" style="background:#555"></span>'+
-        '<div><div class="nm muted">unassigned residual</div></div><span class="w">'+fmtW(st.residual_W)+'</span></div>';
+    if(Math.abs(st.residual_W) > 1 && active.length){
+      box.innerHTML += '<div class="devcard" style="--device-color:#607782;opacity:.72">'+
+        '<div class="device-main"><span class="device-symbol"><span class="swatch"></span></span>'+
+        '<div><div class="nm muted">Unassigned residual</div><div class="meta">Measured but not attributed</div></div></div>'+
+        '<div class="device-reading"><div class="w">'+fmtW(st.residual_W)+'</div></div></div>';
     }
     const gb = document.getElementById("guide-box");
     if(st.teach_guide){
@@ -3715,12 +4460,12 @@ function renderGt(g){
   document.getElementById("gt-body").innerHTML = (g.devices||[]).map(d => {
     const ok = d.gt_on === d.pred_on;
     const dw = (d.gt_W!=null && d.pred_W!=null) ? d.pred_W - d.gt_W : null;
-    return '<tr><td><span class="swatch" style="background:'+col(d.device)+
-      ';display:inline-block"></span></td>'+
-      '<td><b>'+d.device+'</b></td>'+
-      '<td>'+(d.gt_on ? 'ON' : 'off')+'</td>'+
-      '<td>'+(d.pred_on ? 'ON' : 'off')+'</td>'+
-      '<td class="'+(ok ? 'kind-on' : 'kind-unknown')+'">'+(ok ? '✓' : '✗')+'</td>'+
+    const color = col(d.device);
+    return '<tr><td><span class="table-swatch" style="background:'+color+';color:'+color+'"></span></td>'+
+      '<td><b title="'+esc(d.device)+'">'+esc(prettyDevice(d.device))+'</b></td>'+
+      '<td>'+(d.gt_on ? '<span class="kind-on">ON</span>' : '<span class="muted">off</span>')+'</td>'+
+      '<td>'+(d.pred_on ? '<span class="kind-on">ON</span>' : '<span class="muted">off</span>')+'</td>'+
+      '<td><span class="event-badge '+(ok ? 'kind-on' : 'kind-unknown')+'">'+(ok ? 'match' : 'miss')+'</span></td>'+
       '<td>'+(d.gt_W==null ? '-' : fmtW(d.gt_W))+'</td>'+
       '<td>'+(d.pred_W==null ? '-' : fmtW(d.pred_W))+'</td>'+
       '<td>'+(dw==null ? '-' : (dw>=0?'+':'')+fmtW(dw))+'</td></tr>';
@@ -3736,10 +4481,24 @@ async function pollChart(){
 
 function drawChart(c){
   const cv = document.getElementById("chart"), ctx = cv.getContext("2d");
-  const W = cv.width = cv.clientWidth * (window.devicePixelRatio||1);
-  const H = cv.height;
-  ctx.clearRect(0,0,W,H);
-  if(!c.t || c.t.length < 2) return;
+  const cssW = Math.max(300,cv.clientWidth), cssH = parseFloat(getComputedStyle(cv).height)||320;
+  const dpr = Math.min(window.devicePixelRatio||1,2);
+  if(cv.width !== Math.round(cssW*dpr) || cv.height !== Math.round(cssH*dpr)){
+    cv.width = Math.round(cssW*dpr); cv.height = Math.round(cssH*dpr);
+  }
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,cssW,cssH);
+  if(!c.t || c.t.length < 2){
+    ctx.beginPath(); ctx.arc(cssW/2,cssH/2-13,14,0,Math.PI*2);
+    ctx.strokeStyle = "#304755"; ctx.lineWidth = 1; ctx.stroke();
+    ctx.beginPath(); ctx.arc(cssW/2,cssH/2-13,4,0,Math.PI*2);
+    ctx.fillStyle = "#53e0c1"; ctx.fill();
+    ctx.fillStyle = "#8ea2ad"; ctx.font = "11px ui-sans-serif, sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("Waiting for enough samples to draw the live trace",cssW/2,cssH/2+20);
+    document.getElementById("legend").innerHTML = '<span class="muted">The chart will populate automatically.</span>';
+    return;
+  }
   const names = Object.keys(c.devices||{});
   const n = c.t.length;
   let stacked = new Array(n).fill(0);
@@ -3756,24 +4515,31 @@ function drawChart(c){
   let ymax = Math.max(...c.P_total.map(Math.abs), ...stacked,
                       ...(gtNames.length ? gtTop : [0]), 10) * 1.15;
   let ymin = Math.min(0, ...c.P_total) * 1.15;
-  const X = i => 40 + (W-50) * i/(n-1);
-  const Y = v => H - 22 - (H-34) * (v - ymin) / (ymax - ymin);
-  // grid
-  ctx.strokeStyle = "#242d3a"; ctx.fillStyle = "#8b98a9"; ctx.font = "10px sans-serif";
+  const plot = {l:54,r:14,t:18,b:30};
+  const X = i => plot.l + (cssW-plot.l-plot.r) * i/(n-1);
+  const Y = v => cssH-plot.b - (cssH-plot.t-plot.b) * (v-ymin)/(ymax-ymin);
+  // horizontal scale and zero line
+  ctx.font = "10px ui-sans-serif, sans-serif";
+  ctx.textBaseline = "middle";
   for(let g=0; g<=4; g++){
     const v = ymin + (ymax-ymin)*g/4, y = Y(v);
-    ctx.beginPath(); ctx.moveTo(40,y); ctx.lineTo(W-10,y); ctx.stroke();
-    ctx.fillText(Math.round(v), 4, y+3);
+    ctx.beginPath(); ctx.strokeStyle = Math.abs(v)<1 ? "#3a5360" : "#20313e";
+    ctx.lineWidth = Math.abs(v)<1 ? 1.2 : 1;
+    ctx.moveTo(plot.l,y); ctx.lineTo(cssW-plot.r,y); ctx.stroke();
+    ctx.fillStyle = "#718893"; ctx.textAlign = "right";
+    ctx.fillText(Math.abs(v)>=1000 ? (v/1000).toFixed(1)+"k" : Math.round(v)+" W",plot.l-9,y);
   }
   // stacked device areas
   let prev = new Array(n).fill(0);
   stacks.forEach(s => {
     ctx.beginPath();
-    for(let i=0;i<n;i++) ctx.lineTo(X(i), Y(s.top[i]));
+    for(let i=0;i<n;i++) (i ? ctx.lineTo(X(i),Y(s.top[i])) : ctx.moveTo(X(i),Y(s.top[i])));
     for(let i=n-1;i>=0;i--) ctx.lineTo(X(i), Y(prev[i]));
     ctx.closePath();
-    ctx.fillStyle = col(s.nm) + "66";
-    ctx.fill();
+    ctx.save(); ctx.globalAlpha = .24; ctx.fillStyle = col(s.nm); ctx.fill(); ctx.restore();
+    ctx.beginPath(); ctx.strokeStyle = col(s.nm); ctx.lineWidth = 1;
+    for(let i=0;i<n;i++) (i ? ctx.lineTo(X(i),Y(s.top[i])) : ctx.moveTo(X(i),Y(s.top[i])));
+    ctx.save(); ctx.globalAlpha = .7; ctx.stroke(); ctx.restore();
     prev = s.top;
   });
   // replay ground truth: dashed cumulative stack in the same device colors,
@@ -3784,23 +4550,31 @@ function drawChart(c){
     gtNames.forEach(nm => {
       const a = c.gt[nm]||[];
       ctx.beginPath(); ctx.strokeStyle = col(nm); ctx.lineWidth = 1.4;
-      for(let i=0;i<n;i++){ acc[i] += Math.max(0, a[i]||0); ctx.lineTo(X(i), Y(acc[i])); }
+      for(let i=0;i<n;i++){
+        acc[i] += Math.max(0,a[i]||0);
+        (i ? ctx.lineTo(X(i),Y(acc[i])) : ctx.moveTo(X(i),Y(acc[i])));
+      }
       ctx.stroke();
     });
     ctx.setLineDash([]);
   }
   // measured total
-  ctx.beginPath(); ctx.strokeStyle = "#e6edf3"; ctx.lineWidth = 1.6;
-  for(let i=0;i<n;i++) ctx.lineTo(X(i), Y(c.P_total[i]));
-  ctx.stroke();
+  ctx.beginPath();
+  for(let i=0;i<n;i++) (i ? ctx.lineTo(X(i),Y(c.P_total[i])) : ctx.moveTo(X(i),Y(c.P_total[i])));
+  ctx.save(); ctx.strokeStyle = "rgba(242,247,248,.16)"; ctx.lineWidth = 5; ctx.stroke(); ctx.restore();
+  ctx.strokeStyle = "#f2f7f8"; ctx.lineWidth = 1.7; ctx.stroke();
+  const lastY = Y(c.P_total[n-1]);
+  ctx.beginPath(); ctx.arc(X(n-1),lastY,3.2,0,Math.PI*2); ctx.fillStyle = "#f2f7f8"; ctx.fill();
+  ctx.beginPath(); ctx.arc(X(n-1),lastY,6.5,0,Math.PI*2); ctx.strokeStyle = "rgba(242,247,248,.22)"; ctx.stroke();
   // time labels
   const t0 = new Date(c.t[0]), t1 = new Date(c.t[n-1]);
-  ctx.fillText(t0.toTimeString().substring(0,8), 42, H-8);
-  ctx.fillText(t1.toTimeString().substring(0,8), W-70, H-8);
+  ctx.fillStyle = "#718893"; ctx.textBaseline = "alphabetic";
+  ctx.textAlign = "left"; ctx.fillText(t0.toTimeString().substring(0,8),plot.l,cssH-7);
+  ctx.textAlign = "right"; ctx.fillText(t1.toTimeString().substring(0,8),cssW-plot.r,cssH-7);
   document.getElementById("legend").innerHTML =
-    '<span style="color:#e6edf3">━ measured total</span> · ' +
-    names.map(nm=>'<span style="color:'+col(nm)+'">■ '+nm+'</span>').join(" · ") +
-    (gtNames.length ? ' · <span class="muted">╌╌ ground truth (replay)</span>' : '');
+    '<span class="legend-item" style="color:#f2f7f8"><span class="legend-sample"></span>Measured total</span>'+
+    names.map(nm=>'<span class="legend-item" style="color:'+col(nm)+'"><span class="legend-sample area"></span>'+esc(prettyDevice(nm))+'</span>').join("")+
+    (gtNames.length ? '<span class="legend-item muted"><span class="legend-sample dashed"></span>Ground truth (replay)</span>' : '');
 }
 
 async function pollEvents(){
@@ -3818,10 +4592,11 @@ async function pollEvents(){
       if(e.kind.includes("fail") || e.kind.includes("warning") || e.kind.includes("veto")) cls = "kind-unknown";
       if(e.kind === "mode_change") cls = "kind-on";
       if(e.kind === "taught" || e.kind === "residual_matched") cls = "kind-taught";
-      tr.innerHTML = '<td class="time">'+hmsMs(e.time_iso)+'</td><td class="'+cls+'">'+e.kind+
-        '</td><td><b>'+e.device+'</b></td><td>'+(e.dP_W==null?"":e.dP_W)+
-        '</td><td>'+(e.dQ_var==null?"":e.dQ_var)+'</td><td>'+(e.confidence==null?"":e.confidence)+
-        '</td><td class="muted">'+(e.detail||"")+'</td>';
+      tr.innerHTML = '<td class="time">'+esc(hmsMs(e.time_iso))+'</td><td><span class="event-badge '+cls+'">'+
+        esc(String(e.kind).replace(/_/g," "))+'</span></td><td><b title="'+esc(e.device)+'">'+
+        esc(prettyDevice(e.device))+'</b></td><td>'+(e.dP_W==null?"":esc(e.dP_W))+
+        '</td><td>'+(e.dQ_var==null?"":esc(e.dQ_var))+'</td><td>'+(e.confidence==null?"":esc(e.confidence))+
+        '</td><td class="detail-cell" title="'+esc(e.detail||"")+'">'+esc(e.detail||"")+'</td>';
       tb.insertBefore(tr, tb.firstChild);
     });
     while(tb.children.length > 150) tb.removeChild(tb.lastChild);
@@ -3830,39 +4605,47 @@ async function pollEvents(){
 
 async function teach(mode){
   const name = document.getElementById("teach-name").value.trim();
-  if(!name) return alert("give the device a name first");
+  if(!name) return showToast("Give the device a name first.",true);
   const r = await j("/api/teach", {method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify({label:name, retrain:true, mode:mode||"isolated"})});
-  if(!r.ok) alert("teach failed: " + r.error);
-  else document.getElementById("teach-name").value = "";
+  if(!r.ok) showToast("Teaching could not start: " + r.error,true);
+  else { document.getElementById("teach-name").value = ""; showToast("Teaching capture started."); }
 }
 async function teachCancel(){ await j("/api/teach/cancel", {method:"POST"}); }
-async function retrain(){ await j("/api/retrain", {method:"POST"}); }
+async function retrain(){
+  const r = await j("/api/retrain", {method:"POST"});
+  if(!r.ok) showToast(r.error ? "Retraining could not start: "+r.error : "Retraining is already running.",true);
+  else showToast("Model retraining started.");
+}
 async function setVariant(v){
   const r = await j("/api/model", {method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify({variant:v})});
-  if(!r.ok) alert("model switch failed: " + r.error);
+  if(!r.ok) showToast("Model switch failed: " + r.error,true);
+  else showToast("Active model changed.");
 }
 async function modelReset(){
-  if(!confirm("Erase all retrained (non-original) models and restore the "+
-              "frozen original snapshot?\n\nAll on-the-go teach recordings "+
-              "(recordings/on-the-go) are DELETED with them, so taught "+
-              "devices are fully forgotten. Campaign recordings are kept.")) return;
+  if(!confirm("Restore the frozen original model?\n\nAll on-the-go teach recordings "+
+              "will be deleted with the retrained models, so taught devices "+
+              "are fully forgotten. Campaign recordings are kept.")) return;
   const r = await j("/api/model/reset", {method:"POST"});
-  if(!r.ok) alert("reset failed: " + r.error);
+  if(!r.ok) showToast("Model restore failed: " + r.error,true);
+  else showToast("Original model restored.");
 }
 async function simLoad(l){ await j("/api/sim/load", {method:"POST",
   headers:{"Content-Type":"application/json"}, body: JSON.stringify({level:l})}); }
 async function recStart(){
   const name = document.getElementById("rec-name").value.trim();
-  if(!name) return alert("give the device a name first");
+  if(!name) return showToast("Give the device a name first.",true);
   const r = await j("/api/record/start", {method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify({label:name})});
-  if(!r.ok) alert("record failed: " + r.error);
+  if(!r.ok) showToast("Recording could not start: " + r.error,true);
+  else showToast("Device recording started.");
 }
 async function recStop(){
-  await j("/api/record/stop", {method:"POST", headers:{"Content-Type":"application/json"},
+  const r = await j("/api/record/stop", {method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify({retrain:true})});
+  if(!r.ok) showToast("Recording could not stop: " + r.error,true);
+  else showToast("Recording saved. Retraining will begin.");
 }
 
 setInterval(pollStatus, 2000); setInterval(pollState, 400);
@@ -3918,8 +4701,15 @@ def main():
                    help="window (s) used when retraining on the go")
     p.add_argument("--on-w", type=float, default=5.0,
                    help="presence ON threshold (W) used when retraining")
-    p.add_argument("--unknown-min-w", type=float, default=30.0,
-                   help="unexplained power (W) that triggers the unknown-device prompt")
+    p.add_argument("--unknown-min-w", type=float, default=12.0,
+                   help="unexplained power (W) that triggers the unknown-device "
+                        "prompt. The floor only bites on a quiet bench -- with "
+                        "devices running the threshold rises with the load "
+                        "(--unknown-frac). Was 30 W, which hid every small "
+                        "device: a 14 W monitor could never be prompted, so it "
+                        "could never be taught. The meter idles at ~0.4 W and "
+                        "the prompt needs --unknown-persist-s of persistence, "
+                        "so noise does not reach this")
     p.add_argument("--teach-record-s", type=float, default=75.0,
                    help="teach: seconds of ON time to record (both flows; "
                         "matches a record_campaign single, and extends "

@@ -216,6 +216,153 @@ Three paths, all end in an automatic background retrain + hot reload:
    monitor, including harmonics: the higher-fidelity path when you can
    isolate the device.
 
+### Naming a residual: the harmonic-ratio gate (2026-07-15)
+
+A device is taught at whatever it happened to draw during the capture, but a
+switching supply's draw depends on battery and CPU state: the laptop taught
+at 66 W idles at ~43 W. There the signature table does not merely find it
+ambiguous, it does not find it at all (its P-term is 1.37, past the 1.0
+cut), so the nearest watt-twin wins outright -- `coffee_machine_standby`
+(46 W) was named at conf 0.91, with an empty contender list, on a bench with
+no coffee machine plugged in. No confidence floor helps: the window-model
+arbitration only runs when the match is ambiguous, and this match was
+confident and alone.
+
+The residual probe therefore also carries the residual's own **harmonic
+ratio**: its harmonic current (measured spectrum energy, RSS-minus the known
+harmonic currents of everything already ON) over its own fundamental. Unlike
+watts, that ratio does not scale with load -- measured on this bench:
+
+| device | THD ratio |
+|---|---|
+| toaster / lamp / boiler / coffee brewing | 0.01 - 0.02 |
+| fans | 0.10 - 0.13 |
+| coffee machine standby | 0.22 |
+| **laptop** | **1.72** (8x the nearest other family) |
+
+`match_edge` uses it only when a probe passes `thd=` (the residual path; the
+edge path is untouched). It does two things:
+
+* **rules out** a signature whose ratio disagrees. The gate bites only on
+  LARGE ABSOLUTE disagreement -- the tolerance floors at 0.20 and otherwise
+  follows the SMALLER of the two ratios -- so the meter's ~2.3 % THD floor
+  and the coffee machine's cycle-varying harmonics (both moves of a few
+  percentage points) can never veto a correct match. That fragility is what
+  disabled the older IH-in-amps term (`--ih-matching`, still off).
+* lets a device whose fingerprint is **distinctive** (ratio >= 0.5) and
+  matches tightly **taper** down toward idle, so it is recognised across its
+  operating range rather than only at the watts it was taught at. Such a
+  match is capped at conf 0.85: another switching supply of similar size
+  would show the same ratio, so a device matched AT its own watts always
+  outranks it, and the unknown prompt can still win.
+
+Covered by `test_residual_match.py`.
+
+### Power thresholds, and why PV does not work yet (2026-07-15)
+
+The engine's floors were tuned for large positive loads, which left a gap
+small devices fell straight into. A 14 W monitor is big enough for the edge
+detector (`--edge-min-w` 8 W) but used to be below BOTH the unknown-claim
+floor (15 W) and the unknown prompt (`--unknown-min-w`, 30 W) -- so it could
+never be claimed, never prompted, and therefore never taught, because the
+Teach button is driven by the prompt. The floors are now ordered
+`edge <= claim <= prompt` (8 / 8 / 12 W) and a test asserts that ordering so
+the gap cannot silently reopen. The prompt floor only bites on a quiet
+bench: with load running the threshold rises with it (`--unknown-frac`), and
+the meter idles at ~0.4 W with `--unknown-persist-s` of persistence required,
+so noise does not reach it.
+
+The stale-claim guard had the same disease. Its tolerance floored at a flat
+30 W -- larger than the entire claim of every small device here -- which made
+them IMMORTAL: a 17 W `table_fan` claim satisfied `17 <= 0 + 30` with the
+meter reading 0.0 W and stayed "on" forever once its off-step was masked by a
+big device switching at the same moment. The floor now anchors to the
+smallest step the edge detector can see (`_claim_slack_W`). Big claims are
+unaffected -- they are carried by the proportional 10 % term.
+
+### Generation (PV): signed claims (2026-07-15)
+
+Claims are **signed**: a consumer's watts are positive, a generator's
+negative. They used to store `abs(dP)`, which threw away the one feature that
+identifies generation -- PV exporting 18 W was claimed as an 18 W *consumer*,
+and `_reconcile_claims` then killed the claim on sight because the meter read
+-16 W. (Seen live: `residual_matched pv` immediately followed by
+`claim_dropped pv - edge claim exceeds measured power`.)
+
+**The sign of a step cannot say whether a device started or stopped.** A
+consumer starting and a generator STOPPING are the same event at the meter --
+both are +P -- and so are a consumer stopping and a generator starting. The
+old rule (`"on" if dP > 0 else "off"`) simply assumed every device consumes,
+so PV starting to export read as a device switching OFF and its -8.5 W step
+was probed as +8.5 W and pinned on the table fan, force-holding a fan nobody
+touched. `_read_edge` now matches BOTH readings and lets the better fit
+decide:
+
+* **START** -- some family's signature equals the step itself
+* **STOP** -- some family's signature equals the step negated
+
+Where they fit equally well (a fan starting looks exactly like PV stopping),
+the tie goes to the reading that resolves a device already believed to be
+running: a device that is not on cannot stop. With no START reading at all
+the STOP reading stands unchallenged, which is how a device that was already
+running when the engine started still releases its watts.
+
+Consequences threaded through the bookkeeping: the drop-matcher compares
+`dP + claim_W` (a claim of W ends with a step of -W, so a 950 W boiler stops
+at -950 and PV stops at +18); ramp-folding only merges steps of the same
+polarity; `_reconcile_claims` sums signed claims, so PV's export offsets the
+loads exactly as it does at the meter, and only CONSUMERS are eviction
+candidates -- dropping a generator would RAISE the claimed net and the loop
+would evict every load to fix an over-claim caused by nothing.
+
+**Known limit:** an UNTAUGHT generator raises no unknown claim. With no
+signature matching either polarity, a -260 W step is equally "an untaught
+generator started" and "an untaught 260 W load stopped", and guessing
+generation would let an untaught toaster that was already running when the
+engine started be recorded as 700 W of generation out of nothing. The watts
+stay in the residual and raise the unknown prompt, which is how the device
+gets taught; once taught, the signature resolves the polarity. Pinned by
+`test_claims.py`.
+
+**PV produces two different kinds of step, and only one is an event.**
+Plugging the inverter IN raises both P and Q (its ~-16 var is a fixed
+property of the inverter, present whenever it is connected). After that only
+P moves, as the sun does -- so a generation RAMP is a step of `(dP, dQ ~ 0)`,
+and that is *exactly* what a small switching supply switching off looks like.
+Measured live: a PV ramp of `(-13.7 W, +1.0 var)` matched `monitor off` at
+**d=0.00** -- a perfect fit to a device nobody touched. No (P, Q) rule can
+separate them, because in (P, Q) they are the same event.
+
+The harmonic current can. A device TAKES ITS HARMONICS WITH IT when it
+switches, so its off-step carries them; a ramp carries none, because nothing
+switched. `match_edge`'s IH term (and `_ih_contradicts`, which guards the
+release path the same way) therefore applies whenever a signature's harmonic
+RATIO is distinctive -- at any step size, without `--ih-matching`.
+
+The gate is the RATIO, never the absolute amps, and this is the trap: **IH
+scales with device size**. The monitor has enormous distortion (THD 173 %)
+but draws only 15 W, so its harmonic CURRENT is just 0.114 A -- *below* the
+coffee machine's 0.128 A at THD 2 %. No IH threshold can judge the monitor
+without also judging the coffee machine, whose harmonics vary 5x across a
+brew and which is precisely what disabled `--ih-matching`. THD separates the
+two by 86x. On this bench exactly one family clears THD_DISTINCTIVE
+(monitor, 1.73); coffee machine, boiler, lamp, fans and PV are all exempt,
+so the term cannot repeat the regressions that shelved it.
+
+**Still open for PV:**
+
+* The guided teach waits for `abs(w) < 5 W` to call the mains empty, which
+  never happens while PV generates more than 5 W. An unswitchable PV is a
+  reason to use the in-mix teach, which needs no all-off step.
+* `explained_frac` divides by `|total|`, so when load nearly cancels
+  generation the total approaches zero and the figure becomes meaningless.
+* PV's output tracks the sun across a huge range while its signature is
+  taught at one operating point (recorded -4.6..-13.3 W settled, observed
+  live at -30 W -- past the range, so no match). This is the same
+  variable-output problem as the laptop, but PV cannot use the harmonic
+  taper: its THD is 0.25, indistinguishable from `coffee_machine_standby`'s
+  0.22. What DOES identify PV uniquely is its sign -- no consumer generates.
+
 The **Retrainer** then runs, exactly like the CLI chain:
 `mix_measured_scenarios.py` (random ON/OFF schedules per appliance,
 coverage-guaranteed mixes), then `train.py --task mix`, then
