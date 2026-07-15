@@ -153,26 +153,55 @@ no need to physically power-cycle the appliances.
 
 ## 4. Teaching (training on the go)
 
-Two paths, both end in an automatic background retrain + hot reload:
+Three paths, all end in an automatic background retrain + hot reload:
 
-1. **Teach from the unknown prompt (GUIDED, 2026-07-06).** In-mix captures
-   with baseline subtraction gave visibly worse models than a clean isolated
-   recording, so naming the unknown now starts a guided walk-through of the
-   same protocol as the manual record button. The dashboard shows one step at
-   a time, and each step advances automatically from the measured power (no
-   confirm clicks):
+1. **Teach from the unknown prompt (GUIDED / isolated, 2026-07-06).** Naming
+   the unknown starts a guided walk-through of the same protocol as the
+   manual record button. The dashboard shows one step at a time, and each
+   step advances automatically from the measured power (no confirm clicks):
    1. *Disconnect ALL devices* (including the unknown one) - waits for total
       power < 5 W;
-   2. records a 5 s OFF baseline;
+   2. records a 10 s OFF baseline;
    3. *Connect only the new device* - waits for power to appear;
    4. records it running for `--teach-record-s` (default 45) seconds;
-   5. *Disconnect it* - then records a 5 s OFF tail.
+   5. *Disconnect it* - then records an 8 s OFF tail.
    The result is a normal clean session recording (same writer as the manual
    path, harmonics included) and the retrain starts automatically. A Cancel
    button aborts and discards the partial file; if the device is never
    disconnected in step 5, the recording is saved anyway (the ON data is
    already captured). The unknown prompt is suppressed while a teach runs.
-2. **Record it clean** (side panel). Plug in only the new device, name it,
+2. **Teach ON THE GO (in-mix).** When emptying the mains is impractical
+   (fridge, router, a running experiment), the other devices keep running
+   and the unknown device is toggled off and back on once; it stays running
+   when the flow ends. Naive baseline subtraction (one 8 s baseline median,
+   endpoint drift check) taught visibly worse models: anything the
+   background did during the capture leaked into the "isolated" signal, and
+   even a steady background left its noise in the saved waveform, inflating
+   the signature's variance features. The current flow therefore treats the
+   capture as one of several independent measurements and cross-checks them:
+   1. *Switch OFF only the unknown device* - the settled step delta of that
+      toggle is a model-free measurement of its running draw;
+   2. records a settled background baseline;
+   3. *Switch it back ON* - records the mix for `--teach-record-s` seconds
+      (extended while the signal still ramps or cycles);
+   4. three estimates of the settled draw must agree: the off-step delta,
+      the settled ON level minus the baseline, and the engine's own residual
+      history since the unknown was detected (free evidence, no user
+      action). If they agree, one toggle was enough. If not, a background
+      device changed mid-capture: the flow asks for up to two more quick
+      off/on toggles and takes the robust median across all estimates;
+      stretches whose level disagrees with the consensus are excluded from
+      the saved recording instead of poisoning it.
+   Before saving, the background's noise is shrunk out of the settled part
+   of the subtracted signal (fluctuations scaled to the device-only share
+   `sqrt(var_mix - var_baseline)`), so the training features (P_std,
+   P_min/max, THD stats) describe the device, not the background. A cycling
+   device keeps its swings; a steady device comes out as flat as a guided
+   recording. The switch-on transient is kept exactly as measured. The saved
+   file follows the campaign-single shape (10 s off lead, ON stretch(es)
+   separated by short off gaps, 8 s off tail) and carries the per-estimate
+   watts and toggle count in its metadata.
+3. **Record it clean** (side panel). Plug in only the new device, name it,
    record about 60 s, stop. This uses the same session writer as the PAC4200
    monitor, including harmonics: the higher-fidelity path when you can
    isolate the device.

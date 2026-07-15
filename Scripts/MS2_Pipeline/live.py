@@ -17,10 +17,15 @@ and closes the loop when it does NOT know the answer:
        -- what is this?"  ->  you type a name and pick ONE of two teach flows:
          - guided/ISOLATED: disconnect everything, record only the new device
            (cleanest data), or
-         - IN-MIX ("teach on the go"): every other device keeps running; only
-           the unknown device is toggled off -> baseline -> on -> recorded ->
-           off -> closing baseline, and its own signal is isolated by
-           baseline subtraction before being saved.
+         - IN-MIX ("teach on the go"): every other device keeps running; the
+           unknown device is toggled off -> baseline -> back on -> recorded,
+           and it stays running afterwards. Its own signal is isolated by
+           baseline subtraction, CROSS-CHECKED against the off-step delta and
+           the engine's own residual history (three independent estimates of
+           the same watts), and the background's noise is shrunk out of the
+           saved signal. Only when the estimates disagree (a background
+           device changed mid-capture) does the flow ask for extra off/on
+           toggles and take the robust median across them.
        Either way the captured signature is saved as a labelled recording
        under <recordings>/on-the-go/ (kept apart from the campaign corpus;
        "erase retrained models" deletes these together with the models) ->
@@ -975,13 +980,8 @@ class MixCapture:
                     else np.array([], dtype=float))
                 for k in self.KEYS}
 
-    def median(self, key: str, t0_ms: int, t1_ms: int) -> float:
-        a = self.arrays()
-        sel = (a["t_ms"] >= t0_ms) & (a["t_ms"] <= t1_ms)
-        return float(np.nanmedian(a[key][sel])) if sel.any() else float("nan")
-
     def stats(self, t0_ms: int, t1_ms: int):
-        """Channel medians (plus P noise and time centre) over [t0, t1]."""
+        """Channel medians (plus P/Q noise and time centre) over [t0, t1]."""
         a = self.arrays()
         if not a["t_ms"].size:
             return None
@@ -992,6 +992,7 @@ class MixCapture:
         return {"P": med("P"), "Q": med("Q"), "P1": med("P1"),
                 "P2": med("P2"), "P3": med("P3"), "THD": med("THD"),
                 "P_std": float(np.nanstd(a["P"][sel])),
+                "Q_std": float(np.nanstd(a["Q"][sel])),
                 "t_ms": float(np.mean(a["t_ms"][sel])), "n": int(sel.sum())}
 
 
@@ -1030,6 +1031,8 @@ class LiveEngine:
         # already-identified device keep their own (differently scaled) bars.
         self.min_conf = min_conf
         self.teach_record_s = teach_record_s
+        # settled-background measurement time of the in-mix teach flow
+        self.inmix_base_s = 8.0
         # small settled steps in [mode_min_W, edge_min_W) are probed as MODE
         # TRANSITIONS of already-on devices (fan high -> low is a -6 W step:
         # far below the on/off edge threshold, yet decisive for which fan to
@@ -2379,14 +2382,29 @@ class LiveEngine:
     #   teach_record_s ON -> disconnect -> 8 s off tail -> save -> retrain.
     # mode='inmix' ("teach on the go"): when emptying the mains is impractical
     # (fridge, router, a running experiment) the other devices KEEP RUNNING and
-    # only the unknown device is toggled:
-    #   device off -> settled background baseline A -> device on ->
-    #   teach_record_s of the mix -> device off -> closing baseline B.
-    # The device's own signal is isolated by subtracting the baseline,
-    # linearly interpolated A->B so slow background drift is removed too; if
-    # A and B disagree beyond a drift budget some OTHER device toggled
-    # mid-capture and the capture is DISCARDED instead of teaching the model a
-    # polluted signature (that validation is what the naive approach lacked).
+    # the unknown device is toggled ONCE, staying on when the flow ends:
+    #   device off -> off-step delta + settled background baseline A ->
+    #   device back on -> teach_record_s of the mix. Done.
+    # The previous flow modeled the background as a constant (two 8 s
+    # baseline medians, linearly interpolated) and validated only the
+    # ENDPOINTS: anything the background did during the capture (fridge
+    # compressor cycling, a charger tapering) leaked into the "isolated"
+    # signal, and even a steady background left its noise in the saved
+    # waveform, inflating the signature's P_std/P_min/P_max -- in-mix-taught
+    # devices trained visibly worse than guided ones, and small devices
+    # drowned in background residue. The rewritten flow cross-checks THREE
+    # independent estimates of the device's settled draw instead: the
+    # measured off-step delta, the settled ON level minus baseline A, and
+    # the engine's own residual history since the unknown was detected
+    # (evidence that costs the user nothing). Agreement -> one toggle
+    # suffices. Disagreement means the background changed mid-capture: the
+    # flow asks for up to two more quick off/on toggles, each yielding its
+    # own step delta + local baseline, takes the robust median across all
+    # estimates, and EXCLUDES outlier segments from the saved recording
+    # instead of poisoning it. Before saving, the background's noise is
+    # shrunk out of the settled part of the subtracted signal (fluctuations
+    # scaled to the device-only share sqrt(var_mix - var_base)), so the
+    # training features see the device, not the background.
     # Phase changes are driven by the measured power itself (no confirm
     # clicks); progress/instructions are shown via snapshot()["teach_guide"].
     def teach(self, label: str, retrain: bool = True,
@@ -2408,19 +2426,22 @@ class LiveEngine:
             if self._teach_thread is not None and self._teach_thread.is_alive():
                 raise RuntimeError("a teach session is already running")
             self._teach_cancel = False
-            # the unknown residual sizes the in-mix off/on thresholds
-            expected_W = None
+            # the unknown residual sizes the in-mix off/on thresholds, and
+            # its switch-on timestamp anchors the residual-history harvest
+            expected_W, unknown_since = None, None
             if self.unknown is not None:
                 w = abs(float(self.unknown.get("typical_W") or 0.0))
                 expected_W = w if w > 0 else None
+                unknown_since = self.unknown.get("since_ms")
             self.unknown = None            # the guide takes over the prompt
             self._unknown_first = None
         if mode == "inmix":
             th = threading.Thread(target=self._teach_inmix_worker, daemon=True,
-                                  args=(label, retrain, expected_W),
+                                  args=(label, retrain, expected_W,
+                                        unknown_since),
                                   name="teach-inmix")
             detail = ("in-mix capture started - other devices keep running; "
-                      "follow the instructions on the dashboard")
+                      "switch the device off and back on when asked")
         else:
             th = threading.Thread(target=self._teach_worker, daemon=True,
                                   args=(label, retrain), name="teach-guided")
@@ -2660,8 +2681,8 @@ class LiveEngine:
     def _inmix_baseline(self, cap: MixCapture, dur_s, phase, msg_fmt) -> dict:
         """Capture a settled background baseline (channel medians over dur_s).
         A noisy baseline (some background device still ramping) gets one more
-        attempt before it is accepted as-is -- the drift check between the two
-        baselines is the hard guard."""
+        attempt before it is accepted as-is -- the estimate cross-check in
+        the worker is the hard guard."""
         st = None
         for _ in range(2):
             t0_ms, t0 = int(time.time() * 1000), time.time()
@@ -2680,25 +2701,140 @@ class LiveEngine:
                 break
         return st
 
-    def _teach_inmix_worker(self, label, retrain, expected_W=None):
+    def _harvest_residual(self, since_ms):
+        """Zero-effort first estimate of the unknown device's steady draw:
+        median/MAD of the engine's own residual series since the unknown was
+        detected -- the residual IS why the prompt fired. The window mean is
+        still transiting the switch-on step for window_s after since_ms, so
+        those strides are skipped (their residual is fiction). None when too
+        little settled history exists."""
+        if not since_ms:
+            return None
+        with self.models.lock:
+            ws = self.models.window_s
+        with self.lock:
+            rs = [h["residual"] for h in self.history
+                  if h["t_ms"] >= since_ms + int((ws + 4) * 1000)]
+        if len(rs) < 5:
+            return None
+        rs = np.asarray(rs, dtype=float)
+        med = float(np.median(rs))
+        mad = float(np.median(np.abs(rs - med)))
+        return {"W": med, "mad": mad, "n": int(len(rs))}
+
+    def _teach_step_delta(self, cap: MixCapture, t_lo_ms: int, t_hi_ms: int):
+        """Measure the settled step the user's toggle produced inside
+        [t_lo, t_hi]: locate the largest sample-to-sample P jump, then median
+        P/Q over up to 3 s on each side (0.6 s guard around the jump). The
+        pre side may reach BEFORE t_lo -- for an off-toggle that is exactly
+        the device's settled running level, measured with no model in the
+        loop. None when either side is too thin or not settled enough to
+        anchor a level estimate (a duty-cycling device mid-burst)."""
+        a = cap.arrays()
+        t = a["t_ms"].astype(np.int64)
+        sel = np.flatnonzero((t >= t_lo_ms) & (t <= t_hi_ms))
+        if len(sel) < 6:
+            return None
+        P = a["P"][sel]
+        j = int(np.nanargmax(np.abs(np.diff(P))))
+        t_edge = int(t[sel[j]])
+        pre = (t >= t_edge - 3600) & (t <= t_edge - 600)
+        post = (t >= t_edge + 600) & (t <= t_edge + 3600)
+        if int(pre.sum()) < 3 or int(post.sum()) < 3:
+            return None
+        med = lambda k, m: float(np.nanmedian(a[k][m]))   # noqa: E731
+        dP = med("P", post) - med("P", pre)
+        if (float(np.nanstd(a["P"][pre])) > max(6.0, 0.10 * abs(dP))
+                or float(np.nanstd(a["P"][post])) > max(6.0, 0.10 * abs(dP))):
+            return None
+        return {"t_ms": t_edge, "dP": dP, "dQ": med("Q", post) - med("Q", pre)}
+
+    def _inmix_capture_on(self, cap: MixCapture, base_P: float, label: str,
+                          min_s: float, extend: bool, phase: str,
+                          step_txt: str) -> int:
+        """Record the mix with the device running: at least min_s, extended
+        (up to 2x) while the signal still ramps/cycles when `extend` is set,
+        so the settled draw dominates the capture the way it does in a
+        campaign single. A device that switches ITSELF off (toaster pop-up,
+        kettle auto-off) ends the phase early: once the total sits back at
+        the baseline for a few ticks, more waiting records nothing but
+        background. Returns the capture end time (ms)."""
+        on_W_min = max(8.0, self.edge_min_W)
+        t0 = time.time()
+        max_s = (2.0 if extend else 1.0) * min_s
+        back_ticks = 0
+        while True:
+            el = time.time() - t0
+            if el >= min_s and (el >= max_s or not self._still_changing()):
+                break
+            if self._teach_cancel:
+                raise RuntimeError("cancelled")
+            cap.collect()
+            w = self._instant_W() or 0.0
+            if el >= 10.0 and w <= base_P + 0.5 * on_W_min:
+                back_ticks += 1
+                if back_ticks >= 5:      # ~2.5 s back at the baseline
+                    break
+            else:
+                back_ticks = 0
+            note = (f"{min_s - el:.0f} s left" if el < min_s
+                    else "signal still settling - extending")
+            self._set_guide(phase,
+                            f"{step_txt} - recording '{label}' inside the mix "
+                            f"at {w:.0f} W total, {note}. Keep every device "
+                            "exactly as it is.")
+            time.sleep(0.5)
+        cap.collect()
+        return int(time.time() * 1000)
+
+    def _seg_level(self, cap: MixCapture, t_on_ms: int, t_end_ms: int,
+                   base, floor_W: float):
+        """Settled device level of one ON stretch: median of the
+        baseline-subtracted ACTIVE samples, over the later half of them so a
+        soft-start ramp does not drag the estimate down. None when nothing
+        measurable ran."""
+        a = cap.arrays()
+        t = a["t_ms"].astype(np.int64)
+        sel = (t >= t_on_ms) & (t <= t_end_ms)
+        if int(sel.sum()) < 8:
+            return None
+        P = a["P"][sel] - base["P"]
+        act = np.flatnonzero(P > 0.5 * max(3.0, floor_W))
+        if len(act) >= 10:
+            return float(np.nanmedian(P[act[len(act) // 2:]]))
+        if int(np.isfinite(P).sum()) >= 4:
+            return float(np.nanmedian(P))
+        return None
+
+    def _teach_inmix_worker(self, label, retrain, expected_W=None,
+                            unknown_since_ms=None):
         cap = MixCapture(self)
-        base_s = 8.0
+        base_s = self.inmix_base_s
         on_W_min = max(8.0, self.edge_min_W)
         try:
             ref = self._instant_W()
             if ref is None:
                 raise RuntimeError("no live samples in the buffer yet")
-            drop_min = max(on_W_min, 0.3 * expected_W if expected_W else 0.0)
-            # 1. switch OFF only the unknown device; the background keeps running
+            # 0. harvest what the engine already measured for free: the
+            # residual history since the unknown appeared is an independent
+            # estimate of the device's draw
+            harvest = self._harvest_residual(unknown_since_ms)
+            exp = expected_W or (harvest["W"] if harvest else None)
+            drop_min = max(on_W_min, 0.3 * exp if exp else 0.0)
+            # 1. switch OFF only the unknown device; the background keeps
+            # running. The toggle's settled step delta is itself evidence.
+            t_req_ms = int(time.time() * 1000)
             if self._inmix_wait(cap, lambda w: w <= ref - drop_min, 3.0, 300.0,
                     "inmix_off",
-                    f"Step 1/5 - keep every OTHER device running exactly as it "
+                    f"Step 1/4 - keep every OTHER device running exactly as it "
                     f"is; switch OFF only '{label}'. Waiting for a settled drop "
                     f"of >= {drop_min:.0f} W (total now {{w:.0f}} W)") is None:
                 raise RuntimeError("timeout/cancel while waiting for the device "
                                    "to switch off")
+            off_step = self._teach_step_delta(cap, t_req_ms,
+                                              int(time.time() * 1000))
             base_a = self._inmix_baseline(cap, base_s, "inmix_baseline_a",
-                    "Step 2/5 - measuring the background baseline, "
+                    "Step 2/4 - measuring the background baseline, "
                     "{left:.0f} s. Do not switch anything.")
             # 2. switch it back ON. The gate is the minimum DETECTABLE rise,
             # not a fraction of the earlier drop: a soft-start device (laptop
@@ -2707,92 +2843,146 @@ class LiveEngine:
             rise_min = on_W_min
             if self._inmix_wait(cap, lambda w: w >= base_a["P"] + rise_min,
                     2.0, 300.0, "inmix_on",
-                    f"Step 3/5 - now switch '{label}' back ON (leave the others "
+                    f"Step 3/4 - now switch '{label}' back ON (leave the others "
                     f"alone). Waiting for +{rise_min:.0f} W over the "
                     f"{base_a['P']:.0f} W baseline (total now {{w:.0f}} W)") is None:
                 raise RuntimeError("timeout/cancel while waiting for the device "
                                    "to switch on")
             t_on_ms = int(time.time() * 1000)
-            # 3. record the mix with the device running -- extended (up to 2x)
-            # while the signal still ramps/cycles, same as the guided flow;
-            # the closing-baseline drift check remains the guard against a
-            # background device toggling during the longer capture. A device
-            # that switches ITSELF off (toaster pop-up, kettle auto-off) ends
-            # the ON phase early: once the total sits back at the baseline
-            # for a few ticks, more waiting records nothing but background.
-            t0 = time.time()
-            max_s = 2.0 * self.teach_record_s
-            back_ticks = 0
-            while True:
-                el = time.time() - t0
-                if el >= self.teach_record_s and (
-                        el >= max_s or not self._still_changing()):
-                    break
-                if self._teach_cancel:
-                    raise RuntimeError("cancelled")
-                cap.collect()
-                w = self._instant_W() or 0.0
-                if el >= 10.0 and w <= base_a["P"] + 0.5 * on_W_min:
-                    back_ticks += 1
-                    if back_ticks >= 5:      # ~2.5 s back at the baseline
+            # 3. record the mix with the device running; it STAYS running
+            # when the flow ends -- there is no closing baseline. The guard
+            # against a background device toggling mid-capture is no longer
+            # an endpoint drift check (blind to everything that toggled back,
+            # and to everything between the endpoints) but the cross-check
+            # of independent estimates below.
+            t_end_ms = self._inmix_capture_on(cap, base_a["P"], label,
+                                              self.teach_record_s, True,
+                                              "inmix_recording", "Step 4/4")
+            # 4. three independent estimates of the settled draw must agree:
+            #    - the off-step delta (measured, model-free)
+            #    - the settled ON level minus baseline A (the capture itself)
+            #    - the engine's residual history (free, ~15 % model error)
+            # Agreement -> one toggle was enough. Disagreement -> the
+            # background changed somewhere no single check can localize, so
+            # ask for quick extra toggles and let the median decide.
+            e_off = (-off_step["dP"]
+                     if off_step and -off_step["dP"] > 0 else None)
+            e_body = self._seg_level(cap, t_on_ms, t_end_ms, base_a, on_W_min)
+            e_res = None
+            if (harvest and harvest["W"] >= on_W_min
+                    and harvest["mad"] <= max(10.0, 0.15 * harvest["W"])):
+                e_res = harvest["W"]
+            votes = [v for v in (e_off, e_body, e_res)
+                     if v is not None and math.isfinite(v) and v > 0]
+            segments = [(int(t_on_ms - 1500), t_end_ms, base_a, e_body)]
+            level = float(np.median(votes)) if votes else 0.0
+            agree = (len(votes) >= 2
+                     and max(votes) - min(votes) <= max(10.0, 0.18 * level))
+            n_toggles = 1
+            if not agree:
+                self._log_event(int(time.time() * 1000), "teach_warning",
+                                nl.parse_family(label), None, None, None, None,
+                                detail="in-mix estimates disagree ("
+                                       + ", ".join(f"{v:.0f} W" for v in votes)
+                                       + ") - the background likely changed "
+                                       "during the capture; asking for extra "
+                                       "off/on toggles instead of discarding")
+                for k in (2, 3):
+                    n_toggles = k
+                    ref_k = self._instant_W()
+                    if ref_k is None:
+                        raise RuntimeError("live buffer went empty")
+                    guess = float(np.median(votes)) if votes else (exp or 0.0)
+                    drop_k = max(on_W_min, 0.3 * guess)
+                    t_req_k = int(time.time() * 1000)
+                    if self._inmix_wait(cap, lambda w: w <= ref_k - drop_k,
+                            3.0, 300.0, f"inmix_off{k}",
+                            f"Cross-check {k - 1}/2 - switch OFF only "
+                            f"'{label}' again. Waiting for a settled drop of "
+                            f">= {drop_k:.0f} W (total now {{w:.0f}} W)") is None:
+                        raise RuntimeError("timeout/cancel during the "
+                                           "cross-check switch-off")
+                    off_k = self._teach_step_delta(cap, t_req_k,
+                                                   int(time.time() * 1000))
+                    base_k = self._inmix_baseline(cap, base_s,
+                            f"inmix_baseline_{k}",
+                            f"Cross-check {k - 1}/2 - measuring the "
+                            "background, {left:.0f} s. Do not switch anything.")
+                    if self._inmix_wait(cap,
+                            lambda w: w >= base_k["P"] + rise_min, 2.0, 300.0,
+                            f"inmix_on{k}",
+                            f"Cross-check {k - 1}/2 - switch '{label}' back "
+                            f"ON. Waiting for +{rise_min:.0f} W over the "
+                            f"{base_k['P']:.0f} W baseline "
+                            "(total now {w:.0f} W)") is None:
+                        raise RuntimeError("timeout/cancel during the "
+                                           "cross-check switch-on")
+                    t_on_k = int(time.time() * 1000)
+                    t_end_k = self._inmix_capture_on(
+                        cap, base_k["P"], label,
+                        max(12.0, 0.3 * self.teach_record_s), False,
+                        f"inmix_recording{k}", f"Cross-check {k - 1}/2")
+                    e_k = self._seg_level(cap, t_on_k, t_end_k, base_k,
+                                          on_W_min)
+                    if off_k and -off_k["dP"] > 0:
+                        votes.append(-off_k["dP"])
+                    if e_k is not None and e_k > 0:
+                        votes.append(e_k)
+                    segments.append((int(t_on_k - 1500), t_end_k, base_k, e_k))
+                    med = float(np.median(votes))
+                    keep = [v for v in votes
+                            if abs(v - med) <= max(10.0, 0.20 * med)]
+                    if len(keep) >= 3 and len(keep) >= len(votes) - 1:
                         break
-                else:
-                    back_ticks = 0
-                note = (f"{self.teach_record_s - el:.0f} s left"
-                        if el < self.teach_record_s
-                        else "signal still settling - extending")
-                self._set_guide("inmix_recording",
-                                f"Step 4/5 - recording '{label}' inside the mix "
-                                f"at {w:.0f} W total, {note}. Keep "
-                                "every device exactly as it is.")
-                time.sleep(0.5)
-            cap.collect()
-            t_off_req_ms = int(time.time() * 1000)
-            est_W = cap.median("P", t_on_ms, t_off_req_ms) - base_a["P"]
-            # 4. switch it OFF again -> closing baseline. Wait for the total
-            # to RETURN NEAR THE BASELINE -- immediately true when the device
-            # already switched itself off -- rather than for a fresh drop
-            # from the current level, which a pop-up toaster satisfies never
-            # (the drop already happened) and only times out after 5 minutes.
-            back_W = base_a["P"] + max(on_W_min, 0.25 * max(est_W, 0.0))
-            if self._inmix_wait(cap, lambda w: w <= back_W, 3.0, 300.0,
-                    "inmix_off2",
-                    f"Step 5/5 - switch '{label}' OFF again (skip if it "
-                    f"switched itself off). Waiting for the total to return "
-                    f"to ~{base_a['P']:.0f} W (total now {{w:.0f}} W)") is None:
-                raise RuntimeError("timeout/cancel while waiting for the final "
-                                   "switch-off")
-            base_b = self._inmix_baseline(cap, base_s, "inmix_baseline_b",
-                    "Step 5/5 - measuring the closing baseline, "
-                    "{left:.0f} s. Do not switch anything.")
-            # 5. validate: if the background changed between the two baselines,
-            # another device toggled mid-capture -> the subtraction is invalid
-            drift = abs(base_b["P"] - base_a["P"])
-            drift_tol = max(15.0, 0.25 * max(est_W, on_W_min))
-            if drift > drift_tol:
+                med = float(np.median(votes))
+                keep = [v for v in votes
+                        if abs(v - med) <= max(10.0, 0.20 * med)]
+                if len(keep) < 2:
+                    raise RuntimeError(
+                        "the device's watts never measured twice alike ("
+                        + ", ".join(f"{v:.0f} W" for v in votes)
+                        + ") - the background kept changing. Teach this "
+                        "device with the guided (isolated) flow instead")
+                level = float(np.median(keep))
+            if level < on_W_min:
                 raise RuntimeError(
-                    f"background changed by {drift:.0f} W during the capture "
-                    f"(budget {drift_tol:.0f} W) - another device must have "
-                    "switched. Keep the other devices steady and teach again")
-            iso = self._isolate_inmix(cap, base_a, base_b, t_on_ms, t_off_req_ms)
-            if iso["device_W"] < on_W_min:
+                    f"isolated signal is only {level:.0f} W - no measurable "
+                    "device found on top of the background")
+            # 5. save only the stretches whose own level agrees with the
+            # consensus: a stretch the background corrupted must not train
+            # the model, not even partially
+            good = [(g0, g1, gb) for (g0, g1, gb, ge) in segments
+                    if ge is not None
+                    and abs(ge - level) <= max(10.0, 0.25 * level)]
+            if not good:
                 raise RuntimeError(
-                    f"isolated signal is only {iso['device_W']:.0f} W - no "
-                    "measurable device found on top of the background")
-            path = self._save_inmix_recording(label, iso, base_a, base_b, drift)
+                    "no captured stretch matches the agreed "
+                    f"~{level:.0f} W level - teach again while the "
+                    "background is steady")
+            cleaned = [self._clean_segment(cap, g0, g1, gb, level)
+                       for (g0, g1, gb) in good]
+            path = self._save_teach_recording(label, cleaned, base_a, {
+                "n_toggles": n_toggles,
+                "device_W_level": round(level, 1),
+                "device_W_estimates": {
+                    "off_step": e_off, "on_body": e_body,
+                    "residual_history": e_res}})
             self.models._load_signatures()
             warn = self._post_teach_checks(label)
             fname = os.path.basename(path)
+            n_samp = sum(c["n"] for c in cleaned)
             self._log_event(int(time.time() * 1000), "taught",
                             nl.parse_family(label), None, None, None, None,
                             detail=f"in-mix capture isolated and saved ({fname}, "
-                                   f"{iso['n']} samples, ~{iso['device_W']:.0f} W "
-                                   f"on a {base_a['P']:.0f} W background, "
-                                   f"drift {drift:.0f} W)"
+                                   f"{n_samp} samples, ~{level:.0f} W on a "
+                                   f"{base_a['P']:.0f} W background, "
+                                   f"{n_toggles} toggle(s), estimates "
+                                   + "/".join(f"{v:.0f}" for v in votes)
+                                   + " W)"
                                    + ("; retraining" if retrain else ""))
             with self.lock:
-                self._teach_note = (f"saved {fname} (in-mix, "
-                                    f"~{iso['device_W']:.0f} W isolated)"
+                self._teach_note = (f"saved {fname} (in-mix, ~{level:.0f} W "
+                                    f"isolated, {n_toggles} toggle(s))"
                                     + ("; retraining" if retrain else "")
                                     + (f" - {warn}" if warn else ""))
             if retrain:
@@ -2807,73 +2997,133 @@ class LiveEngine:
             with self.lock:
                 self.guide = None
 
-    def _isolate_inmix(self, cap: MixCapture, base_a, base_b,
-                       t_on_ms, t_off_ms) -> dict:
-        """Isolated device channels = captured mix minus the background
-        baseline, interpolated linearly from baseline A to baseline B so slow
-        background drift (fridge duty cycle, PV) is subtracted as well."""
+    def _clean_segment(self, cap: MixCapture, t0_ms: int, t1_ms: int,
+                       base, level_W: float) -> dict:
+        """One captured ON stretch -> the device's own clean channels.
+
+        Mix minus the (constant) background baseline leaves the device PLUS
+        the background's noise, and the training features (P_std, P_min/max,
+        THD stats) would absorb that noise as if it were the device's -- the
+        core reason in-mix recordings used to train worse than guided ones.
+        The settled part is therefore SHRUNK: fluctuations around the settled
+        level are scaled to the device-only share sqrt(var_mix - var_base).
+        A genuinely cycling device keeps its swings (its own variance
+        dominates that estimate); a steady device on a noisy background comes
+        out as flat as a guided recording. The switch-on transient is kept
+        exactly as measured -- it is the event signature."""
         a = cap.arrays()
         t = a["t_ms"].astype(np.int64)
-        span = max(1.0, base_b["t_ms"] - base_a["t_ms"])
-        frac = np.clip((t - base_a["t_ms"]) / span, 0.0, 1.0)
-
-        def base(k):
-            return base_a[k] + frac * (base_b[k] - base_a[k])
-
-        P = a["P"] - base("P")
-        Q = a["Q"] - base("Q")
-        P1 = a["P1"] - base("P1")
-        P2 = a["P2"] - base("P2")
-        P3 = a["P3"] - base("P3")
-        S = np.hypot(P, Q)
-        PF = np.divide(P, S, out=np.ones_like(P), where=S > 1e-6)
+        sel = (t >= t0_ms) & (t <= t1_ms)
+        if int(sel.sum()) < 10:
+            raise RuntimeError("too few samples captured for an ON stretch")
+        t = t[sel]
+        P = a["P"][sel] - base["P"]
+        Q = a["Q"][sel] - base["Q"]
+        P1 = a["P1"][sel] - base["P1"]
+        P2 = a["P2"][sel] - base["P2"]
+        P3 = a["P3"][sel] - base["P3"]
+        on = np.abs(P) > max(3.0, 0.25 * level_W)
+        settled = ModelManager._trim_soft_start(P, on)
+        scale = 1.0
+        if int(settled.sum()) >= 10:
+            def shrink(arr, noise_std):
+                med = float(np.nanmedian(arr[settled]))
+                s_r = float(np.nanstd(arr[settled]))
+                s_dev = math.sqrt(max(0.0, s_r ** 2 - float(noise_std) ** 2))
+                sc = 1.0 if s_r <= 1e-9 else min(1.0, s_dev / s_r)
+                out = arr.copy()
+                out[settled] = med + sc * (arr[settled] - med)
+                return out, sc
+            P, scale = shrink(P, base.get("P_std", 0.0))
+            Q, _ = shrink(Q, base.get("Q_std", 0.0))
+            # each phase channel carries roughly a third of the total's noise
+            ph_std = float(base.get("P_std", 0.0)) / math.sqrt(3.0)
+            P1, _ = shrink(P1, ph_std)
+            P2, _ = shrink(P2, ph_std)
+            P3, _ = shrink(P3, ph_std)
         # THD_I: percentages do not subtract, harmonic CURRENTS of independent
         # loads add ~orthogonally -> estimate the device's harmonic current by
         # RSS subtraction and re-normalize to its own fundamental (nominal
         # 230 V cancels out of mix vs baseline, it only scales both).
         V = 230.0
-        i_f_mix = np.hypot(np.nan_to_num(a["P"]), np.nan_to_num(a["Q"])) / V
-        i_h_mix = a["THD"] / 100.0 * i_f_mix
-        i_f_base = np.hypot(base("P"), base("Q")) / V
-        i_h_base = (base_a["THD"] + frac * (base_b["THD"] - base_a["THD"])) \
-            / 100.0 * i_f_base
+        i_f_mix = np.hypot(np.nan_to_num(a["P"][sel]),
+                           np.nan_to_num(a["Q"][sel])) / V
+        i_h_mix = a["THD"][sel] / 100.0 * i_f_mix
+        i_f_base = math.hypot(base["P"], base["Q"]) / V
+        i_h_base = base["THD"] / 100.0 * i_f_base
         i_f_dev = np.hypot(P, Q) / V
         with np.errstate(invalid="ignore"):
             i_h_dev = np.sqrt(np.clip(i_h_mix ** 2 - i_h_base ** 2, 0.0, None))
             THD = np.where(np.isfinite(i_h_dev) & (i_f_dev > 1e-3),
                            100.0 * i_h_dev / np.maximum(i_f_dev, 1e-9), np.nan)
-        on_sel = (t >= t_on_ms) & (t <= t_off_ms)
-        # median over the samples where the device actually DRAWS: a toaster
-        # that pops up mid-window would otherwise average its own off-tail in
-        # and could fail the >= on_W_min save gate despite a clean capture
-        act = on_sel & (np.abs(P) > 3.0)
-        if act.sum() >= max(15, int(0.1 * on_sel.sum())):
-            device_W = float(np.nanmedian(P[act]))
-        elif on_sel.any():
-            device_W = float(np.nanmedian(P[on_sel]))
-        else:
-            device_W = 0.0
+        if int(settled.sum()) >= 10:
+            fin = settled & np.isfinite(THD)
+            if int(fin.sum()) >= 5:
+                med_t = float(np.nanmedian(THD[fin]))
+                THD = np.where(fin, med_t + scale * (THD - med_t), THD)
+        S = np.hypot(P, Q)
+        PF = np.divide(P, S, out=np.ones_like(P), where=S > 1e-6)
+        act = settled if int(settled.sum()) >= 10 else on
+        dev_W = (float(np.nanmedian(P[act])) if act.any()
+                 else float(np.nanmedian(P)))
         return {"t_ms": t, "P_total": P, "Q_total": Q, "S_total": S,
                 "PF_total": PF, "P_L1": P1, "P_L2": P2, "P_L3": P3,
-                "THD_I_L1": THD, "device_W": device_W, "n": int(len(t))}
+                "THD_I_L1": THD, "device_W": dev_W,
+                "noise_scale": round(float(scale), 3), "n": int(len(t))}
 
-    def _save_inmix_recording(self, label, iso, base_a, base_b, drift) -> str:
-        """Write the isolated signal as a standard recorder .h5 (same layout as
-        pac_reader's IncrementalHDF5Writer) so signatures, the scenario mixer,
-        and identify training consume it like any clean recording."""
+    def _save_teach_recording(self, label, segments, base_a, extra) -> str:
+        """Write the cleaned ON stretch(es) as a standard recorder .h5 (same
+        layout as pac_reader's IncrementalHDF5Writer) so signatures, the
+        scenario mixer, and identify training consume it like any clean
+        recording. Campaign-single protocol shape: 10 s off lead, the
+        stretch(es) separated by short off gaps (each boundary is a real
+        off/on cycle for the event features), 8 s off tail."""
         channels = ["P_total", "Q_total", "S_total", "PF_total",
                     "P_L1", "P_L2", "P_L3", "THD_I_L1"]
+        sr = float(self.svc.sample_rate_hz)
+        dt_ms = 1000.0 / max(sr, 1e-6)
+        lead_s, gap_s, tail_s = 10.0, 5.0, 8.0
+
+        def zeros(n):
+            return {"P_total": np.zeros(n), "Q_total": np.zeros(n),
+                    "S_total": np.zeros(n), "PF_total": np.ones(n),
+                    "P_L1": np.zeros(n), "P_L2": np.zeros(n),
+                    "P_L3": np.zeros(n), "THD_I_L1": np.full(n, np.nan)}
+
+        t_parts, ch_parts = [], []
+        cursor = float(segments[0]["t_ms"][0]) - lead_s * 1000.0
+        n_lead = max(1, int(round(lead_s * sr)))
+        t_parts.append(cursor + np.arange(n_lead) * dt_ms)
+        ch_parts.append(zeros(n_lead))
+        cursor += n_lead * dt_ms
+        for i, seg in enumerate(segments):
+            if i:
+                n_gap = max(1, int(round(gap_s * sr)))
+                t_parts.append(cursor + np.arange(n_gap) * dt_ms)
+                ch_parts.append(zeros(n_gap))
+                cursor += n_gap * dt_ms
+            rel = (seg["t_ms"] - seg["t_ms"][0]).astype(float)
+            t_parts.append(cursor + rel)          # keeps real sample spacing
+            ch_parts.append({ch: np.asarray(seg[ch], dtype=float)
+                             for ch in channels})
+            cursor += float(rel[-1]) + dt_ms
+        n_tail = max(1, int(round(tail_s * sr)))
+        t_parts.append(cursor + np.arange(n_tail) * dt_ms)
+        ch_parts.append(zeros(n_tail))
+        t_ms = np.concatenate(t_parts)
+        data = {ch: np.concatenate([p[ch] for p in ch_parts])
+                for ch in channels}
+
         safe = pr._safe_label(label)
         fname = f"{safe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.h5"
         os.makedirs(self.models.onthego_dir, exist_ok=True)
         path = os.path.join(self.models.onthego_dir, fname)
-        t_us = iso["t_ms"].astype(np.int64) * 1000
-        sr = float(self.svc.sample_rate_hz)
+        t_us = np.round(t_ms * 1000.0).astype(np.int64)
         with h5py.File(path, "w") as f:
             f.create_dataset("timestamp", data=t_us, compression="lzf")
             m = f.create_group("measurements")
             for ch in channels:
-                m.create_dataset(ch, data=np.asarray(iso[ch], dtype=np.float32),
+                m.create_dataset(ch, data=np.asarray(data[ch], dtype=np.float32),
                                  compression="lzf")
             md = f.create_group("metadata")
             md.attrs["format_version"] = pr.FORMAT_VERSION
@@ -2885,17 +3135,20 @@ class LiveEngine:
             md.attrs["appliance_label"] = label
             md.attrs["channels"] = json.dumps(channels)
             md.attrs["harmonics_enabled"] = False
-            md.attrs["teach_mode"] = "in_mix"
+            md.attrs["teach_mode"] = "on_the_go"
             md.attrs["baseline_P_W"] = round(float(base_a["P"]), 1)
-            md.attrs["baseline_drift_W"] = round(float(drift), 1)
+            md.attrs["n_toggles"] = int(extra["n_toggles"])
             md.attrs["recording_summary"] = json.dumps({
                 "appliance_label": label,
-                "teach_mode": "in_mix",
-                "n_samples": int(iso["n"]),
-                "duration_s": round(iso["n"] / sr, 2) if sr > 0 else None,
-                "device_W_median": round(float(iso["device_W"]), 1),
+                "teach_mode": "on_the_go",
+                "n_samples": int(len(t_us)),
+                "duration_s": round(len(t_us) / sr, 2) if sr > 0 else None,
+                "device_W_median": extra["device_W_level"],
+                "device_W_estimates": extra["device_W_estimates"],
                 "baseline_P_W": round(float(base_a["P"]), 1),
-                "baseline_drift_W": round(float(drift), 1),
+                "baseline_P_std_W": round(float(base_a.get("P_std", 0.0)), 2),
+                "n_toggles": int(extra["n_toggles"]),
+                "noise_scale": [s["noise_scale"] for s in segments],
                 "configured_sample_rate_hz": sr,
                 "harmonics_enabled": False,
                 "completed_utc": datetime.now(timezone.utc).isoformat()})
@@ -3197,8 +3450,10 @@ LIVE_HTML = r"""<!DOCTYPE html>
         ~<span id="unk-w">?</span> W of unexplained power since <span id="unk-since">?</span>.
         What device is this? Name it, then either record it in ISOLATION
         (disconnect everything first - cleanest data) or teach it ON THE GO:
-        the other devices keep running and you only toggle this one device off
-        and on; its signal is isolated from the mix by baseline subtraction.
+        the other devices keep running and you switch just this one device
+        off and back on once when asked. Its signal is isolated from the mix
+        and cross-checked against independent measurements; only if the
+        background interferes are you asked for one or two more toggles.
       </div>
       <div class="row">
         <input type="text" id="teach-name" placeholder="e.g. kettle">
