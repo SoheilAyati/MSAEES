@@ -780,6 +780,79 @@ class ModelManager:
                     "distance": round(best_d, 3),
                     "contenders": contenders}
 
+    def suggest_device_name(self, watts: float, q_var=None):
+        """Return a numbered name based on the closest active model family.
+
+        This is intentionally separate from :meth:`match_edge`: it always
+        returns the nearest usable signature, even when that signature is far
+        too weak to name the load during normal inference.  Its result is only
+        a default for the unknown-device textbox and therefore cannot create a
+        claim, change a prediction, or suppress the unknown warning.  The
+        suffix makes the recording label unique (``standing_fan_2``, then
+        ``standing_fan_3``), while parse_family intentionally maps every such
+        label back to the shared ``standing_fan`` model family.
+
+        Filtering by ``self.appliances`` is important when the frozen original
+        and train-on-the-go bundles coexist.  The signature table can contain
+        newer on-the-go recordings, but the hint must only use devices known by
+        whichever model bundle the user currently selected.
+        """
+        try:
+            p = float(watts)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(p):
+            return None
+        try:
+            q = float(q_var) if q_var is not None else None
+        except (TypeError, ValueError):
+            q = None
+        if q is not None and not math.isfinite(q):
+            q = None
+
+        with self.lock:
+            active = {nl.parse_family(name) for name in self.appliances}
+            sigs = [dict(s) for s in self.signatures
+                    if nl.parse_family(s.get("family", "")) in active]
+            all_labels = [str(s.get("label", "")) for s in self.signatures]
+        if not sigs:
+            return None
+
+        best = None
+        for s in sigs:
+            tol_P = max(15.0, 0.25 * abs(s["P"]))
+            p_lo, p_hi = s.get("P_lo", s["P"]), s.get("P_hi", s["P"])
+            dp_err = (0.0 if p_lo <= p <= p_hi
+                      else min(abs(p - p_lo), abs(p - p_hi)))
+            terms = [dp_err / tol_P]
+            if q is not None:
+                tol_Q = max(8.0, 0.25 * abs(s["Q"]) + 0.05 * abs(s["P"]))
+                q_lo, q_hi = s.get("Q_lo", s["Q"]), s.get("Q_hi", s["Q"])
+                dq_err = (0.0 if q_lo <= q <= q_hi
+                          else min(abs(q - q_lo), abs(q - q_hi)))
+                terms.append(dq_err / tol_Q)
+            distance = max(terms)
+            candidate = (distance, abs(p - s["P"]),
+                         nl.parse_family(s["family"]))
+            if best is None or candidate < best:
+                best = candidate
+        if best is None:
+            return None
+
+        family = best[2]
+        used = {1}                       # the active model already has the base
+        prefix = family + "_"
+        for label in all_labels:
+            raw = nl.strip_timestamp(label.strip().lower())
+            if raw.startswith(prefix):
+                token = raw[len(prefix):].split("_", 1)[0]
+                if token.isdigit():
+                    used.add(int(token))
+        n = 2
+        while n in used:
+            n += 1
+        return f"{family}_{n}"
+
     def match_edge_pair(self, dP: float, dQ: float, q_noise: float = 0.0):
         """Explain one composite step as TWO devices switching together.
 
@@ -2728,6 +2801,12 @@ class LiveEngine:
                 self.unknown = None
             over = False
 
+        # This measurement is retained only for the optional textbox hint.
+        # It never enters matching/claim decisions above.  Reactive power is
+        # valuable here because two fan-like loads can draw similar watts but
+        # have very different electrical signatures.
+        unknown_q = self._residual_q(arrs, on_map, src_map) if over else None
+
         with self.lock:
             if over:
                 self._unknown_clear_ms = None
@@ -2741,7 +2820,9 @@ class LiveEngine:
                                     "since_iso": datetime.fromtimestamp(
                                         self._unknown_first / 1000.0).astimezone()
                                         .isoformat(timespec="seconds"),
-                                    "typical_W": round(residual, 1)}
+                                    "typical_W": round(residual, 1),
+                                    "typical_Q": (round(unknown_q, 1)
+                                                  if unknown_q is not None else None)}
                     self._log_event(self._unknown_first, "unknown_detected", "unknown",
                                     None, residual, None, total_W,
                                     detail="sustained unexplained power - "
@@ -2766,6 +2847,8 @@ class LiveEngine:
                     self._unknown_clear_ms = None
             if self.unknown is not None:
                 self.unknown["typical_W"] = round(residual, 1)
+                if unknown_q is not None:
+                    self.unknown["typical_Q"] = round(unknown_q, 1)
 
     # ---- teach: two guided flows to capture exactly one device --------------
     # Both flows use record_campaign's protocol numbers (10 s lead, 75 s ON
@@ -3707,20 +3790,29 @@ class LiveEngine:
                                  .astimezone().isoformat(timespec="seconds")
                                  if v.get("since_ms") else None)}
                   for nm, v in sorted(self.state.items()) if v["on"]]
-            return {"currently_on": on,
-                    "all": self.state,
-                    "total_W": self.total_W,
-                    "residual_W": self.residual_W,
-                    "explained_frac": self.explained_frac,
-                    "unknown": self.unknown,
-                    "unknown_loads": [
-                        {"W": round(u["W"], 1), "since_ms": u["t_ms"],
-                         "since_iso": datetime.fromtimestamp(u["t_ms"] / 1000.0)
-                         .astimezone().isoformat(timespec="seconds")}
-                        for u in self.unknown_claims],
-                    "teach_guide": self.guide,
-                    "teach_note": self._teach_note,
-                    "replay_gt": self._gt_now}
+            unknown = dict(self.unknown) if self.unknown is not None else None
+            out = {"currently_on": on,
+                   "all": self.state,
+                   "total_W": self.total_W,
+                   "residual_W": self.residual_W,
+                   "explained_frac": self.explained_frac,
+                   "unknown": unknown,
+                   "unknown_loads": [
+                       {"W": round(u["W"], 1), "since_ms": u["t_ms"],
+                        "since_iso": datetime.fromtimestamp(u["t_ms"] / 1000.0)
+                        .astimezone().isoformat(timespec="seconds")}
+                       for u in self.unknown_claims],
+                   "teach_guide": self.guide,
+                   "teach_note": self._teach_note,
+                   "replay_gt": self._gt_now}
+        if unknown is not None:
+            # Compute this outside the engine lock: switching model variants
+            # reloads ModelManager under its own lock, and the UI hint must not
+            # introduce a new lock-order dependency into the live path.
+            unknown["suggested_name"] = self.models.suggest_device_name(
+                unknown.get("typical_W"), unknown.get("typical_Q"))
+            unknown.pop("typical_Q", None)       # internal comparison detail
+        return out
 
     def chart(self) -> dict:
         with self.lock:
@@ -4192,6 +4284,7 @@ LIVE_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="alert-actions">
       <input type="text" id="teach-name" aria-label="Unknown device name" placeholder="Device name, e.g. kettle">
+      <div class="small muted" id="teach-suggestion"></div>
       <div class="row">
         <button class="primary" onclick="teach('isolated')">Teach isolated</button>
         <button class="warn" onclick="teach('inmix')">Teach in mix</button>
@@ -4288,6 +4381,7 @@ LIVE_HTML = r"""<!DOCTYPE html>
 const FAMILY_COLORS = __FAMILY_COLORS__;
 const FALLBACK_FAMS = Object.keys(FAMILY_COLORS);
 let lastEvent = 0, recActive = false;
+let suggestedTeachName = "", lastUnknownSince = null;
 
 function djb2(s){                       // same 32-bit hash as nilm_pipeline._djb2
   let h = 5381;
@@ -4433,7 +4527,28 @@ async function pollState(){
       ub.style.display = "block";
       document.getElementById("unk-w").textContent = st.unknown.typical_W;
       document.getElementById("unk-since").textContent = hms(st.unknown.since_iso);
-    } else ub.style.display = "none";
+      const input = document.getElementById("teach-name");
+      if(lastUnknownSince !== st.unknown.since_ms){
+        input.value = "";                 // a new warning must not reuse an old name
+        lastUnknownSince = st.unknown.since_ms;
+      }
+      suggestedTeachName = st.unknown.suggested_name || "";
+      input.placeholder = suggestedTeachName ?
+        "Suggested: " + suggestedTeachName :
+        "Device name, e.g. kettle";
+      document.getElementById("teach-suggestion").textContent = suggestedTeachName ?
+        "Closest device in the current model; suggested recording name: " +
+        suggestedTeachName +
+        ". Leave the box empty to use this name, or type a different one." : "";
+    } else {
+      ub.style.display = "none";
+      if(!st.unknown){
+        suggestedTeachName = "";
+        lastUnknownSince = null;
+        document.getElementById("teach-name").placeholder = "Device name, e.g. kettle";
+        document.getElementById("teach-suggestion").textContent = "";
+      }
+    }
     if(st.teach_note) document.getElementById("teach-note").textContent = st.teach_note;
     renderGt(st.replay_gt);
   }catch(e){}
@@ -4604,7 +4719,8 @@ async function pollEvents(){
 }
 
 async function teach(mode){
-  const name = document.getElementById("teach-name").value.trim();
+  const typed = document.getElementById("teach-name").value.trim();
+  const name = typed || suggestedTeachName;
   if(!name) return showToast("Give the device a name first.",true);
   const r = await j("/api/teach", {method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify({label:name, retrain:true, mode:mode||"isolated"})});
