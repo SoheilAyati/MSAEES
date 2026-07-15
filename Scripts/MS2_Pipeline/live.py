@@ -957,7 +957,7 @@ class MixCapture:
     overrun it, so every wait/record loop of the in-mix flow calls collect()
     to drain new samples into this unbounded store as they arrive."""
 
-    KEYS = ("t_ms", "P", "Q", "S", "PF", "P1", "P2", "P3", "THD")
+    KEYS = ("t_ms", "P", "Q", "S", "PF", "P1", "P2", "P3", "THD", "HE")
 
     def __init__(self, engine):
         self.engine = engine
@@ -988,9 +988,14 @@ class MixCapture:
         sel = (a["t_ms"] >= t0_ms) & (a["t_ms"] <= t1_ms)
         if int(sel.sum()) < 3:
             return None
-        med = lambda k: float(np.nanmedian(a[k][sel]))   # noqa: E731
+
+        def med(k):
+            v = a[k][sel]
+            return (float(np.nanmedian(v)) if np.isfinite(v).any()
+                    else float("nan"))
         return {"P": med("P"), "Q": med("Q"), "P1": med("P1"),
                 "P2": med("P2"), "P3": med("P3"), "THD": med("THD"),
+                "HE": med("HE"),
                 "P_std": float(np.nanstd(a["P"][sel])),
                 "Q_std": float(np.nanstd(a["Q"][sel])),
                 "t_ms": float(np.mean(a["t_ms"][sel])), "n": int(sel.sum())}
@@ -2961,6 +2966,16 @@ class LiveEngine:
                     "background is steady")
             cleaned = [self._clean_segment(cap, g0, g1, gb, level)
                        for (g0, g1, gb) in good]
+            thd_warn = ""
+            if not all(c.get("thd_ok") for c in cleaned):
+                thd_warn = ("no THD captured (harmonic reads were unavailable "
+                            "during the capture) - the identify features of "
+                            "this recording are incomplete")
+                self._log_event(int(time.time() * 1000), "teach_warning",
+                                nl.parse_family(label), None, None, None, None,
+                                detail=thd_warn + "; check the meter's "
+                                       "harmonic spectrum reads and teach "
+                                       "again if recognition stays weak")
             path = self._save_teach_recording(label, cleaned, base_a, {
                 "n_toggles": n_toggles,
                 "device_W_level": round(level, 1),
@@ -3045,12 +3060,24 @@ class LiveEngine:
         # loads add ~orthogonally -> estimate the device's harmonic current by
         # RSS subtraction and re-normalize to its own fundamental (nominal
         # 230 V cancels out of mix vs baseline, it only scales both).
+        # The per-sample spectrum energy (HE, amps) IS that harmonic current
+        # and is used directly when the meter delivered it; the THD%-derived
+        # estimate is the per-sample fallback so one source failing does not
+        # silently strip the recording of its THD (all-NaN THD trains a
+        # device with THD_I_mean 0 - unmatchable live).
         V = 230.0
         i_f_mix = np.hypot(np.nan_to_num(a["P"][sel]),
                            np.nan_to_num(a["Q"][sel])) / V
-        i_h_mix = a["THD"][sel] / 100.0 * i_f_mix
+        i_h_mix = np.asarray(a["HE"][sel], dtype=float)
+        fb = ~np.isfinite(i_h_mix)
+        if fb.any():
+            with np.errstate(invalid="ignore"):
+                i_h_mix = np.where(fb, a["THD"][sel] / 100.0 * i_f_mix,
+                                   i_h_mix)
         i_f_base = math.hypot(base["P"], base["Q"]) / V
-        i_h_base = base["THD"] / 100.0 * i_f_base
+        i_h_base = float(base.get("HE", float("nan")))
+        if not math.isfinite(i_h_base):
+            i_h_base = base["THD"] / 100.0 * i_f_base
         i_f_dev = np.hypot(P, Q) / V
         with np.errstate(invalid="ignore"):
             i_h_dev = np.sqrt(np.clip(i_h_mix ** 2 - i_h_base ** 2, 0.0, None))
@@ -3061,7 +3088,12 @@ class LiveEngine:
             if int(fin.sum()) >= 5:
                 med_t = float(np.nanmedian(THD[fin]))
                 THD = np.where(fin, med_t + scale * (THD - med_t), THD)
-        S = np.hypot(P, Q)
+        # apparent power must include the device's DISTORTION component:
+        # S = hypot(P, Q) gives a high-THD electronic load PF ~1 and half its
+        # real VA (laptop: P 66 W -> meter S 132 VA, PF 0.50), and the
+        # identify features PF_mean/S_mean then never match the live device.
+        d_va = np.where(np.isfinite(i_h_dev), V * i_h_dev, 0.0)
+        S = np.sqrt(P ** 2 + Q ** 2 + d_va ** 2)
         PF = np.divide(P, S, out=np.ones_like(P), where=S > 1e-6)
         act = settled if int(settled.sum()) >= 10 else on
         dev_W = (float(np.nanmedian(P[act])) if act.any()
@@ -3069,6 +3101,8 @@ class LiveEngine:
         return {"t_ms": t, "P_total": P, "Q_total": Q, "S_total": S,
                 "PF_total": PF, "P_L1": P1, "P_L2": P2, "P_L3": P3,
                 "THD_I_L1": THD, "device_W": dev_W,
+                "thd_ok": bool(np.isfinite(THD[act]).any()) if act.any()
+                else bool(np.isfinite(THD).any()),
                 "noise_scale": round(float(scale), 3), "n": int(len(t))}
 
     def _save_teach_recording(self, label, segments, base_a, extra) -> str:

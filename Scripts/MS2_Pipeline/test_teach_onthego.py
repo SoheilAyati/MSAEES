@@ -68,12 +68,14 @@ class FakeRetrainer:
 class Feeder(threading.Thread):
     """Synthetic meter: steady background + the device under teach."""
 
-    def __init__(self, svc, bg_W=300.0, bg_Q=50.0, dev_W=120.0, dev_Q=20.0):
+    def __init__(self, svc, bg_W=300.0, bg_Q=50.0, dev_W=120.0, dev_Q=20.0,
+                 emit_he=True):
         super().__init__(daemon=True, name="feeder")
         self.svc = svc
         self.bg_W, self.bg_Q = bg_W, bg_Q
         self.dev_W, self.dev_Q = dev_W, dev_Q
         self.dev_on = True               # the unknown device is running
+        self.emit_he = emit_he           # False -> THD%-fallback path
         self.stop_flag = False
         self.rng = np.random.default_rng(7)
 
@@ -92,12 +94,16 @@ class Feeder(threading.Thread):
                 i_f_dev = math.hypot(self.dev_W, self.dev_Q) / 230.0
                 i_h += (0.05 * i_f_dev) ** 2
             i_f = math.hypot(p, q) / 230.0
-            thd = 100.0 * math.sqrt(i_h) / max(i_f, 1e-9)
-            s = math.hypot(p, q)
+            i_h_amp = math.sqrt(i_h)
+            thd = 100.0 * i_h_amp / max(i_f, 1e-9)
+            # the real meter's S_total includes the distortion component
+            s = 230.0 * math.hypot(i_f, i_h_amp)
             sample = {"P_total": p, "Q_total": q, "S_total": s,
                       "PF_total": p / max(s, 1e-9),
                       "P_L1": p, "P_L2": 0.0, "P_L3": 0.0,
                       "THD_I_L1": thd}
+            if self.emit_he:
+                sample["HE_I_L1"] = i_h_amp
             with self.svc._lock:
                 self.svc._buffer.append((int(time.time() * 1000), sample))
             time.sleep(1.0 / SR)
@@ -178,10 +184,10 @@ def load_saved(models):
     files = sorted(glob.glob(os.path.join(models.onthego_dir, "*.h5")))
     assert files, "no recording saved in on-the-go/"
     with h5py.File(files[-1], "r") as f:
-        P = f["measurements/P_total"][:]
+        data = {ch: f["measurements/" + ch][:] for ch in f["measurements"]}
         md = dict(f["metadata"].attrs)
         summary = json.loads(md["recording_summary"])
-    return P, md, summary
+    return data, md, summary
 
 
 def scenario_steady():
@@ -208,7 +214,8 @@ def scenario_steady():
         assert "1 toggle" in note, f"expected 1 toggle, got: {note}"
         assert not any("inmix_off2" in p for p in driver.phases_seen), \
             "extra toggles were requested on a steady background"
-        P, md, summary = load_saved(models)
+        data, md, summary = load_saved(models)
+        P = data["P_total"]
         assert md["teach_mode"] == "on_the_go"
         assert int(md["n_toggles"]) == 1
         dev_w = float(summary["device_W_median"])
@@ -227,6 +234,23 @@ def scenario_steady():
               f"noise_scale {summary['noise_scale']}")
         assert body_std < 1.5, \
             f"background noise leaked into the recording (std {body_std:.2f})"
+        # the device's OWN harmonic/apparent-power signature must survive the
+        # isolation: an all-NaN THD trains THD_I_mean 0 and S=hypot(P,Q)
+        # trains PF ~1 - both unmatchable against the live device
+        on = P > 0.5 * dev_w
+        THD = data["THD_I_L1"]
+        assert np.isfinite(THD[on]).sum() >= 0.8 * on.sum(), \
+            "THD is missing from the saved ON stretch"
+        med_thd = float(np.nanmedian(THD[on]))
+        assert abs(med_thd - 5.0) <= 2.0, \
+            f"device THD off: {med_thd:.1f}% (feeder truth 5%)"
+        i_f_dev = math.hypot(120.0, 20.0) / 230.0
+        exp_S = 230.0 * math.hypot(i_f_dev, 0.05 * i_f_dev)
+        med_S = float(np.nanmedian(data["S_total"][on]))
+        assert abs(med_S - exp_S) <= 4.0, \
+            f"S misses the distortion VA: {med_S:.1f} vs {exp_S:.1f}"
+        print(f"device THD {med_thd:.1f} %, S {med_S:.1f} VA "
+              f"(expected {exp_S:.1f})")
         print("scenario 1 PASSED\n")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -237,7 +261,9 @@ def scenario_background_jump():
     tmp = tempfile.mkdtemp(prefix="teach_otg_2_")
     try:
         svc, models, engine = build_engine(tmp)
-        feeder = Feeder(svc)
+        # emit_he=False: this scenario also covers the THD%-derived fallback
+        # (a meter whose per-order spectrum reads are unavailable)
+        feeder = Feeder(svc, emit_he=False)
         driver = Driver(engine, feeder, bg_jump_W=80.0, bg_jump_after_s=4.0)
         note = run_teach(engine, feeder, driver)
         print("teach note:", note)
@@ -245,7 +271,8 @@ def scenario_background_jump():
         assert note.startswith("saved"), f"teach failed: {note}"
         assert any(p.startswith("inmix_off2") for p in driver.phases_seen), \
             "no cross-check toggle was requested despite the corrupted capture"
-        P, md, summary = load_saved(models)
+        data, md, summary = load_saved(models)
+        P = data["P_total"]
         assert int(md["n_toggles"]) >= 2
         dev_w = float(summary["device_W_median"])
         assert abs(dev_w - 120.0) <= 10.0, \
@@ -253,6 +280,9 @@ def scenario_background_jump():
         # the corrupted ~200 W stretch must NOT be in the saved recording
         assert float(np.nanmax(P)) < 170.0, \
             f"corrupted stretch leaked into the recording (max {np.nanmax(P):.0f} W)"
+        on = P > 0.5 * dev_w
+        assert np.isfinite(data["THD_I_L1"][on]).any(), \
+            "THD%-fallback path saved no THD at all"
         # the warning about disagreeing estimates must be in the event log
         kinds = [e["kind"] for e in engine.events]
         assert "teach_warning" in kinds, "no teach_warning event was logged"

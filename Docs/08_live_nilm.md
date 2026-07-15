@@ -197,10 +197,20 @@ Three paths, all end in an automatic background retrain + hot reload:
    `sqrt(var_mix - var_baseline)`), so the training features (P_std,
    P_min/max, THD stats) describe the device, not the background. A cycling
    device keeps its swings; a steady device comes out as flat as a guided
-   recording. The switch-on transient is kept exactly as measured. The saved
-   file follows the campaign-single shape (10 s off lead, ON stretch(es)
-   separated by short off gaps, 8 s off tail) and carries the per-estimate
-   watts and toggle count in its metadata.
+   recording. The switch-on transient is kept exactly as measured. The
+   device's own current-THD is recovered by RSS subtraction of harmonic
+   currents (mix minus baseline; the per-sample spectrum energy is used
+   directly when the meter delivers it, the THD%-derived estimate is the
+   fallback), and the saved S/PF are rebuilt INCLUDING that distortion
+   component: with plain `S = hypot(P, Q)` a high-THD electronic load
+   (laptop: 66 W but 135 VA, PF 0.49, THD_I ~175 %) would train with PF ~1
+   and half its real VA and the window model would never match it live --
+   this was exactly why in-mix-taught devices kept being mistaken for the
+   coffee machine. If the harmonic reads are unavailable during a capture, a
+   teach warning is raised instead of silently saving a THD-less recording.
+   The saved file follows the campaign-single shape (10 s off lead, ON
+   stretch(es) separated by short off gaps, 8 s off tail) and carries the
+   per-estimate watts and toggle count in its metadata.
 3. **Record it clean** (side panel). Plug in only the new device, name it,
    record about 60 s, stop. This uses the same session writer as the PAC4200
    monitor, including harmonics: the higher-fidelity path when you can
