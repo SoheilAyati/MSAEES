@@ -283,13 +283,14 @@ def _plot_scenario(path: str, out_png: str) -> None:
 # Build scenarios
 # ---------------------------------------------------------------------------
 def build(args) -> None:
-    files = sorted(glob.glob(os.path.join(args.recordings, "*.h5")))
+    files = sorted(f for d in args.recordings
+                   for f in glob.glob(os.path.join(d, "*.h5")))
     if args.exclude:
         import fnmatch
         files = [f for f in files
                  if not fnmatch.fnmatch(os.path.basename(f), args.exclude)]
     if not files:
-        sys.exit(f"no .h5 recordings found in {args.recordings}")
+        sys.exit(f"no .h5 recordings found in {', '.join(args.recordings)}")
 
     recs = []
     for p in files:
@@ -395,9 +396,13 @@ def build(args) -> None:
 def main():
     p = argparse.ArgumentParser(description="Mix real PAC4200 recordings into "
                                             "ground-truth scenario files.")
-    p.add_argument("--recordings", default=os.path.join(HERE, "..", "PAC4200_reader",
-                                                         "recordings"),
-                   help="dir of PAC4200 single-appliance recordings (*.h5)")
+    p.add_argument("--recordings", nargs="+",
+                   default=[os.path.join(HERE, "..", "PAC4200_reader",
+                                         "recordings")],
+                   help="dir(s) of PAC4200 single-appliance recordings "
+                        "(*.h5, non-recursive per dir); pass several to "
+                        "combine e.g. the campaign corpus with its "
+                        "on-the-go/ teach subfolder")
     p.add_argument("--out", default=os.path.join(HERE, "measured_scenarios"),
                    help="output dir for the scenario .h5 files")
     p.add_argument("--n-scenarios", type=int, default=6)

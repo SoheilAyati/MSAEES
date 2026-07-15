@@ -21,7 +21,9 @@ and closes the loop when it does NOT know the answer:
            the unknown device is toggled off -> baseline -> on -> recorded ->
            off -> closing baseline, and its own signal is isolated by
            baseline subtraction before being saved.
-       Either way the captured signature is saved as a labelled recording ->
+       Either way the captured signature is saved as a labelled recording
+       under <recordings>/on-the-go/ (kept apart from the campaign corpus;
+       "erase retrained models" deletes these together with the models) ->
        scenarios are rebuilt and the model is RETRAINED in the background ->
        hot-reloaded. Training on the go: the next time that device runs, the
        system knows it.
@@ -42,8 +44,10 @@ Usage
     # real meter without per-order harmonics (if file numbers are unverified):
     python live.py --host 192.168.168.1 --no-harmonics
 
-Options of note: --stride (how often to re-evaluate, s), --models-dir,
---recordings-dir (where taught devices are saved), --web-port.
+Options of note: --stride (how often to re-evaluate, s; can go down to one
+meter sample interval, 0.2 s at the default --rate 5), --models-dir,
+--recordings-dir (taught devices land in its on-the-go/ subfolder),
+--web-port.
 """
 from __future__ import annotations
 import argparse
@@ -343,6 +347,10 @@ class ModelManager:
     def __init__(self, models_dir: str, recordings_dir: str):
         self.models_dir = models_dir
         self.recordings_dir = recordings_dir
+        # everything taught/recorded through live.py lands HERE, not in the
+        # campaign corpus: erasing the trained models can then delete exactly
+        # the recordings those models were taught from and nothing else
+        self.onthego_dir = os.path.join(recordings_dir, "on-the-go")
         self.lock = threading.RLock()
         self.presence = None
         self.power = None
@@ -397,24 +405,47 @@ class ModelManager:
     ]
 
     def reset_to_original(self) -> dict:
-        """Erase every non-original (train-on-the-go) model: the frozen
-        *_original snapshots are copied back over the live bundle names, so
-        the system starts clean as if no retraining had ever happened. The
-        snapshots themselves are never modified; recordings and scenarios are
-        untouched (taught devices keep their signatures and re-enter the
-        model on the next retrain)."""
+        """Erase every non-original (train-on-the-go) model AND the data it
+        was taught from: the frozen *_original snapshots are copied back over
+        the live bundle names, and every teach recording in the on-the-go/
+        subfolder is deleted, so the system starts clean as if no teaching or
+        retraining had ever happened. The snapshots and the campaign corpus
+        (recordings dir root) are never touched. Scenario files rebuilt by a
+        past retrain are left on disk -- the next retrain regenerates them
+        from the remaining recordings, so no taught device can leak back in."""
         if "original" not in self.variants():
             raise RuntimeError("model_mix_original.joblib not found - there "
                                "is no frozen original snapshot to reset to")
-        restored = []
+        restored, removed = [], []
         with self.lock:
             for src, dst in self.ORIGINAL_PAIRS:
                 s = os.path.join(self.models_dir, src)
                 if os.path.exists(s):
                     shutil.copyfile(s, os.path.join(self.models_dir, dst))
                     restored.append(dst)
+            for p in sorted(glob.glob(os.path.join(self.onthego_dir, "*.h5"))):
+                try:
+                    os.remove(p)
+                    removed.append(os.path.basename(p))
+                except OSError:
+                    pass
             self.variant = "latest"      # latest now IS the original
-        return {"restored": restored, "model": self.reload()}
+        return {"restored": restored, "removed_recordings": removed,
+                "model": self.reload()}
+
+    @staticmethod
+    def _sequentialize(model):
+        """Live predictions are one window at a time: a MultiOutput forest
+        saved with n_jobs=-1 makes every predict spin up joblib's thread
+        pool, which busy-polls ~0.5 s per call (measured) -- 700x the actual
+        single-row tree traversal. Force sequential inference on the wrapper
+        and its per-output estimators."""
+        if model is None:
+            return None
+        for est in [model, *list(getattr(model, "estimators_", []))]:
+            if hasattr(est, "n_jobs"):
+                est.n_jobs = 1
+        return model
 
     def _load_models(self):
         self.presence = self.power = None
@@ -426,7 +457,8 @@ class ModelManager:
                 mix = orig
         if os.path.exists(mix):
             b = joblib.load(mix)
-            self.presence, self.power = b["presence"], b["power"]
+            self.presence = self._sequentialize(b["presence"])
+            self.power = self._sequentialize(b["power"])
             self.appliances = list(b["appliances"])
             self.features = list(b.get("features", []) or [])
             self.window_s = float(b.get("window_s", 10.0))
@@ -438,7 +470,7 @@ class ModelManager:
         dis = os.path.join(self.models_dir, "model_disaggregate.joblib")
         if os.path.exists(pres):
             bp = joblib.load(pres)
-            self.presence = bp["model"]
+            self.presence = self._sequentialize(bp["model"])
             self.appliances = list(bp["appliances"])
             self.features = list(bp.get("features", []) or [])
             self.window_s = float(bp.get("window_s", 10.0))
@@ -448,7 +480,7 @@ class ModelManager:
             if os.path.exists(dis):
                 bd = joblib.load(dis)
                 if list(bd.get("appliances", [])) == self.appliances:
-                    self.power = bd["model"]
+                    self.power = self._sequentialize(bd["model"])
                     self.source = "model_presence.joblib + model_disaggregate.joblib"
 
     def _load_signatures(self):
@@ -466,7 +498,11 @@ class ModelManager:
         unbeatable by any pair hypothesis."""
         ROT = {"rotate", "rotating", "rotation", "swing", "withswing"}
         sigs = []
-        for p in sorted(glob.glob(os.path.join(self.recordings_dir, "*.h5"))):
+        # campaign corpus + the on-the-go teach subfolder; still non-recursive
+        # per dir, so retired recordings in old/ / mixed/ / test/ stay out
+        paths = sorted(glob.glob(os.path.join(self.recordings_dir, "*.h5"))
+                       + glob.glob(os.path.join(self.onthego_dir, "*.h5")))
+        for p in paths:
             try:
                 with h5py.File(p, "r") as f:
                     lab = f["metadata"].attrs.get("appliance_label", "")
@@ -484,17 +520,50 @@ class ModelManager:
             on = np.abs(P) > 3.0
             if len(P) < 25 or not on.any():
                 continue
+            sel = self._trim_soft_start(P, on)
             ih = None
             if T is not None and len(T) == len(P):
-                fin = on & np.isfinite(T)
-                if fin.sum() >= max(10, 0.3 * on.sum()):
+                fin = sel & np.isfinite(T)
+                if fin.sum() >= max(10, 0.3 * sel.sum()):
                     ih = float(np.median(
                         T[fin] / 100.0 * np.hypot(P[fin], Q[fin]) / 230.0))
+            # the signature carries the observed steady RANGE (p5..p95), not
+            # just the median: a laptop charger's draw tapers with battery
+            # state across tens of watts, and a point signature turned every
+            # reconnect a few watts away into an "unknown device"
+            p_lo, p_hi = np.percentile(P[sel], [5.0, 95.0])
+            q_lo, q_hi = np.percentile(Q[sel], [5.0, 95.0])
             sigs.append({"family": nl.parse_family(lab), "label": lab,
-                         "P": float(np.median(P[on])), "Q": float(np.median(Q[on])),
+                         "P": float(np.median(P[sel])), "Q": float(np.median(Q[sel])),
+                         "P_lo": float(p_lo), "P_hi": float(p_hi),
+                         "Q_lo": float(q_lo), "Q_hi": float(q_hi),
                          "IH": ih})
         self.signatures = sigs
         self.modes = self._build_modes(sigs)
+
+    @staticmethod
+    def _trim_soft_start(P, on):
+        """ON-sample mask with the leading soft-start ramp removed: a laptop
+        charger plugs in at ~10 W and climbs for tens of seconds, and folding
+        that ramp into the median (and the p5 of the range) biases the
+        signature away from the steady draw the device will actually show.
+        The ramp ends where P first enters a band around the settled tail
+        level; devices that start settled (fans, boiler) cross at sample 0 and
+        are untouched, and a cycling device (coffee heater) crosses early, so
+        this is a no-op for everything but genuine soft-starters."""
+        idx = np.flatnonzero(on)
+        if len(idx) < 50:
+            return on
+        seg = P[idx]
+        steady = float(np.nanmedian(seg[-max(10, len(seg) // 4):]))
+        band = max(3.0, 0.12 * abs(steady))
+        inb = np.flatnonzero(np.abs(seg - steady) <= band)
+        if (not inb.size or inb[0] == 0 or inb[0] > int(0.6 * len(seg))
+                or len(seg) - inb[0] < 25):
+            return on
+        sel = np.zeros_like(on)
+        sel[idx[inb[0]:]] = True
+        return sel
 
     @staticmethod
     def _build_modes(sigs) -> dict:
@@ -572,7 +641,16 @@ class ModelManager:
                 # real fan edge into an "unknown load"
                 tol_Q = (max(8.0, 0.25 * abs(s["Q"]) + 0.05 * abs(s["P"]))
                          + 1.5 * max(0.0, q_noise)) * q_tol_scale
-                terms = [(dP - s["P"]) / tol_P, (dQ - s["Q"]) / tol_Q]
+                # distance to the signature's observed steady RANGE: any value
+                # the recording itself showed costs nothing, only the excursion
+                # beyond it counts (chargers taper, PV drifts with the sun)
+                p_lo, p_hi = s.get("P_lo", s["P"]), s.get("P_hi", s["P"])
+                q_lo, q_hi = s.get("Q_lo", s["Q"]), s.get("Q_hi", s["Q"])
+                dp_err = 0.0 if p_lo <= dP <= p_hi else \
+                    min(abs(dP - p_lo), abs(dP - p_hi))
+                dq_err = 0.0 if q_lo <= dQ <= q_hi else \
+                    min(abs(dQ - q_lo), abs(dQ - q_hi))
+                terms = [dp_err / tol_P, dq_err / tol_Q]
                 if (self.use_ih and ih is not None and math.isfinite(ih)
                         and s.get("IH") is not None
                         and math.hypot(dP, dQ) >= self.IH_MIN_STEP):
@@ -607,9 +685,22 @@ class ModelManager:
                         factor = max(factor, 0.5)
                     conf *= min(1.0, factor)
                     break
+            # every OTHER family close enough to have caused (or nearly caused)
+            # the collapse, so the caller can arbitrate the tie with evidence
+            # this (P, Q) table does not have -- the window model's spectral
+            # vote separates a laptop from a coffee machine idling at the same
+            # ~45 W, which no watt-based rule ever will
+            contenders, seen = [], {best["family"]}
+            for d2, s2 in cands[1:]:
+                if s2["family"] not in seen and d2 - best_d < 0.35:
+                    contenders.append({"family": s2["family"],
+                                       "label": s2["label"],
+                                       "distance": round(d2, 3)})
+                    seen.add(s2["family"])
             return {"family": best["family"], "label": best["label"],
                     "confidence": round(max(0.0, conf), 2),
-                    "distance": round(best_d, 3)}
+                    "distance": round(best_d, 3),
+                    "contenders": contenders}
 
     def match_edge_pair(self, dP: float, dQ: float, q_noise: float = 0.0):
         """Explain one composite step as TWO devices switching together.
@@ -808,6 +899,7 @@ class Retrainer:
             ok = self._sh("mixing recordings into scenarios", [
                 PY, MIX_SCRIPT,
                 "--recordings", self.models.recordings_dir,
+                self.models.onthego_dir,
                 "--out", self.scenarios_dir,
                 "--n-scenarios", str(self.n_scenarios),
                 "--duration", str(self.scenario_duration),
@@ -820,11 +912,12 @@ class Retrainer:
                     "--out", self.models.models_dir])
             if ok:
                 # identify refresh is best-effort; ignore its exit code.
-                # non-recursive glob: retired recordings in old/ stay out,
+                # non-recursive globs: retired recordings in old/ stay out,
                 # matching what the scenario mixer trains on
                 self._sh("training identify model", [
                     PY, TRAIN_SCRIPT, "--task", "identify",
                     "--data", os.path.join(self.models.recordings_dir, "*.h5"),
+                    os.path.join(self.models.onthego_dir, "*.h5"),
                     "--window", "10", "--stride", "5",
                     "--out", self.models.models_dir])
             with self.lock:
@@ -920,7 +1013,11 @@ class LiveEngine:
         self.svc = svc
         self.models = models
         self.retrainer = retrainer
-        self.stride_s = stride_s
+        # re-evaluation can run as fast as samples arrive; below one meter
+        # sample interval (0.2 s at the default 5 Hz poll rate) there is
+        # nothing new in the ring buffer to evaluate
+        self.stride_s = max(float(stride_s),
+                            1.0 / max(float(svc.sample_rate_hz), 1e-6))
         self.unknown_min_W = unknown_min_W
         self.unknown_frac = unknown_frac
         self.unknown_persist_s = unknown_persist_s
@@ -943,6 +1040,14 @@ class LiveEngine:
         # themselves with a step. This kills the phantom "coffee machine /
         # water boiler popped up while other devices ran" reports.
         self.big_edge_min_W = big_edge_min_W
+        # hardest distance a two-device (pair) hypothesis may CLAIM at. Real
+        # simultaneous starts fit their signature SUM to a few percent
+        # (both-fans-low: d~0.03), but the untaught toaster's 595.8 W step got
+        # "explained" as coffee_standby+lamp = 546 W at d 0.44 -- an 8 % watt
+        # error the raw 22 % pair tolerance tolerates, fabricating two wrong
+        # devices instead of raising the unknown prompt. Past this cap a step
+        # stays unknown ("a wrong name is worse than an unknown").
+        self.pair_max_d = 0.28
         self._teach_thread: threading.Thread | None = None
         self._teach_cancel = False
         self.guide: dict | None = None   # current guided-teach instruction
@@ -976,14 +1081,20 @@ class LiveEngine:
         # afterwards, without touching the hardware.
         self.edge_history: deque = deque(maxlen=600)   # {t_ms, dP, dQ}
         self._model_seq = models.reload_seq
-        # 5 strides (~10 s) of probability smoothing: with 3, a device whose
-        # probability hovers near the threshold (coffee machine in the ~500 W
-        # regime reads lamp-like) flapped in and out of "currently on"
-        self.smooth: deque = deque(maxlen=5)     # recent proba vectors
+        # ~10 s of probability smoothing, counted in strides so the window
+        # stays 10 s at ANY stride (5 strides at the 2 s default; 50 at 0.2 s).
+        # With less, a device whose probability hovers near the threshold
+        # (coffee machine in the ~500 W regime reads lamp-like) flapped in
+        # and out of "currently on"
+        self.smooth: deque = deque(               # recent proba vectors
+            maxlen=max(3, int(round(10.0 / self.stride_s))))
         self.residual_W = 0.0
         self.total_W = 0.0
         self.explained_frac = 1.0
-        self.history: deque = deque(maxlen=420)  # per-stride snapshots for the chart
+        # per-stride snapshots for the chart, sized to keep ~14 min of
+        # history regardless of stride (420 entries at the 2 s default)
+        self.history: deque = deque(
+            maxlen=max(420, int(round(840.0 / self.stride_s))))
         self.events: list = []           # full session event log
         self.unknown: dict | None = None
         self._unknown_first: float | None = None
@@ -1095,6 +1206,14 @@ class LiveEngine:
             return None
         P8, Q8, t8 = P[-need:], Q[-need:], t_ms[-need:]
         k = int(2.5 * sr)
+        # the PREVIOUS edge still inside the pre-median window pollutes the
+        # baseline this step is measured against: the fan switching OFF 6 s
+        # before the toaster switched ON turned the toaster's probe into
+        # +717 W / -21.7 var (fan watts+vars folded in) -> unrecognized.
+        # Defer -- two strides later the window has slid past the old edge
+        # and the same step re-fires with a clean pre-level.
+        if int(t8[0]) <= self._last_edge_ms <= int(t8[k - 1]) + 500:
+            return None
         pre_P, post_P = np.nanmedian(P8[:k]), np.nanmedian(P8[-k:])
         pre_Q, post_Q = np.nanmedian(Q8[:k]), np.nanmedian(Q8[-k:])
         dP, dQ = post_P - pre_P, post_Q - pre_Q
@@ -1193,6 +1312,7 @@ class LiveEngine:
             single_d = (match["distance"]
                         if (match and match["confidence"] >= 0.25) else 9.9)
             if (pair and pair["confidence"] >= self.edge_claim_conf
+                    and pair["distance"] <= self.pair_max_d
                     and pair["distance"] <= single_d - 0.15):
                 self._apply_edge_pair(edge, pair, record=record)
                 if record:
@@ -1557,17 +1677,11 @@ class LiveEngine:
                                 detail="edge claim exceeds measured power "
                                        "(missed off-edge?)")
 
-    def _claim_residual(self, residual, now_ms, arrs, on_map, src_map):
-        """NAME a persistent residual before calling it unknown: probe the
-        signature table with the residual's own (P, estimated Q). Soft-start
-        devices (a laptop charger plugs in at ~10 W and ramps to its 60+ W
-        steady draw) never produce a switch-on edge that resembles their
-        steady-state signature, and the window model drowns at mix scale --
-        the residual is the only place their identity shows, so a TAUGHT
-        device could stay 'unknown' forever without this path. The Q probe is
-        an estimate (measured Q minus the ON devices' known vars), hence the
-        relaxed Q tolerance; the min_conf naming floor still applies, and an
-        ambiguous match collapses to None so the unknown prompt takes over."""
+    def _residual_q(self, arrs, on_map, src_map):
+        """Estimated reactive power of the UNEXPLAINED watts: measured Q now,
+        minus the known vars of everything currently ON (edge claims carry
+        their own measured dQ; model-tracked families use their signature
+        median). None when the meter gives no finite Q."""
         k = max(1, int(2.5 * self.svc.sample_rate_hz))
         q_now = float(np.nanmedian(arrs["Q"][-k:]))
         if not math.isfinite(q_now):
@@ -1582,12 +1696,38 @@ class LiveEngine:
         for nm, on in on_map.items():
             if on and src_map.get(nm) == "model" and nm in fam_q:
                 q_on += float(np.median(fam_q[nm]))
-        q_res = q_now - q_on
+        return q_now - q_on
+
+    def _claim_residual(self, residual, now_ms, arrs, on_map, src_map,
+                        prob_map=None):
+        """NAME a persistent residual before calling it unknown: probe the
+        signature table with the residual's own (P, estimated Q). Soft-start
+        devices (a laptop charger plugs in at ~10 W and ramps to its 60+ W
+        steady draw) never produce a switch-on edge that resembles their
+        steady-state signature, and the window model drowns at mix scale --
+        the residual is the only place their identity shows, so a TAUGHT
+        device could stay 'unknown' forever without this path. The Q probe is
+        an estimate (measured Q minus the ON devices' known vars), hence the
+        relaxed Q tolerance; the min_conf naming floor still applies.
+
+        When the signature match COLLAPSES because two families sit on the
+        same watts (the taught laptop at 42.9 W is a near-twin of
+        coffee_machine_standby at 46.0 W -- no (P, Q) rule can separate
+        them, so the collapse alone left the laptop 'unknown' FOREVER after
+        teaching), the window model arbitrates: among the watt-plausible
+        contender families, the one whose smoothed presence probability
+        clears min_conf AND beats every rival by a clear margin gets the
+        name. The model sees harmonics/THD/dynamics the signature table does
+        not, and it is exactly the evidence a teach-then-retrain added."""
+        q_res = self._residual_q(arrs, on_map, src_map)
+        if q_res is None:
+            return None
         m = self.models.match_edge(residual, q_res, q_tol_scale=3.0)
-        # an unusable single (weak, or naming an already-on family) cannot be
-        # claimed, but its DISTANCE still sets the bar the pair must clear
+        # an unusable single (naming an already-on family) cannot be claimed,
+        # but its DISTANCE still sets the bar the pair must clear; a WEAK
+        # single stays alive as arbitration input below
         single_d = m["distance"] if m else 9.9
-        if m and (m["confidence"] < self.min_conf or on_map.get(m["family"])):
+        if m and on_map.get(m["family"]):
             m = None
         # the residual can be TWO devices nobody claimed (engine started with
         # both fans already running on low: 34 W / 53 var reads exactly like
@@ -1595,6 +1735,7 @@ class LiveEngine:
         # pair must explain the residual clearly more tightly than the single.
         pair = self.models.match_edge_pair(residual, q_res, q_noise=3.0)
         if (pair and pair["confidence"] >= 0.40
+                and pair["distance"] <= self.pair_max_d
                 and pair["distance"] <= single_d - 0.15
                 and not any(on_map.get(s["family"]) for s in pair["members"])):
             tot = sum(abs(s["P"]) for s in pair["members"]) or 1e-6
@@ -1615,7 +1756,33 @@ class LiveEngine:
             return names
         if not m:
             return None
-        fam = m["family"]
+        fam, conf = m["family"], float(m["confidence"])
+        detail = ("persistent residual matches this device's steady "
+                  "signature - claimed (soft-start/ramp device has no "
+                  "matching switch-on edge)")
+        if conf < self.min_conf:
+            # the signature alone cannot NAME it: the residual either sits
+            # between two families (ambiguity collapse) or drifted outside
+            # the recorded range. Let the window model pick among the
+            # watt-plausible families -- and only there: the signature
+            # distance keeps the model from naming something at absurd watts.
+            tied = [(fam, float(m["distance"]))] + [
+                (c["family"], float(c["distance"]))
+                for c in m.get("contenders", [])]
+            scored = sorted(((float((prob_map or {}).get(f, 0.0)), f, d)
+                             for f, d in tied if not on_map.get(f)),
+                            reverse=True)
+            if not scored:
+                return None
+            p_best, fam_best, _d = scored[0]
+            p_next = scored[1][0] if len(scored) > 1 else 0.0
+            if p_best < self.min_conf or p_best - p_next < 0.20:
+                return None
+            fam, conf = fam_best, round(float(p_best), 2)
+            others = ", ".join(sorted(f for _, f, _ in scored[1:])) or "none"
+            detail = ("residual watts fit several device signatures about "
+                      f"equally (other candidates: {others}) - the window "
+                      f"model's spectral vote picks '{fam}' at p={p_best:.2f}")
         # a kilowatt-class residual while big UNMATCHED edges are still
         # churning is a cycling load mid-transition (coffee heater bursts),
         # not a silently-started device -- naming it would pin the watts on
@@ -1637,13 +1804,10 @@ class LiveEngine:
         with self.lock:
             t0 = int(self._unknown_first or now_ms)
             self.claims[fam] = {"W": abs(float(residual)), "Q": float(q_res),
-                                "conf": float(m["confidence"]), "t_ms": t0}
+                                "conf": float(conf), "t_ms": t0}
             self.forced_off.pop(fam, None)
-        self._log_event(now_ms, "residual_matched", fam, m["confidence"],
-                        residual, q_res, None,
-                        detail="persistent residual matches this device's "
-                               "steady signature - claimed (soft-start/ramp "
-                               "device has no matching switch-on edge)")
+        self._log_event(now_ms, "residual_matched", fam, conf,
+                        residual, q_res, None, detail=detail)
         return fam
 
     def _rebuild_state_from_history(self, now_ms):
@@ -1935,6 +2099,54 @@ class LiveEngine:
                                            "cannot start silently (phantom "
                                            "suppressed)")
 
+        # -- a pair story that clearly beats the single must not be preempted --
+        # The engine starting late on BOTH fans (34 W / 52.8 var) reads to the
+        # window model as standing_fan alone (p 0.76), and once that name
+        # sticks, the 3.9 W leftover can never raise the pair path again --
+        # the exact both-low disease, resurrected through the model vote.
+        # When the unexplained watts fit a two-device signature SUM clearly
+        # tighter than any single family (same margins as everywhere else),
+        # hold the model's new names back; the residual matcher then claims
+        # both devices a few strides later.
+        new_ons = [nm for nm in on_map
+                   if on_map[nm] and nm not in claims
+                   and not prev_on_map.get(nm, False)
+                   and nm not in recent_named]
+        if new_ons:
+            already_W = sum(power_map[nm] for nm in on_map
+                            if on_map[nm] and nm not in new_ons
+                            and math.isfinite(power_map.get(nm, 0.0)))
+            unexplained = (total_W - sum(c["W"] for c in claims.values())
+                           - sum(u["W"] for u in unk_claims) - already_W)
+            on_q = {nm: (on_map[nm] and nm not in new_ons) for nm in on_map}
+            for f in claims:
+                on_q[f] = True
+            q_res = self._residual_q(arrs, on_q, src_map)
+            if unexplained >= 20.0 and q_res is not None:
+                m1 = self.models.match_edge(unexplained, q_res, q_tol_scale=3.0)
+                d1 = m1["distance"] if m1 else 9.9
+                pr2 = self.models.match_edge_pair(unexplained, q_res,
+                                                  q_noise=3.0)
+                if (pr2 and pr2["confidence"] >= 0.40
+                        and pr2["distance"] <= self.pair_max_d
+                        and pr2["distance"] <= d1 - 0.15
+                        and {s["family"] for s in pr2["members"]}
+                        != set(new_ons)):
+                    for nm in new_ons:
+                        on_map[nm] = False
+                        power_map[nm] = 0.0
+                    if now_ms - self._veto_log_ms.get("_pair_hold", 0) > 60000:
+                        self._veto_log_ms["_pair_hold"] = now_ms
+                        names = "+".join(sorted(
+                            s["family"] for s in pr2["members"]))
+                        self._log_event(
+                            now_ms, "model_hold", ", ".join(new_ons), None,
+                            unexplained, q_res, total_W,
+                            detail=f"unexplained power fits the two-device sum "
+                                   f"{names} clearly better than any single "
+                                   "family - model vote held back; the "
+                                   "residual matcher decides")
+
         # -- merge edge claims over the model ----------------------------------
         # A claim forces the device ON with the watts its own switch-on step
         # measured; a fresh off-edge forces it OFF while the model window still
@@ -2088,8 +2300,15 @@ class LiveEngine:
                           and now_ms - u["t_ms"] >= self.unknown_persist_s * 1000
                           for u in unk_claims)
         retraining = self.retrainer.status()["state"] == "running"
+        # in_transition: a big level change is still transiting the edge
+        # window, so the lagging window-mean residual is momentarily fiction
+        # -- naming it fabricated devices (the toaster's off-transition read
+        # as a 587 W residual and got claimed as coffee+lamp two seconds
+        # before its own off-edge resolved). The edge pipeline owns
+        # transitions; the residual namer waits for the settled truth.
         over = ((abs(residual) > threshold or big_unknown)
-                and not settling and not teaching and not retraining)
+                and not settling and not teaching and not retraining
+                and not in_transition)
 
         # try to NAME the persistent residual before (or while) prompting:
         # a taught soft-start device is recognized here, not by its edge
@@ -2100,7 +2319,7 @@ class LiveEngine:
                              >= self.unknown_persist_s * 1000))
         if (over and persisted and abs(residual) >= self.unknown_min_W
                 and self._claim_residual(residual, now_ms, arrs,
-                                         on_map, src_map)):
+                                         on_map, src_map, prob_map)):
             with self.lock:
                 self._unknown_first = None
                 self.unknown = None
@@ -2146,11 +2365,18 @@ class LiveEngine:
                 self.unknown["typical_W"] = round(residual, 1)
 
     # ---- teach: two guided flows to capture exactly one device --------------
+    # Both flows use record_campaign's protocol numbers (10 s lead, 75 s ON
+    # default, 8 s tail) and EXTEND the ON phase up to 2x while the signal is
+    # still ramping/cycling -- thinner teach recordings trained visibly
+    # weaker models than the campaign corpus. Either way the capture is saved
+    # under <recordings>/on-the-go/, never mixed into the campaign corpus,
+    # and "erase retrained models" deletes that folder's files with the
+    # models they trained.
     # mode='isolated' (default): clean recording, same protocol as the manual
     # record button. Naive in-mix captures gave visibly worse models than a
     # clean isolated recording, so this stays the recommended flow:
-    #   disconnect everything -> 5 s off baseline -> connect the device ->
-    #   teach_record_s ON -> disconnect -> 5 s off tail -> save -> retrain.
+    #   disconnect everything -> 10 s off baseline -> connect the device ->
+    #   teach_record_s ON -> disconnect -> 8 s off tail -> save -> retrain.
     # mode='inmix' ("teach on the go"): when emptying the mains is impractical
     # (fridge, router, a running experiment) the other devices KEEP RUNNING and
     # only the unknown device is toggled:
@@ -2226,6 +2452,29 @@ class LiveEngine:
         k = max(1, int(1.5 * self.svc.sample_rate_hz))
         return float(np.nanmedian(arrs["P"][-k:]))
 
+    def _still_changing(self, span_s: float = 12.0) -> bool:
+        """True while the live total is still ramping or cycling (a
+        soft-start charger climbing, a heater duty-cycling): the settled
+        level of the last span_s/2 differs from the half before it, or the
+        last half is not internally settled. The teach flows use this to
+        EXTEND the ON recording past its nominal time, so the steady draw --
+        not the start-up transient -- dominates the saved signature, the way
+        it does in a full-length record_campaign single."""
+        arrs = self._buffer_arrays()
+        if arrs is None:
+            return False
+        k = max(3, int(span_s / 2 * self.svc.sample_rate_hz))
+        P = arrs["P"]
+        if len(P) < 2 * k:
+            return False
+        a = float(np.nanmedian(P[-2 * k:-k]))
+        b = float(np.nanmedian(P[-k:]))
+        if not (math.isfinite(a) and math.isfinite(b)):
+            return False
+        lvl = max(abs(a), abs(b))
+        return (abs(b - a) > max(2.0, 0.04 * lvl)
+                or float(np.nanstd(P[-k:])) > max(3.0, 0.08 * lvl))
+
     def _wait_power(self, cond, hold_s, timeout_s, phase, msg_fmt) -> bool:
         """Advance when cond(instant watts) has held for hold_s seconds."""
         held, t0 = 0.0, time.time()
@@ -2240,11 +2489,32 @@ class LiveEngine:
             time.sleep(0.5)
         return False
 
-    def _post_teach_checks(self, label: str):
+    def _move_to_onthego(self, done: dict):
+        """Relocate a just-saved live recording into <recordings>/on-the-go/.
+        Everything taught or recorded through live.py stays out of the
+        campaign corpus, and 'erase retrained models' can delete exactly the
+        recordings those models were taught from. Updates done['file'] to the
+        new path; a failed move leaves the file where it is (still trained
+        on, just not separated)."""
+        path = done.get("file") if done else None
+        if not path or not os.path.exists(path):
+            return
+        try:
+            os.makedirs(self.models.onthego_dir, exist_ok=True)
+            dest = os.path.join(self.models.onthego_dir,
+                                os.path.basename(path))
+            shutil.move(path, dest)
+            done["file"] = dest
+        except OSError:
+            pass
+
+    def _post_teach_checks(self, label: str) -> str:
         """After a teach recording is saved: warn when the new device's
         signature sits on top of an existing family (they WILL be confused in
         mixes), and remember the family so the post-retrain hook can verify
-        the model actually learned it."""
+        the model actually learned it. Returns a short warning for the
+        dashboard teach note ('' when the signature is separable) -- the
+        event-log-only warning went unseen exactly when it mattered."""
         fam = nl.parse_family(label)
         with self.lock:
             self._last_taught_family = fam
@@ -2260,9 +2530,15 @@ class LiveEngine:
                                    f"dQ {rep['dQ_var']:+.0f} var) - expect "
                                    "confusion in mixes; record its other "
                                    "modes or a longer run to separate them")
+            return (f"warning: watts overlap '{rep['family']}' - the window "
+                    "model arbitrates between them after retraining")
+        return ""
 
     def _teach_worker(self, label, retrain):
-        off_W, lead_s, tail_s = 5.0, 5.0, 5.0
+        # same protocol numbers as a record_campaign single (10 s lead, 8 s
+        # tail): teach recordings used to be visibly thinner than campaign
+        # ones (5/45/5 vs 10/75/8) and trained visibly weaker models
+        off_W, lead_s, tail_s = 5.0, 10.0, 8.0
         on_W = max(8.0, self.edge_min_W)
         started = False
         try:
@@ -2287,16 +2563,35 @@ class LiveEngine:
                     f"Step 3/5 - now CONNECT '{label}' (only this device). "
                     "Waiting for power (now {w:.0f} W)"):
                 raise RuntimeError("device was not connected within 3 minutes")
-            # 4. record it running
+            # 4. record it running -- at least teach_record_s, EXTENDED (up to
+            # 2x) while the signal is still ramping/cycling, so the settled
+            # draw dominates the recording the way it does in a campaign
+            # single. A device that switches ITSELF off (toaster pop-up,
+            # kettle auto-off) ends the ON phase early instead of recording
+            # dead air.
             t0 = time.time()
-            while time.time() - t0 < self.teach_record_s:
+            max_s = 2.0 * self.teach_record_s
+            back_ticks = 0
+            while True:
+                el = time.time() - t0
+                if el >= self.teach_record_s and (
+                        el >= max_s or not self._still_changing()):
+                    break
                 if self._teach_cancel:
                     raise RuntimeError("cancelled")
-                left = self.teach_record_s - (time.time() - t0)
                 w = self._instant_W() or 0.0
+                if el >= 10.0 and abs(w) < off_W:
+                    back_ticks += 1
+                    if back_ticks >= 3:      # ~3 s back at zero
+                        break
+                else:
+                    back_ticks = 0
+                note = (f"{self.teach_record_s - el:.0f} s left"
+                        if el < self.teach_record_s
+                        else "signal still settling - extending")
                 self._set_guide("recording_on",
                                 f"Step 4/5 - recording '{label}' at {w:.0f} W, "
-                                f"{left:.0f} s left. Leave it running.")
+                                f"{note}. Leave it running.")
                 time.sleep(1.0)
             # 5. disconnect + off tail (if the user never disconnects, save
             # anyway - the ON data is already captured)
@@ -2311,8 +2606,9 @@ class LiveEngine:
                     time.sleep(1.0)
             done = self.svc.stop_session() or {}
             started = False
+            self._move_to_onthego(done)
             self.models._load_signatures()
-            self._post_teach_checks(label)
+            warn = self._post_teach_checks(label)
             fname = os.path.basename(str(done.get("file", "recording")))
             self._log_event(int(time.time() * 1000), "taught",
                             nl.parse_family(label), None, None, None, None,
@@ -2320,7 +2616,9 @@ class LiveEngine:
                                    f"{done.get('samples', '?')} samples)"
                                    + ("; retraining" if retrain else ""))
             with self.lock:
-                self._teach_note = f"saved {fname}" + ("; retraining" if retrain else "")
+                self._teach_note = (f"saved {fname}"
+                                    + ("; retraining" if retrain else "")
+                                    + (f" - {warn}" if warn else ""))
             if retrain:
                 self.retrainer.start()
         except Exception as e:            # noqa: BLE001
@@ -2384,7 +2682,7 @@ class LiveEngine:
 
     def _teach_inmix_worker(self, label, retrain, expected_W=None):
         cap = MixCapture(self)
-        base_s = 6.0
+        base_s = 8.0
         on_W_min = max(8.0, self.edge_min_W)
         try:
             ref = self._instant_W()
@@ -2415,30 +2713,53 @@ class LiveEngine:
                 raise RuntimeError("timeout/cancel while waiting for the device "
                                    "to switch on")
             t_on_ms = int(time.time() * 1000)
-            # 3. record the mix with the device running
+            # 3. record the mix with the device running -- extended (up to 2x)
+            # while the signal still ramps/cycles, same as the guided flow;
+            # the closing-baseline drift check remains the guard against a
+            # background device toggling during the longer capture. A device
+            # that switches ITSELF off (toaster pop-up, kettle auto-off) ends
+            # the ON phase early: once the total sits back at the baseline
+            # for a few ticks, more waiting records nothing but background.
             t0 = time.time()
-            while time.time() - t0 < self.teach_record_s:
+            max_s = 2.0 * self.teach_record_s
+            back_ticks = 0
+            while True:
+                el = time.time() - t0
+                if el >= self.teach_record_s and (
+                        el >= max_s or not self._still_changing()):
+                    break
                 if self._teach_cancel:
                     raise RuntimeError("cancelled")
                 cap.collect()
-                left = self.teach_record_s - (time.time() - t0)
                 w = self._instant_W() or 0.0
+                if el >= 10.0 and w <= base_a["P"] + 0.5 * on_W_min:
+                    back_ticks += 1
+                    if back_ticks >= 5:      # ~2.5 s back at the baseline
+                        break
+                else:
+                    back_ticks = 0
+                note = (f"{self.teach_record_s - el:.0f} s left"
+                        if el < self.teach_record_s
+                        else "signal still settling - extending")
                 self._set_guide("inmix_recording",
                                 f"Step 4/5 - recording '{label}' inside the mix "
-                                f"at {w:.0f} W total, {left:.0f} s left. Keep "
+                                f"at {w:.0f} W total, {note}. Keep "
                                 "every device exactly as it is.")
                 time.sleep(0.5)
             cap.collect()
             t_off_req_ms = int(time.time() * 1000)
             est_W = cap.median("P", t_on_ms, t_off_req_ms) - base_a["P"]
-            # 4. switch it OFF again -> closing baseline
-            cur = self._instant_W()
-            cur = cur if cur is not None else base_a["P"] + max(est_W, 0.0)
-            drop2 = max(on_W_min, 0.5 * max(est_W, 0.0))
-            if self._inmix_wait(cap, lambda w: w <= cur - drop2, 3.0, 300.0,
+            # 4. switch it OFF again -> closing baseline. Wait for the total
+            # to RETURN NEAR THE BASELINE -- immediately true when the device
+            # already switched itself off -- rather than for a fresh drop
+            # from the current level, which a pop-up toaster satisfies never
+            # (the drop already happened) and only times out after 5 minutes.
+            back_W = base_a["P"] + max(on_W_min, 0.25 * max(est_W, 0.0))
+            if self._inmix_wait(cap, lambda w: w <= back_W, 3.0, 300.0,
                     "inmix_off2",
-                    f"Step 5/5 - switch '{label}' OFF again. Waiting for a "
-                    f"settled drop of >= {drop2:.0f} W (total now {{w:.0f}} W)") is None:
+                    f"Step 5/5 - switch '{label}' OFF again (skip if it "
+                    f"switched itself off). Waiting for the total to return "
+                    f"to ~{base_a['P']:.0f} W (total now {{w:.0f}} W)") is None:
                 raise RuntimeError("timeout/cancel while waiting for the final "
                                    "switch-off")
             base_b = self._inmix_baseline(cap, base_s, "inmix_baseline_b",
@@ -2460,7 +2781,7 @@ class LiveEngine:
                     "measurable device found on top of the background")
             path = self._save_inmix_recording(label, iso, base_a, base_b, drift)
             self.models._load_signatures()
-            self._post_teach_checks(label)
+            warn = self._post_teach_checks(label)
             fname = os.path.basename(path)
             self._log_event(int(time.time() * 1000), "taught",
                             nl.parse_family(label), None, None, None, None,
@@ -2472,7 +2793,8 @@ class LiveEngine:
             with self.lock:
                 self._teach_note = (f"saved {fname} (in-mix, "
                                     f"~{iso['device_W']:.0f} W isolated)"
-                                    + ("; retraining" if retrain else ""))
+                                    + ("; retraining" if retrain else "")
+                                    + (f" - {warn}" if warn else ""))
             if retrain:
                 self.retrainer.start()
         except Exception as e:            # noqa: BLE001
@@ -2521,7 +2843,16 @@ class LiveEngine:
             THD = np.where(np.isfinite(i_h_dev) & (i_f_dev > 1e-3),
                            100.0 * i_h_dev / np.maximum(i_f_dev, 1e-9), np.nan)
         on_sel = (t >= t_on_ms) & (t <= t_off_ms)
-        device_W = float(np.nanmedian(P[on_sel])) if on_sel.any() else 0.0
+        # median over the samples where the device actually DRAWS: a toaster
+        # that pops up mid-window would otherwise average its own off-tail in
+        # and could fail the >= on_W_min save gate despite a clean capture
+        act = on_sel & (np.abs(P) > 3.0)
+        if act.sum() >= max(15, int(0.1 * on_sel.sum())):
+            device_W = float(np.nanmedian(P[act]))
+        elif on_sel.any():
+            device_W = float(np.nanmedian(P[on_sel]))
+        else:
+            device_W = 0.0
         return {"t_ms": t, "P_total": P, "Q_total": Q, "S_total": S,
                 "PF_total": PF, "P_L1": P1, "P_L2": P2, "P_L3": P3,
                 "THD_I_L1": THD, "device_W": device_W, "n": int(len(t))}
@@ -2534,8 +2865,8 @@ class LiveEngine:
                     "P_L1", "P_L2", "P_L3", "THD_I_L1"]
         safe = pr._safe_label(label)
         fname = f"{safe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.h5"
-        os.makedirs(self.models.recordings_dir, exist_ok=True)
-        path = os.path.join(self.models.recordings_dir, fname)
+        os.makedirs(self.models.onthego_dir, exist_ok=True)
+        path = os.path.join(self.models.onthego_dir, fname)
         t_us = iso["t_ms"].astype(np.int64) * 1000
         sr = float(self.svc.sample_rate_hz)
         with h5py.File(path, "w") as f:
@@ -2698,19 +3029,29 @@ def create_app(svc: pr.AcquisitionService, engine: LiveEngine,
 
     @app.route("/api/model/reset", methods=["POST"])
     def api_model_reset():
-        """Erase all non-original (train-on-the-go) models: the frozen
-        *_original snapshots are copied back over the live bundles and
-        hot-reloaded; the engine then re-matches its edge history against the
-        restored signatures automatically."""
+        """Erase all non-original (train-on-the-go) models AND the on-the-go
+        teach recordings they were trained from: the frozen *_original
+        snapshots are copied back over the live bundles and hot-reloaded; the
+        engine then re-matches its edge history against the restored
+        signatures automatically. Campaign recordings are untouched."""
         if retrainer.status()["state"] == "running":
             return jsonify({"ok": False, "error": "retraining is running - "
                             "wait for it to finish first"}), 409
+        with engine.lock:
+            teaching = (engine._teach_thread is not None
+                        and engine._teach_thread.is_alive())
+        if teaching:
+            return jsonify({"ok": False, "error": "a teach session is "
+                            "running - cancel it first"}), 409
         try:
             res = models.reset_to_original()
+            removed = res.get("removed_recordings", [])
             engine._log_event(int(time.time() * 1000), "model_reset", "-",
                               None, None, None, None,
                               detail="non-original models erased; restored "
-                                     + ", ".join(res["restored"]))
+                                     + ", ".join(res["restored"])
+                                     + f"; deleted {len(removed)} on-the-go "
+                                       "teach recording(s)")
             return jsonify({"ok": True, **res})
         except Exception as e:            # noqa: BLE001
             return jsonify({"ok": False, "error": str(e)}), 400
@@ -2729,6 +3070,10 @@ def create_app(svc: pr.AcquisitionService, engine: LiveEngine,
         data = request.get_json(silent=True) or {}
         done = svc.stop_session()
         started = False
+        if done:
+            # live-made recordings are teach material -> on-the-go/, so an
+            # "erase retrained models" can delete them with the models
+            engine._move_to_onthego(done)
         if done and (data.get("retrain") or False):
             started = retrainer.start()
         if done:
@@ -2889,7 +3234,8 @@ LIVE_HTML = r"""<!DOCTYPE html>
     <div class="panel">
       <h2>Teach a device by recording it</h2>
       <div class="small muted" style="margin-bottom:8px">
-        Plug in ONLY the new device, give it a name, record ~60 s, stop - the
+        Plug in ONLY the new device, give it a name, record ~75 s (like a
+        campaign single), stop - the recording lands in on-the-go/ and the
         model retrains automatically with the new device included.
       </div>
       <input type="text" id="rec-name" placeholder="device name, e.g. desk_lamp">
@@ -3210,8 +3556,9 @@ async function setVariant(v){
 }
 async function modelReset(){
   if(!confirm("Erase all retrained (non-original) models and restore the "+
-              "frozen original snapshot?\n\nRecordings are kept - taught "+
-              "devices re-enter the model on the next retrain.")) return;
+              "frozen original snapshot?\n\nAll on-the-go teach recordings "+
+              "(recordings/on-the-go) are DELETED with them, so taught "+
+              "devices are fully forgotten. Campaign recordings are kept.")) return;
   const r = await j("/api/model/reset", {method:"POST"});
   if(!r.ok) alert("reset failed: " + r.error);
 }
@@ -3229,8 +3576,8 @@ async function recStop(){
     body: JSON.stringify({retrain:true})});
 }
 
-setInterval(pollStatus, 2000); setInterval(pollState, 1000);
-setInterval(pollChart, 1500); setInterval(pollEvents, 1500);
+setInterval(pollStatus, 2000); setInterval(pollState, 400);
+setInterval(pollChart, 1000); setInterval(pollEvents, 1000);
 pollStatus(); pollState(); pollChart(); pollEvents();
 </script>
 </body>
@@ -3264,11 +3611,17 @@ def main():
     p.add_argument("--no-harmonics", action="store_true",
                    help="skip per-order harmonic reads (THD_I then unavailable live)")
     p.add_argument("--stride", type=float, default=2.0,
-                   help="re-evaluate the model every N seconds")
+                   help="re-evaluate the model every N seconds; floored at "
+                        "one meter sample interval (1/--rate, i.e. 0.2 s at "
+                        "the default 5 Hz) since a faster loop would re-read "
+                        "the same sample")
     p.add_argument("--models-dir", default=os.path.join(HERE, "output"))
     p.add_argument("--recordings-dir",
                    default=os.path.join(READER_DIR, "recordings"),
-                   help="where taught/recorded devices are stored (and signatures read)")
+                   help="the recordings corpus (signatures are read from it); "
+                        "devices taught/recorded through live.py are saved "
+                        "into its on-the-go/ subfolder, which 'erase "
+                        "retrained models' deletes")
     p.add_argument("--scenarios-dir",
                    default=os.path.join(AGG_DIR, "measured_scenarios"),
                    help="where retraining writes its mixed training scenarios")
@@ -3278,9 +3631,11 @@ def main():
                    help="presence ON threshold (W) used when retraining")
     p.add_argument("--unknown-min-w", type=float, default=30.0,
                    help="unexplained power (W) that triggers the unknown-device prompt")
-    p.add_argument("--teach-record-s", type=float, default=45.0,
-                   help="teach: seconds of ON time to record (guided flow) "
-                        "before retraining")
+    p.add_argument("--teach-record-s", type=float, default=75.0,
+                   help="teach: seconds of ON time to record (both flows; "
+                        "matches a record_campaign single, and extends "
+                        "automatically up to 2x while the signal still "
+                        "ramps/cycles) before retraining")
     p.add_argument("--mode-min-w", type=float, default=3.5,
                    help="settled steps above this (but below the edge "
                         "threshold) are matched as MODE changes of an "
