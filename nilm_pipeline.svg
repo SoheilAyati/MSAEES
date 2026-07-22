@@ -1,0 +1,123 @@
+<svg width="1000" height="1080" viewBox="0 0 1000 1080" xmlns="http://www.w3.org/2000/svg">
+<rect x="0" y="0" width="1000" height="1080" fill="#ffffff"/>
+  <style>
+    text{font-family:"Segoe UI",system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;fill:#1b2330;}
+    .tt{font-weight:700;font-size:15px;letter-spacing:-.01em;}
+    .tt-mono{font-family:"Cascadia Code","Consolas","Liberation Mono",ui-monospace,monospace;font-weight:700;font-size:12.5px;}
+    .st{font-size:11px;fill:#667085;}
+    .st-mono{font-family:"Cascadia Code","Consolas","Liberation Mono",ui-monospace,monospace;font-size:10.5px;fill:#667085;}
+    .lane{font-size:11px;font-weight:600;letter-spacing:.13em;}
+    .lane-syn{fill:#2f6ab0;} .lane-real{fill:#2c8a5c;}
+    .caption{font-size:10.5px;fill:#667085;font-style:italic;}
+    .bx{stroke-width:1.4;}
+    .bx-syn{fill:#e9f1fa;stroke:#a9cbeb;} .bx-syn-d{fill:#f3f8fd;stroke:#a9cbeb;stroke-dasharray:4 3;}
+    .bx-real{fill:#e8f4ec;stroke:#a9dcc0;} .bx-real-d{fill:#f2faf5;stroke:#a9dcc0;stroke-dasharray:4 3;}
+    .bx-sh{fill:#eef0f4;stroke:#cdd4de;} .bx-sh-d{fill:#f6f7f9;stroke:#cdd4de;stroke-dasharray:4 3;}
+    .c{fill:none;stroke-width:1.6;} .c-syn{stroke:#2f6ab0;} .c-real{stroke:#2c8a5c;} .c-sh{stroke:#98a2b3;}
+    .c-fb{stroke:#b5812a;stroke-width:1.6;stroke-dasharray:5 4;fill:none;} .dot{fill:#98a2b3;}
+  </style>
+  <defs>
+        <pattern id="grid" width="26" height="26" patternUnits="userSpaceOnUse">
+          <circle cx="1" cy="1" r="1" fill="#e6e9ef"/>
+        </pattern>
+        <marker id="mk-syn" markerWidth="9" markerHeight="9" refX="7.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#2f6ab0"/></marker>
+        <marker id="mk-real" markerWidth="9" markerHeight="9" refX="7.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#2c8a5c"/></marker>
+        <marker id="mk-sh" markerWidth="9" markerHeight="9" refX="7.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#98a2b3"/></marker>
+        <marker id="mk-amber" markerWidth="9" markerHeight="9" refX="7.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#b5812a"/></marker>
+      </defs>
+
+      <rect x="0" y="0" width="1000" height="1080" fill="url(#grid)"/>
+
+      <text class="lane lane-syn" x="260" y="44" text-anchor="middle">SYNTHETIC PATH</text>
+      <text class="lane lane-real" x="740" y="44" text-anchor="middle">MEASURED PATH</text>
+
+      <path class="c c-syn" d="M260,156 L260,187" marker-end="url(#mk-syn)"/>
+      <path class="c c-syn" d="M260,260 L260,291" marker-end="url(#mk-syn)"/>
+      <path class="c c-syn" d="M260,364 C260,470 300,540 369,540" marker-end="url(#mk-syn)"/>
+      <path class="c c-real" d="M740,156 L740,187" marker-end="url(#mk-real)"/>
+      <path class="c c-real" d="M740,260 L740,291" marker-end="url(#mk-real)"/>
+      <path class="c c-real" d="M740,364 L740,395" marker-end="url(#mk-real)"/>
+      <path class="c c-real" d="M740,468 C740,512 690,540 631,540" marker-end="url(#mk-real)"/>
+      <path class="c c-sh" d="M500,576 L500,621" marker-end="url(#mk-sh)"/>
+      <path class="c c-sh" d="M500,696 L500,737" marker-end="url(#mk-sh)"/>
+      <path class="c c-sh" d="M500,812 L500,853" marker-end="url(#mk-sh)"/>
+      <path class="c c-sh" d="M500,928 C500,964 384,980 332,980" marker-end="url(#mk-sh)"/>
+      <path class="c c-sh" d="M500,928 C500,964 616,980 668,980" marker-end="url(#mk-sh)"/>
+      <circle class="dot" cx="500" cy="928" r="3.4"/>
+      <path class="c-fb" d="M780,1016 C888,1016 888,892 642,892" marker-end="url(#mk-amber)"/>
+      <text x="892" y="946" text-anchor="middle" transform="rotate(90 892 946)" style="fill:#b5812a;font-size:10.5px;font-weight:600;">teach + retrain</text>
+
+      <text class="caption" x="662" y="536" text-anchor="start">shared downstream</text>
+
+      <g>
+        <rect class="bx bx-syn" x="140" y="84" width="240" height="72" rx="11"/>
+        <text class="tt" x="260" y="109" text-anchor="middle">Appliance generators</text>
+        <text class="st" x="260" y="127" text-anchor="middle">8 appliances + baseload,</text>
+        <text class="st" x="260" y="142" text-anchor="middle">state machines &amp; harmonics</text>
+      </g>
+      <g>
+        <rect class="bx bx-syn-d" x="140" y="188" width="240" height="72" rx="11"/>
+        <text class="tt" x="260" y="213" text-anchor="middle">Per-appliance traces</text>
+        <text class="st-mono" x="260" y="231" text-anchor="middle">.h5: P, Q, harmonics,</text>
+        <text class="st" x="260" y="246" text-anchor="middle">ground-truth labels</text>
+      </g>
+      <g>
+        <rect class="bx bx-syn" x="140" y="292" width="240" height="72" rx="11"/>
+        <text class="tt" x="260" y="317" text-anchor="middle">Scenario aggregator</text>
+        <text class="st" x="260" y="335" text-anchor="middle">PCC physics: phase split,</text>
+        <text class="st" x="260" y="350" text-anchor="middle">complex harmonic sum</text>
+      </g>
+      <g>
+        <rect class="bx bx-real" x="620" y="84" width="240" height="72" rx="11"/>
+        <text class="tt" x="740" y="109" text-anchor="middle">Siemens PAC4200 at PCC</text>
+        <text class="st" x="740" y="127" text-anchor="middle">three-phase metering,</text>
+        <text class="st" x="740" y="142" text-anchor="middle">class 0.2 accuracy</text>
+      </g>
+      <g>
+        <rect class="bx bx-real-d" x="620" y="188" width="240" height="72" rx="11"/>
+        <text class="tt" x="740" y="213" text-anchor="middle">Modbus TCP registers</text>
+        <text class="st" x="740" y="231" text-anchor="middle">IEEE 754 floats,</text>
+        <text class="st" x="740" y="246" text-anchor="middle">~200 ms poll cycle</text>
+      </g>
+      <g>
+        <rect class="bx bx-real" x="620" y="292" width="240" height="72" rx="11"/>
+        <text class="tt-mono" x="740" y="316" text-anchor="middle">pac4200_reader.py</text>
+        <text class="st" x="740" y="335" text-anchor="middle">decode registers,</text>
+        <text class="st" x="740" y="350" text-anchor="middle">record sessions (.h5)</text>
+      </g>
+      <g>
+        <rect class="bx bx-real" x="620" y="396" width="240" height="72" rx="11"/>
+        <text class="tt-mono" x="740" y="420" text-anchor="middle">mix_measured_scenarios.py</text>
+        <text class="st" x="740" y="439" text-anchor="middle">random on/off mixes,</text>
+        <text class="st" x="740" y="454" text-anchor="middle">single devices give ground truth</text>
+      </g>
+
+      <g>
+        <rect class="bx bx-sh-d" x="370" y="504" width="260" height="72" rx="11"/>
+        <text class="tt-mono" x="500" y="534" text-anchor="middle">scenario_*.h5</text>
+        <text class="st" x="500" y="552" text-anchor="middle">identical layout, any source</text>
+      </g>
+      <g>
+        <rect class="bx bx-sh" x="360" y="740" width="280" height="72" rx="11"/>
+        <text class="tt" x="500" y="765" text-anchor="middle">Feature extraction + windowing</text>
+        <text class="st" x="500" y="783" text-anchor="middle">steady-state, harmonic, transient</text>
+        <text class="st-mono" x="500" y="798" text-anchor="middle">nilm_pipeline.py</text>
+      </g>
+      <g>
+        <rect class="bx bx-sh" x="360" y="856" width="280" height="72" rx="11"/>
+        <text class="tt" x="500" y="881" text-anchor="middle">Model training</text>
+        <text class="st" x="500" y="899" text-anchor="middle">identify · disaggregate · presence · mix</text>
+        <text class="st" x="500" y="914" text-anchor="middle">RF · LightGBM · MLP  &#8594;  <tspan class="st-mono">model_*.joblib</tspan></text>
+      </g>
+      <g>
+        <rect class="bx bx-sh" x="220" y="980" width="220" height="72" rx="11"/>
+        <text class="tt" x="330" y="1010" text-anchor="middle">Offline inference</text>
+        <text class="st" x="330" y="1028" text-anchor="middle"><tspan class="st-mono">infer.py</tspan>  &#8594;  CSV, JSON, plots</text>
+      </g>
+      <g>
+        <rect class="bx bx-sh" x="560" y="980" width="220" height="72" rx="11"/>
+        <text class="tt" x="670" y="1005" text-anchor="middle">Live NILM monitor</text>
+        <text class="st" x="670" y="1023" text-anchor="middle">on/off · watts · switch events</text>
+        <text class="st" x="670" y="1038" text-anchor="middle">teach unknown loads, retrain</text>
+      </g>
+    </svg>

@@ -1,0 +1,351 @@
+<title>Lab Report: Live-Test Software Improvements (NILM)</title>
+<style>
+  :root {
+    --paper: #f7f9fa;
+    --panel: #ffffff;
+    --ink: #14181c;
+    --ink-soft: #4b555d;
+    --ink-faint: #8b959c;
+    --line: #dce3e7;
+    --line-soft: #e9eef1;
+    --accent: #0d7c86;
+    --accent-ink: #0a5b62;
+    --accent-wash: #e6f1f1;
+    --tag-now: #0d7c86;
+    --tag-gap: #a8562a;
+    --tag-fix: #3c7d3f;
+    --serif: Georgia, "Iowan Old Style", "Times New Roman", serif;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0f1316;
+      --panel: #151b1f;
+      --ink: #e9eef1;
+      --ink-soft: #a3aeb5;
+      --ink-faint: #6c777e;
+      --line: #26313a;
+      --line-soft: #1d262d;
+      --accent: #3cb9c4;
+      --accent-ink: #6fd3dc;
+      --accent-wash: #12262a;
+      --tag-now: #3cb9c4;
+      --tag-gap: #d68a5a;
+      --tag-fix: #6fbf72;
+    }
+  }
+  :root[data-theme="light"] {
+    --paper: #f7f9fa; --panel: #ffffff; --ink: #14181c; --ink-soft: #4b555d;
+    --ink-faint: #8b959c; --line: #dce3e7; --line-soft: #e9eef1; --accent: #0d7c86;
+    --accent-ink: #0a5b62; --accent-wash: #e6f1f1; --tag-now: #0d7c86;
+    --tag-gap: #a8562a; --tag-fix: #3c7d3f;
+  }
+  :root[data-theme="dark"] {
+    --paper: #0f1316; --panel: #151b1f; --ink: #e9eef1; --ink-soft: #a3aeb5;
+    --ink-faint: #6c777e; --line: #26313a; --line-soft: #1d262d; --accent: #3cb9c4;
+    --accent-ink: #6fd3dc; --accent-wash: #12262a; --tag-now: #3cb9c4;
+    --tag-gap: #d68a5a; --tag-fix: #6fbf72;
+  }
+
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--paper); color: var(--ink); }
+
+  .sheet {
+    max-width: 50rem;
+    margin: 0 auto;
+    padding: 4rem 2rem 5rem;
+    font-family: var(--serif);
+    font-size: 1.0625rem;
+    line-height: 1.62;
+  }
+
+  /* ---- Masthead ---- */
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--accent-ink);
+    margin: 0 0 1rem;
+  }
+  h1 {
+    font-family: var(--sans);
+    font-weight: 650;
+    font-size: 2.15rem;
+    line-height: 1.12;
+    letter-spacing: -0.015em;
+    text-wrap: balance;
+    margin: 0 0 1.25rem;
+  }
+  .trace { display: block; width: 100%; height: 44px; margin: 0.25rem 0 1.5rem; }
+
+  .meta {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.35rem 2rem;
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    color: var(--ink-soft);
+    border-top: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+    padding: 0.9rem 0;
+  }
+  .meta div { display: flex; gap: 0.6rem; }
+  .meta .k { color: var(--ink-faint); min-width: 5.2rem; text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.72rem; align-self: center; }
+  .meta .v { color: var(--ink); }
+
+  /* ---- Body ---- */
+  h2.section {
+    font-family: var(--sans);
+    font-weight: 640;
+    font-size: 0.95rem;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    margin: 2.5rem 0 0.75rem;
+  }
+  p.lede { margin: 1.5rem 0 0; color: var(--ink-soft); }
+  p { margin: 0.85rem 0; }
+
+  .points { display: flex; flex-direction: column; gap: 1rem; margin-top: 1.25rem; }
+
+  .point {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 1.35rem 1.5rem 1.4rem;
+  }
+  .point-head { display: flex; align-items: baseline; gap: 0.85rem; margin-bottom: 0.9rem; }
+  .num {
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--paper);
+    background: var(--accent);
+    border-radius: 6px;
+    padding: 0.18rem 0.5rem;
+    line-height: 1;
+    flex: none;
+  }
+  .point-head h3 {
+    font-family: var(--sans);
+    font-weight: 620;
+    font-size: 1.15rem;
+    letter-spacing: -0.01em;
+    margin: 0;
+    color: var(--ink);
+  }
+
+  dl.rows { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 0.55rem 1rem; }
+  dl.rows dt {
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding-top: 0.22rem;
+  }
+  dl.rows dt.now { color: var(--tag-now); }
+  dl.rows dt.gap { color: var(--tag-gap); }
+  dl.rows dt.fix { color: var(--tag-fix); }
+  dl.rows dd { margin: 0; font-size: 0.98rem; line-height: 1.55; }
+  dl.rows dd .term { font-family: var(--mono); font-size: 0.85em; color: var(--accent-ink); }
+
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-wash);
+    padding: 0.55rem 0.9rem;
+    margin: 0.65rem 0 0;
+    font-size: 0.9rem;
+    border-radius: 0 6px 6px 0;
+    color: var(--ink-soft);
+  }
+
+  .closing {
+    margin-top: 2.5rem;
+    border-top: 1px solid var(--line);
+    padding-top: 1.25rem;
+  }
+  .closing p { color: var(--ink-soft); }
+
+  footer.foot {
+    margin-top: 2.5rem;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    color: var(--ink-faint);
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    border-top: 1px solid var(--line-soft);
+    padding-top: 0.9rem;
+  }
+
+  @media (max-width: 620px) {
+    .sheet { padding: 2.5rem 1.25rem 3rem; }
+    h1 { font-size: 1.7rem; }
+    .meta { grid-template-columns: 1fr; }
+    dl.rows { grid-template-columns: 1fr; gap: 0.15rem 0; }
+    dl.rows dd { margin-bottom: 0.55rem; }
+  }
+
+  @media print {
+    :root {
+      --paper: #ffffff; --panel: #ffffff; --ink: #000; --ink-soft: #222;
+      --line: #bbb; --line-soft: #ddd; --accent-wash: #f2f7f7;
+    }
+    .sheet { max-width: none; padding: 0; font-size: 10.5pt; line-height: 1.42; }
+    .point { break-inside: avoid; border-color: #ccc; padding: 0.7rem 0.85rem; border-radius: 6px; }
+    .points { gap: 0.55rem; }
+    h1 { font-size: 20pt; }
+    h2.section { margin: 1.1rem 0 0.4rem; }
+    .callout { break-inside: avoid; }
+    footer.foot { border: none; }
+  }
+</style>
+
+<article class="sheet">
+  <p class="eyebrow">Lab Report &middot; Live-Test Findings</p>
+  <h1>Improving the Live NILM System: what we would build next</h1>
+
+  <svg class="trace" viewBox="0 0 800 44" preserveAspectRatio="none" aria-hidden="true">
+    <polyline fill="none" stroke="var(--line)" stroke-width="1.5"
+      points="0,30 90,30 90,14 180,14 180,30 300,30 300,8 300,8 420,8 420,26 520,26 520,18 640,18 640,34 720,34 720,22 800,22"/>
+    <polyline fill="none" stroke="var(--accent)" stroke-width="2"
+      points="0,38 120,38 120,24 210,24 210,38 330,38 330,20 470,20 470,38 560,38 560,30 690,30 690,38 800,38"/>
+  </svg>
+
+  <div class="meta">
+    <div><span class="k">Course</span><span class="v">Modeling, Simulation and Automation of Electrical Energy Systems, TH Koeln</span></div>
+    <div><span class="k">System</span><span class="v">Live NILM monitor &mdash; live.py</span></div>
+    <div><span class="k">Team</span><span class="v">Soheil Ayati (11153003), Marc Steffgen (11149043)</span></div>
+    <div><span class="k">Date</span><span class="v">2026-07-22</span></div>
+  </div>
+
+  <p class="lede">Our system disaggregates per-appliance power from a single PAC4200
+  measurement, logs every switch event with exact timestamps, and learns unknown
+  devices on the go. It performed well in the live evaluation. This report collects
+  the concrete weaknesses we observed during those tests and the improvements we
+  would prioritise next. Each point states what the software does today, why it is a
+  limitation, and the proposed change.</p>
+
+  <h2 class="section">Improvement points</h2>
+
+  <div class="points">
+
+    <section class="point">
+      <div class="point-head"><span class="num">01</span><h3>A graphical event timeline</h3></div>
+      <dl class="rows">
+        <dt class="now">Now</dt>
+        <dd>Switch events are written to <span class="term">events.csv</span> and shown on the
+          dashboard as a scrolling text log. Measured power is charted, but the ON/OFF
+          history of individual devices is not.</dd>
+        <dt class="gap">Gap</dt>
+        <dd>Reading a text log line by line does not reveal overlap between devices, missed
+          edges, or a claim that flickered &mdash; all of which are obvious at a glance on a timeline.</dd>
+        <dt class="fix">Fix</dt>
+        <dd>Render a per-device Gantt-style timeline (one lane per device, coloured ON
+          intervals on a shared time axis) beside the power chart. The event log already
+          carries exact edge timestamps and the matched device, so no new data is needed,
+          only the view. It doubles as a post-test artifact for reporting and debugging.</dd>
+      </dl>
+    </section>
+
+    <section class="point">
+      <div class="point-head"><span class="num">02</span><h3>Faster, more precise corrections</h3></div>
+      <dl class="rows">
+        <dt class="now">Now</dt>
+        <dd>When a device's steady state changes shape, the engine can briefly misread it
+          before a second evidence source corrects it. In the live test at ~16:01 the PV
+          export was released as OFF for about ten seconds, then the residual monitor
+          re-matched its signature and restored it to ON.</dd>
+        <dt class="gap">Gap</dt>
+        <dd>A PV generation ramp is a step of <span class="term">(dP, dQ&nbsp;&asymp;&nbsp;0)</span>,
+          indistinguishable in the (P,&nbsp;Q) plane from a small switching supply turning off, so
+          the off-edge wrongly released the PV claim. The correction is real but slow: it waits
+          for the residual monitor's multi-second window to accumulate.</dd>
+        <dt class="fix">Fix</dt>
+        <dd>Move the discriminating evidence to the moment of the edge. A true switch carries
+          the device's harmonic current with it; a generation ramp carries none. Applying that
+          harmonic-and-sign test at edge time, plus a short hold before a generator claim is
+          released, would shorten the ten-second correction to a fraction of a second instead of
+          detecting and undoing the mistake after the fact.</dd>
+      </dl>
+    </section>
+
+    <section class="point">
+      <div class="point-head"><span class="num">03</span><h3>Generic load-class labels for unknown devices</h3></div>
+      <dl class="rows">
+        <dt class="now">Now</dt>
+        <dd>Teaching an unknown load requires the user to type a specific name
+          (<span class="term">standing_fan_high</span>, <span class="term">coffee_machine_standby</span>).
+          The signature table and identify model are keyed to that exact family.</dd>
+        <dt class="gap">Gap</dt>
+        <dd>In a real installation the operator often knows only that something new is drawing
+          power, not its family. Requiring a specific name makes the system brittle and unhelpful
+          for unfamiliar devices.</dd>
+        <dt class="fix">Fix</dt>
+        <dd>Offer an automatic electrical-class label from features we already measure &mdash;
+          <em>resistive</em>, <em>inductive</em>, <em>capacitive</em>, <em>non-linear (switch-mode)</em>.
+          The sign of Q separates inductive from capacitive; power factor and THD_I separate a clean
+          heater from a distorted supply. Our own fingerprint table shows these classes are cleanly
+          separable here (THD_I ~2&nbsp;% for the boiler vs ~170&nbsp;% for the laptop). The user can
+          still refine the label into a name later, but the system is useful immediately.</dd>
+      </dl>
+    </section>
+
+    <section class="point">
+      <div class="point-head"><span class="num">04</span><h3>Fully asynchronous, hands-off training</h3></div>
+      <dl class="rows">
+        <dt class="now">Now</dt>
+        <dd>The in-mix teach removed the need to empty the mains, but still asks for one manual
+          action: switch the unknown device off and back on once so the settled step gives a
+          model-free measurement of its draw.</dd>
+        <dt class="gap">Gap</dt>
+        <dd>Any required action interrupts an experiment and is impossible for loads that cannot
+          be toggled (a running fridge, an inverter, a sealed installation). It also blocks
+          unattended, continuous learning.</dd>
+        <dt class="fix">Fix</dt>
+        <dd>Learn passively from the residual history the engine already records. When unexplained
+          power appears and persists, capture its settled level, Q, and harmonic signature over time
+          and teach a provisional signature from that alone, cross-checked against any natural on/off
+          transitions that occur. The manual toggle becomes an optional confidence boost, not a
+          prerequisite &mdash; training a background process the user never has to trigger.</dd>
+      </dl>
+    </section>
+
+    <section class="point">
+      <div class="point-head"><span class="num">05</span><h3>Recognition across a device's operating range</h3></div>
+      <dl class="rows">
+        <dt class="now">Now</dt>
+        <dd>A device is taught at whatever it drew during capture. A switching supply or PV inverter
+          whose output varies can then fall outside the taught range and stop matching (the laptop
+          taught at 66&nbsp;W idles at 43&nbsp;W; PV taught near &minus;13&nbsp;W was seen at &minus;30&nbsp;W).</dd>
+        <dt class="gap">Gap</dt>
+        <dd>Variable-output loads and generation are exactly the cases NILM finds hardest, and a
+          single taught operating point does not cover them.</dd>
+        <dt class="fix">Fix</dt>
+        <dd>Teach a range rather than a point &mdash; record several operating levels, or let a
+          distinctive harmonic fingerprint taper the match toward idle. For PV, the unique,
+          load-independent discriminator is the sign of power, which no consumer produces, so
+          generation should be recognised by sign across its whole range rather than by a taught wattage.</dd>
+      </dl>
+    </section>
+
+  </div>
+
+  <div class="closing">
+    <h2 class="section" style="margin-top:0">Summary</h2>
+    <p>The system met the goals of the exercise. The improvements above target the gaps we felt
+    during live operation: better visibility (timeline), faster self-correction (edge-time harmonic
+    evidence), lower operator burden (generic labels and hands-off learning), and robustness to the
+    hardest loads (variable-output devices and generation). None require new sensing hardware; all
+    build on features the pipeline already records.</p>
+  </div>
+
+  <footer class="foot">
+    <span>NILM live-test lab report</span>
+    <span>Ayati &middot; Steffgen &middot; TH Koeln</span>
+  </footer>
+</article>
